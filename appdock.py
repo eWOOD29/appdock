@@ -195,6 +195,12 @@ def validate_bind_host(host: str) -> str:
     return host
 
 
+def _process_group_options(platform: str | None = None) -> dict[str, Any]:
+    if (platform or os.name) == "nt":
+        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+    return {"start_new_session": True}
+
+
 def _relative_path(raw: Any, base: Path, *, field_name: str) -> Path:
     if raw in (None, ""):
         return base.resolve()
@@ -452,7 +458,16 @@ class AppManager:
                 log = self.log_path(spec).open("a", encoding="utf-8", buffering=1)
                 log.write(f"\n--- AppDock start {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
                 try:
-                    runtime.process = subprocess.Popen(spec.command, cwd=spec.cwd, stdout=log, stderr=subprocess.STDOUT, text=True, shell=False, env=self._environment(spec), creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+                    runtime.process = subprocess.Popen(
+                        spec.command,
+                        cwd=spec.cwd,
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        shell=False,
+                        env=self._environment(spec),
+                        **_process_group_options(),
+                    )
                     runtime.started_at = time.time()
                     runtime.last_exit_code = None
                     runtime.intentional_stop = False

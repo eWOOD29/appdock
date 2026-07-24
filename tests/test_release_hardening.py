@@ -142,6 +142,12 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.assertEqual(status["pid"], 9999)
         self.assertFalse(status["managed"])
 
+    def test_posix_apps_launch_in_an_isolated_process_group(self) -> None:
+        self.assertEqual(appdock._process_group_options("posix"), {"start_new_session": True})
+        windows = appdock._process_group_options("nt")
+        self.assertIn("creationflags", windows)
+        self.assertNotIn("start_new_session", windows)
+
     def test_archive_rejects_device_names_ads_and_expansion_limit(self) -> None:
         for member in ("CON/appdock.py", "folder/NUL.txt", "appdock.py:stream"):
             with self.subTest(member=member), self.assertRaises(AppDockError):
