@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "python-app",
+  "name": "Python App",
+  "description": "A local Python web app",
+  "command": [".venv/Scripts/python.exe", "-m", "your_package", "--port", "8787"],
+  "cwd": ".",
+  "port": 8787,
+  "health_url": "http://127.0.0.1:8787/health",
+  "local_url": "http://127.0.0.1:8787/",
+  "private_url": ""
+}

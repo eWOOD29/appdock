@@ -1,0 +1,28 @@
+[project]
+name = "appdock"
+version = "0.1.0"
+description = "A local-first dashboard for organizing and running local apps"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "AppDock contributors" }]
+keywords = ["local-apps", "dashboard", "process-manager", "windows"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: Microsoft :: Windows :: Windows 10",
+  "Operating System :: Microsoft :: Windows :: Windows 11",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Desktop Environment",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/eWOOD29/appdock"
+Repository = "https://github.com/eWOOD29/appdock"
+Issues = "https://github.com/eWOOD29/appdock/issues"
+
+[tool.appdock]
+release_asset = "appdock-windows.zip"
+checksum_asset = "SHA256SUMS.txt"

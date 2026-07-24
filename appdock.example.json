@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "my-app",
+  "name": "My App",
+  "description": "A local application managed by AppDock",
+  "command": [".venv/Scripts/python.exe", "-m", "app.main", "--port", "8787"],
+  "cwd": ".",
+  "port": 8787,
+  "health_url": "http://127.0.0.1:8787/health",
+  "local_url": "http://127.0.0.1:8787/",
+  "private_url": ""
+}

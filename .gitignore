@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# AppDock user/runtime data
+runtime/
+data/
+registry/
+apps/
+staging/
+updates/
+config.json
+app-order.json
+*.log
+
+# Local configuration and manifests
+*.local.json
+appdock.local.json
+.env
+.env.*
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Release scratch
+release-work/
+SHA256SUMS.txt

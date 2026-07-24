@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "node-app",
+  "name": "Node App",
+  "description": "A local Node.js web app",
+  "command": ["node", "server.js", "--port", "8787"],
+  "cwd": ".",
+  "port": 8787,
+  "health_url": "http://127.0.0.1:8787/health",
+  "local_url": "http://127.0.0.1:8787/",
+  "private_url": ""
+}

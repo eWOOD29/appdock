@@ -1,0 +1,39 @@
+name: Feature request
+description: Propose a focused AppDock improvement
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: Please search existing issues and pull requests before creating a new request.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What workflow is difficult today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe user-visible behavior and acceptance criteria, not only an implementation.
+    validations:
+      required: true
+  - type: dropdown
+    id: risk
+    attributes:
+      label: Does this affect a security boundary?
+      options:
+        - No
+        - Process launching or stopping
+        - Filesystem paths or archives
+        - Git/repository import
+        - Networking or remote access
+        - Self-update
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

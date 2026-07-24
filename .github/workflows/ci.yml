@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        python-version: ['3.11', '3.13']
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Compile check
+        run: python -m compileall -q appdock.py tests scripts
+      - name: JavaScript syntax
+        run: node --check static/app.js
+      - name: Privacy and secret scan
+        run: python scripts/privacy_scan.py
+      - name: Documentation links
+        run: python scripts/check_docs.py
+
+  package:
+    name: Verify portable package
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+      - run: python scripts/build_portable.py --output dist/appdock-windows.zip
+      - name: Inspect archive
+        shell: pwsh
+        run: |
+          $archive = [IO.Compression.ZipFile]::OpenRead((Resolve-Path 'dist/appdock-windows.zip'))
+          try {
+            if (-not ($archive.Entries.FullName -contains 'appdock.py')) { throw 'appdock.py missing from archive' }
+            if ($archive.Entries.FullName | Where-Object { $_ -match '(^|/)(data|runtime|\.git|\.venv)/' }) { throw 'private/runtime content found in archive' }
+          } finally {
+            $archive.Dispose()
+          }
+      - name: Exercise Windows installer and uninstaller
+        shell: pwsh
+        run: |
+          $install = Join-Path $env:RUNNER_TEMP 'AppDockProgram'
+          $data = Join-Path $env:RUNNER_TEMP 'AppDockData'
+          $overlap = Join-Path $env:RUNNER_TEMP 'AppDockOverlap'
+          try {
+            .\scripts\install.ps1 -InstallDir $overlap -DataDir (Join-Path $overlap 'data') -NoStart
+            throw 'installer accepted overlapping program and data directories'
+          } catch {
+            if ($_.Exception.Message -notmatch 'must not overlap') { throw }
+          }
+          try {
+            .\scripts\uninstall.ps1 -InstallDir $overlap -DataDir (Join-Path $overlap 'data')
+            throw 'uninstaller accepted overlapping program and data directories'
+          } catch {
+            if ($_.Exception.Message -notmatch 'Refusing to uninstall') { throw }
+          }
+          .\scripts\install.ps1 -InstallDir $install -DataDir $data -NoStart
+          if (-not (Test-Path (Join-Path $install 'appdock.py'))) { throw 'installer did not copy appdock.py' }
+          if (-not (Test-Path $data)) { throw 'installer did not create data directory' }
+          .\scripts\uninstall.ps1 -InstallDir $install -DataDir $data
+          if (Test-Path $install) { throw 'uninstaller did not remove program files' }
+          if (-not (Test-Path $data)) { throw 'uninstaller removed user data without permission' }
+          Remove-Item -Recurse -Force $data
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: appdock-windows
+          path: |
+            dist/appdock-windows.zip
+            dist/SHA256SUMS.txt

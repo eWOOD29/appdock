@@ -1,0 +1,40 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+      - name: Verify version tag
+        shell: pwsh
+        run: |
+          $expected = 'v' + (python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          if ($env:GITHUB_REF_NAME -ne $expected) { throw "Tag $env:GITHUB_REF_NAME does not match $expected" }
+      - name: Test
+        run: python -m unittest discover -s tests -v
+      - name: Compile and JavaScript syntax
+        run: |
+          python -m compileall -q appdock.py tests scripts
+          node --check static/app.js
+      - name: Privacy scan
+        run: python scripts/privacy_scan.py
+      - name: Documentation links
+        run: python scripts/check_docs.py
+      - name: Build portable release
+        run: python scripts/build_portable.py --output dist/appdock-windows.zip
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create $env:GITHUB_REF_NAME dist/appdock-windows.zip dist/SHA256SUMS.txt --verify-tag --generate-notes --title "AppDock $env:GITHUB_REF_NAME"
