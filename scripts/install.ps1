@@ -24,6 +24,25 @@ if (Test-PathOverlap $InstallDir $DataDir) {
     throw 'InstallDir and DataDir must not overlap so updates and uninstall cannot overwrite user data.'
 }
 
+$PreviousManagedFiles = @()
+$ExistingReleaseManifest = Join-Path $InstallDir 'RELEASE-MANIFEST.json'
+if (Test-Path $ExistingReleaseManifest -PathType Leaf) {
+    try {
+        $PreviousManagedFiles = @((Get-Content -Raw $ExistingReleaseManifest | ConvertFrom-Json).files | ForEach-Object { $_.path })
+    } catch {
+        throw 'The existing RELEASE-MANIFEST.json is invalid; refusing to remove managed files.'
+    }
+}
+$IncomingReleaseManifest = Join-Path $SourceRoot 'RELEASE-MANIFEST.json'
+$IncomingManagedFiles = @()
+if (Test-Path $IncomingReleaseManifest -PathType Leaf) {
+    try {
+        $IncomingManagedFiles = @((Get-Content -Raw $IncomingReleaseManifest | ConvertFrom-Json).files | ForEach-Object { $_.path })
+    } catch {
+        throw 'The incoming RELEASE-MANIFEST.json is invalid.'
+    }
+}
+
 if ($PythonExe) {
     $ResolvedPython = (Resolve-Path $PythonExe).Path
     & $ResolvedPython --version | Out-Host
@@ -41,7 +60,8 @@ New-Item -ItemType Directory -Force -Path $InstallDir, $DataDir | Out-Null
 
 $AllowedFiles = @(
     'appdock.py', 'appdock.example.json', 'pyproject.toml',
-    'README.md', 'CHANGELOG.md', 'CONTRIBUTING.md', 'SECURITY.md', 'LICENSE'
+    'README.md', 'CHANGELOG.md', 'CONTRIBUTING.md', 'SECURITY.md', 'LICENSE',
+    'RELEASE-MANIFEST.json'
 )
 foreach ($Name in $AllowedFiles) {
     $Source = Join-Path $SourceRoot $Name
@@ -60,6 +80,26 @@ foreach ($Name in $AllowedDirectories) {
 
 if (-not (Test-Path (Join-Path $InstallDir 'appdock.py'))) {
     throw 'The release does not contain appdock.py.'
+}
+
+if ($IncomingManagedFiles.Count -gt 0) {
+    $InstallPrefix = $InstallDir.TrimEnd([char[]]@('\', '/')) + [System.IO.Path]::DirectorySeparatorChar
+    foreach ($Relative in $PreviousManagedFiles) {
+        if (-not ($Relative -is [string]) -or $IncomingManagedFiles -contains $Relative) { continue }
+        $Parts = $Relative -split '/'
+        if ([System.IO.Path]::IsPathRooted($Relative) -or $Relative.Contains('\') -or ($Parts | Where-Object { $_ -in @('', '.', '..') })) {
+            throw 'The existing release inventory contains an unsafe path.'
+        }
+        $Obsolete = [System.IO.Path]::GetFullPath((Join-Path $InstallDir $Relative))
+        if (-not $Obsolete.StartsWith($InstallPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw 'The existing release inventory escapes InstallDir.'
+        }
+        if (Test-Path $Obsolete -PathType Leaf) {
+            Remove-Item -Force $Obsolete
+        } elseif (Test-Path $Obsolete) {
+            throw 'An obsolete managed path is not a regular file.'
+        }
+    }
 }
 
 $Launcher = Join-Path $InstallDir 'run-appdock.cmd'

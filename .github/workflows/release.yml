@@ -33,6 +33,8 @@ jobs:
         run: python scripts/check_docs.py
       - name: Build portable release
         run: python scripts/build_portable.py --output dist/appdock-windows.zip
+      - name: Verify release inventory
+        run: python -c "from pathlib import Path; import appdock; appdock.validate_zip(Path('dist/appdock-windows.zip').read_bytes())"
       - name: Publish GitHub release
         shell: pwsh
         env:

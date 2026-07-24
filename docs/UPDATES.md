@@ -17,10 +17,11 @@ After the user chooses **Update now** and confirms:
 2. It selects only `appdock-windows.zip` and `SHA256SUMS.txt` assets from that same release.
 3. It applies bounded timeouts and download-size limits.
 4. It parses the checksum file and verifies the ZIP with SHA-256.
-5. It rejects absolute paths, `..` traversal, symlinks, device/reserved paths, and entries outside the update staging directory.
-6. It extracts into the AppDock data directory's update staging area.
-7. An external helper waits for the server to exit, backs up current program files, replaces the installation, and restarts AppDock.
-8. If replacement or launching the restarted process fails, the helper restores the previous program files.
+5. It verifies `RELEASE-MANIFEST.json`: every packaged program file must be listed with its own SHA-256 digest, required AppDock files must be present, and unlisted or missing files are rejected.
+6. It rejects absolute paths, `..` traversal, symlinks, device/reserved paths, and entries outside the update staging directory.
+7. It extracts into the AppDock data directory's update staging area.
+8. An external helper waits for the server to exit, backs up current managed program files, replaces the installation, removes only obsolete files listed by the previous release inventory, and restarts AppDock.
+9. If replacement or launching the restarted process fails, the helper restores overwritten and removed program files from the backup.
 
 The browser cannot supply an arbitrary download URL to the update endpoint. Update assets must come from the expected configured GitHub release.
 
@@ -63,5 +64,6 @@ Every release must:
 - build `appdock-windows.zip` from tracked release files;
 - publish `SHA256SUMS.txt` containing the archive digest;
 - avoid user data, logs, local manifests, `.env` files, credentials, and personal paths;
+- include a generated `RELEASE-MANIFEST.json` covering every program file;
 - keep update-compatible top-level paths;
 - include human-readable release notes and upgrade caveats.

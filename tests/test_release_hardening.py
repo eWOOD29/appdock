@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import subprocess
 import sys
@@ -62,6 +63,32 @@ class ReleaseHardeningTests(unittest.TestCase):
             for name, content in members.items():
                 archive.writestr(name, content)
         return stream.getvalue()
+
+    def release_members(self, overrides: dict[str, bytes] | None = None) -> dict[str, bytes]:
+        members = {
+            "appdock.py": b"app",
+            "static/app.js": b"js",
+            "static/app.css": b"css",
+            "scripts/update_helper.py": b"helper",
+            "scripts/install.ps1": b"install",
+            "scripts/uninstall.ps1": b"uninstall",
+        }
+        members.update(overrides or {})
+        manifest = {
+            "schema_version": 1,
+            "files": [
+                {"path": path, "sha256": hashlib.sha256(content).hexdigest()}
+                for path, content in sorted(members.items())
+            ],
+        }
+        members["RELEASE-MANIFEST.json"] = json.dumps(manifest, sort_keys=True).encode("utf-8")
+        return members
+
+    def write_release_tree(self, root: Path, overrides: dict[str, bytes] | None = None) -> None:
+        for relative, content in self.release_members(overrides).items():
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
 
     def test_local_registration_preserves_cwd_and_private_env(self) -> None:
         source = self.root / "source"
@@ -160,6 +187,20 @@ class ReleaseHardeningTests(unittest.TestCase):
         with self.assertRaises(AppDockError):
             validate_zip(self.make_zip({"README.md": b"not an application"}))
 
+    def test_update_archive_requires_a_complete_verified_inventory(self) -> None:
+        complete = self.release_members()
+        self.assertIn("RELEASE-MANIFEST.json", validate_zip(self.make_zip(complete)))
+
+        missing = dict(complete)
+        missing.pop("static/app.js")
+        with self.assertRaises(AppDockError):
+            validate_zip(self.make_zip(missing))
+
+        extra = dict(complete)
+        extra["unexpected.py"] = b"surprise"
+        with self.assertRaises(AppDockError):
+            validate_zip(self.make_zip(extra))
+
     def test_trusted_asset_path_must_start_with_exact_repository(self) -> None:
         deceptive = "https://github.com/other/project/owner/repo/releases/download/v1.0.0/"
         release = {"assets": [
@@ -179,6 +220,22 @@ class ReleaseHardeningTests(unittest.TestCase):
         (staged / "appdock.py").write_text("new", encoding="utf-8")
         with self.assertRaises(AppDockError):
             apply_update(staged, self.config.data_root, self.config.data_root)
+
+    def test_apply_update_removes_obsolete_managed_files_and_rollback_restores_them(self) -> None:
+        install = self.root / "install"
+        install.mkdir()
+        self.write_release_tree(install, {"obsolete.py": b"old obsolete", "appdock.py": b"old app"})
+        staged = self.config.updates_root / "0.2.0"
+        staged.mkdir(parents=True)
+        self.write_release_tree(staged, {"appdock.py": b"new app"})
+
+        result = apply_update(staged, install, self.config.data_root)
+        self.assertFalse((install / "obsolete.py").exists())
+        self.assertEqual((install / "appdock.py").read_bytes(), b"new app")
+
+        appdock.rollback_update(result, install, self.config.data_root)
+        self.assertEqual((install / "obsolete.py").read_bytes(), b"old obsolete")
+        self.assertEqual((install / "appdock.py").read_bytes(), b"old app")
 
     def test_updater_has_external_restart_helper_boundary(self) -> None:
         self.assertTrue(callable(getattr(appdock, "launch_update_helper", None)))
@@ -206,11 +263,11 @@ class ReleaseHardeningTests(unittest.TestCase):
     def test_update_helper_rolls_back_if_restart_launch_fails(self) -> None:
         install = self.root / "install"
         install.mkdir()
+        self.write_release_tree(install, {"appdock.py": b"old"})
         installed_entry = install / "appdock.py"
-        installed_entry.write_text("old", encoding="utf-8")
         staged = self.config.updates_root / "0.2.0"
         staged.mkdir(parents=True)
-        (staged / "appdock.py").write_text("new", encoding="utf-8")
+        self.write_release_tree(staged, {"appdock.py": b"new"})
 
         with patch("scripts.update_helper.subprocess.Popen", side_effect=OSError("restart failed")):
             result = update_helper.run(

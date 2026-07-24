@@ -20,7 +20,7 @@ import uuid
 import zipfile
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable
 
 MANIFEST_NAME = "appdock.json"
@@ -32,6 +32,15 @@ MAX_JSON_BYTES = 128 * 1024
 MAX_UPDATE_ASSET_BYTES = 100 * 1024 * 1024
 MAX_UPDATE_FILE_COUNT = 4096
 MAX_UPDATE_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
+RELEASE_MANIFEST_NAME = "RELEASE-MANIFEST.json"
+REQUIRED_RELEASE_FILES = {
+    "appdock.py",
+    "static/app.js",
+    "static/app.css",
+    "scripts/update_helper.py",
+    "scripts/install.ps1",
+    "scripts/uninstall.ps1",
+}
 
 
 class AppDockError(Exception):
@@ -850,6 +859,65 @@ def _assert_zip_member(name: str, info: zipfile.ZipInfo) -> None:
         raise AppDockError("update ZIP contains a symlink")
 
 
+def _parse_release_manifest(data: bytes) -> dict[str, str]:
+    try:
+        payload = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AppDockError("release inventory is invalid") from exc
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1 or not isinstance(payload.get("files"), list):
+        raise AppDockError("release inventory is invalid")
+    inventory: dict[str, str] = {}
+    for item in payload["files"]:
+        if not isinstance(item, dict) or set(item) != {"path", "sha256"}:
+            raise AppDockError("release inventory entry is invalid")
+        path, digest = item["path"], item["sha256"]
+        if not isinstance(path, str) or "\\" in path or path == RELEASE_MANIFEST_NAME:
+            raise AppDockError("release inventory path is invalid")
+        pure = PurePosixPath(path)
+        if pure.is_absolute() or not pure.parts or any(part in {"", ".", ".."} for part in pure.parts):
+            raise AppDockError("release inventory path is invalid")
+        _assert_zip_member(path, zipfile.ZipInfo(path))
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise AppDockError("release inventory checksum is invalid")
+        if path in inventory:
+            raise AppDockError("release inventory contains duplicate paths")
+        inventory[path] = digest
+    if not REQUIRED_RELEASE_FILES.issubset(inventory):
+        raise AppDockError("release inventory is missing required AppDock files")
+    return inventory
+
+
+def _release_path(root: Path, relative: str) -> Path:
+    target = (root / Path(*PurePosixPath(relative).parts)).resolve()
+    if not _inside(target, root):
+        raise AppDockError("release inventory path escapes its root")
+    return target
+
+
+def _load_release_inventory(root: Path, *, complete: bool) -> dict[str, str]:
+    manifest_path = root / RELEASE_MANIFEST_NAME
+    if not manifest_path.is_file() or manifest_path.is_symlink():
+        if complete:
+            raise AppDockError("release inventory is missing")
+        return {}
+    inventory = _parse_release_manifest(manifest_path.read_bytes())
+    if complete:
+        actual: set[str] = set()
+        for path in root.rglob("*"):
+            if path.is_symlink():
+                raise AppDockError("release tree contains a symlink")
+            if path.is_file():
+                actual.add(path.relative_to(root).as_posix())
+        expected = {*inventory, RELEASE_MANIFEST_NAME}
+        if actual != expected:
+            raise AppDockError("release tree does not match its inventory")
+        for relative, expected_digest in inventory.items():
+            actual_digest = hashlib.sha256(_release_path(root, relative).read_bytes()).hexdigest()
+            if actual_digest != expected_digest:
+                raise AppDockError("release file checksum does not match its inventory")
+    return inventory
+
+
 def validate_zip(data: bytes) -> list[str]:
     names: list[str] = []
     try:
@@ -869,6 +937,19 @@ def validate_zip(data: bytes) -> list[str]:
             root_entries = [info for info in infos if info.filename == "appdock.py"]
             if len(root_entries) != 1 or root_entries[0].is_dir():
                 raise AppDockError("update ZIP must contain root appdock.py")
+            manifest_entries = [info for info in infos if info.filename == RELEASE_MANIFEST_NAME]
+            if len(manifest_entries) != 1 or manifest_entries[0].is_dir():
+                raise AppDockError("update ZIP must contain a release inventory")
+            file_infos = [info for info in infos if not info.is_dir()]
+            if len({info.filename for info in file_infos}) != len(file_infos):
+                raise AppDockError("update ZIP contains duplicate paths")
+            inventory = _parse_release_manifest(archive.read(RELEASE_MANIFEST_NAME))
+            archive_files = {info.filename for info in file_infos}
+            if archive_files != {*inventory, RELEASE_MANIFEST_NAME}:
+                raise AppDockError("update ZIP does not match its release inventory")
+            for relative, expected_digest in inventory.items():
+                if hashlib.sha256(archive.read(relative)).hexdigest() != expected_digest:
+                    raise AppDockError("update ZIP file checksum does not match its inventory")
     except (zipfile.BadZipFile, OSError, AppDockError) as exc:
         if isinstance(exc, AppDockError):
             raise
@@ -910,38 +991,39 @@ def apply_update(staged_dir: str | Path, install_dir: str | Path, data_dir: str 
         raise AppDockError("installation and data roots must not overlap")
     if not staged.is_dir() or not _inside(staged, data / "updates"):
         raise AppDockError("staged update path is invalid")
+    target_inventory = _load_release_inventory(staged, complete=True)
+    current_inventory = _load_release_inventory(install, complete=False) if install.exists() else {}
+    target_files = {*target_inventory, RELEASE_MANIFEST_NAME}
+    current_files = set(current_inventory)
+    if current_inventory:
+        current_files.add(RELEASE_MANIFEST_NAME)
+    affected = sorted(target_files | current_files)
     backup = data / "updates" / "backups" / uuid.uuid4().hex
     backup.mkdir(parents=True, exist_ok=False)
-    copied: list[Path] = []
+    result = {"applied": True, "backup": str(backup), "files": affected}
     try:
         install.mkdir(parents=True, exist_ok=True)
-        for source in staged.rglob("*"):
-            if source.is_symlink() or not source.is_file():
-                continue
-            relative = source.relative_to(staged)
-            destination = (install / relative).resolve()
-            if not _inside(destination, install):
-                raise AppDockError("staged update escapes installation directory")
-            old = install / relative
-            if old.exists():
-                backup_target = backup / relative
+        for relative in affected:
+            old = _release_path(install, relative)
+            if old.is_symlink() or (old.exists() and not old.is_file()):
+                raise AppDockError("managed installation path is not a regular file")
+            if old.is_file():
+                backup_target = _release_path(backup, relative)
                 backup_target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(old, backup_target)
+        for relative in sorted(target_files):
+            source = _release_path(staged, relative)
+            destination = _release_path(install, relative)
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, destination)
-            copied.append(relative)
+        for relative in sorted(current_files - target_files):
+            _release_path(install, relative).unlink(missing_ok=True)
         if restart:
             restart()
     except Exception as exc:
-        for relative in copied:
-            target = install / relative
-            saved = backup / relative
-            if saved.exists():
-                shutil.copy2(saved, target)
-            else:
-                target.unlink(missing_ok=True)
+        rollback_update(result, install, data)
         raise AppDockError("update failed and was rolled back") from exc
-    return {"applied": True, "backup": str(backup), "files": [str(item) for item in copied]}
+    return result
 
 
 def rollback_update(applied: dict[str, Any], install_dir: str | Path, data_dir: str | Path) -> None:

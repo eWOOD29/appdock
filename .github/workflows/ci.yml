@@ -48,7 +48,9 @@ jobs:
         run: |
           $archive = [IO.Compression.ZipFile]::OpenRead((Resolve-Path 'dist/appdock-windows.zip'))
           try {
-            if (-not ($archive.Entries.FullName -contains 'appdock.py')) { throw 'appdock.py missing from archive' }
+            foreach ($required in @('appdock.py', 'RELEASE-MANIFEST.json', 'static/app.js', 'static/app.css', 'scripts/update_helper.py')) {
+              if (-not ($archive.Entries.FullName -contains $required)) { throw "$required missing from archive" }
+            }
             if ($archive.Entries.FullName | Where-Object { $_ -match '(^|/)(data|runtime|\.git|\.venv)/' }) { throw 'private/runtime content found in archive' }
           } finally {
             $archive.Dispose()
@@ -59,22 +61,31 @@ jobs:
           $install = Join-Path $env:RUNNER_TEMP 'AppDockProgram'
           $data = Join-Path $env:RUNNER_TEMP 'AppDockData'
           $overlap = Join-Path $env:RUNNER_TEMP 'AppDockOverlap'
+          $bundle = Join-Path $env:RUNNER_TEMP 'AppDockBundle'
+          Expand-Archive -Path 'dist/appdock-windows.zip' -DestinationPath $bundle
+          $installer = Join-Path $bundle 'scripts/install.ps1'
           try {
-            .\scripts\install.ps1 -InstallDir $overlap -DataDir (Join-Path $overlap 'data') -NoStart
+            & $installer -InstallDir $overlap -DataDir (Join-Path $overlap 'data') -NoStart
             throw 'installer accepted overlapping program and data directories'
           } catch {
             if ($_.Exception.Message -notmatch 'must not overlap') { throw }
           }
           try {
-            .\scripts\uninstall.ps1 -InstallDir $overlap -DataDir (Join-Path $overlap 'data')
+            & (Join-Path $bundle 'scripts/uninstall.ps1') -InstallDir $overlap -DataDir (Join-Path $overlap 'data')
             throw 'uninstaller accepted overlapping program and data directories'
           } catch {
             if ($_.Exception.Message -notmatch 'Refusing to uninstall') { throw }
           }
-          .\scripts\install.ps1 -InstallDir $install -DataDir $data -NoStart
+          New-Item -ItemType Directory -Force -Path $install | Out-Null
+          Set-Content -NoNewline -Path (Join-Path $install 'obsolete.py') -Value 'old'
+          @{schema_version=1; files=@(@{path='appdock.py'; sha256=('0' * 64)}, @{path='obsolete.py'; sha256=('0' * 64)})} |
+            ConvertTo-Json -Depth 5 | Set-Content (Join-Path $install 'RELEASE-MANIFEST.json')
+          & $installer -InstallDir $install -DataDir $data -NoStart
           if (-not (Test-Path (Join-Path $install 'appdock.py'))) { throw 'installer did not copy appdock.py' }
+          if (-not (Test-Path (Join-Path $install 'RELEASE-MANIFEST.json'))) { throw 'installer did not copy the release inventory' }
+          if (Test-Path (Join-Path $install 'obsolete.py')) { throw 'installer left an obsolete managed file behind' }
           if (-not (Test-Path $data)) { throw 'installer did not create data directory' }
-          .\scripts\uninstall.ps1 -InstallDir $install -DataDir $data
+          & (Join-Path $install 'scripts/uninstall.ps1') -InstallDir $install -DataDir $data
           if (Test-Path $install) { throw 'uninstaller did not remove program files' }
           if (-not (Test-Path $data)) { throw 'uninstaller removed user data without permission' }
           Remove-Item -Recurse -Force $data

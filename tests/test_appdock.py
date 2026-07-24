@@ -176,16 +176,36 @@ class AppDockTests(unittest.TestCase):
         with zipfile.ZipFile(stream, "w") as archive: archive.writestr(member, content)
         return stream.getvalue()
 
+    def make_release_zip(self, appdock_content: bytes = b"new") -> bytes:
+        members = {
+            "appdock.py": appdock_content,
+            "static/app.js": b"js",
+            "static/app.css": b"css",
+            "scripts/update_helper.py": b"helper",
+            "scripts/install.ps1": b"install",
+            "scripts/uninstall.ps1": b"uninstall",
+        }
+        manifest = {"schema_version": 1, "files": [
+            {"path": path, "sha256": hashlib.sha256(content).hexdigest()}
+            for path, content in sorted(members.items())
+        ]}
+        members["RELEASE-MANIFEST.json"] = json.dumps(manifest, sort_keys=True).encode()
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, "w") as archive:
+            for path, content in members.items():
+                archive.writestr(path, content)
+        return stream.getvalue()
+
     def test_checksum_and_zip_slip_symlink_rejection(self) -> None:
-        data = self.make_zip(); checksum = hashlib.sha256(data).hexdigest()
+        data = self.make_release_zip(); checksum = hashlib.sha256(data).hexdigest()
         self.assertEqual(verify_sha256(data, f"{checksum}  appdock-windows.zip"), checksum)
         with self.assertRaises(AppDockError): verify_sha256(data, "0" * 64 + "  appdock-windows.zip")
-        self.assertEqual(validate_zip(data), ["appdock.py"])
+        self.assertIn("appdock.py", validate_zip(data))
         with self.assertRaises(AppDockError): validate_zip(self.make_zip("../escape"))
         with self.assertRaises(AppDockError): validate_zip(self.make_zip("data/user.json"))
 
     def test_stage_update_uses_trusted_assets_checksum_and_preserves_data_on_apply(self) -> None:
-        data = self.make_zip("appdock.py", b"new code"); sums = hashlib.sha256(data).hexdigest().encode() + b"  appdock-windows.zip\n"
+        data = self.make_release_zip(b"new code"); sums = hashlib.sha256(data).hexdigest().encode() + b"  appdock-windows.zip\n"
         base = "https://github.com/owner/repo/releases/download/v0.2.0/"
         release = {"version": "0.2.0", "release_url": base, "assets": [{"name": "appdock-windows.zip", "url": base + "appdock-windows.zip"}, {"name": "SHA256SUMS.txt", "url": base + "SHA256SUMS.txt"}]}
         opener = lambda request, **kwargs: Response(data if request.full_url.endswith(".zip") else sums)
