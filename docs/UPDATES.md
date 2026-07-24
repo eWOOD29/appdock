@@ -9,19 +9,23 @@ AppDock's updater is designed around versioned GitHub release assets and a user-
 3. It displays the version, public release URL, and release notes.
 4. It does not download or apply anything during a check.
 
+## Updating from v0.1.0
+
+The v0.1.0 one-click updater intentionally cannot apply v0.1.1's release-inventory schema. Install v0.1.1 manually once using the verified ZIP and Windows installer; see [Migrating an existing AppDock setup](MIGRATING.md#v010--v011-safety-migration). This fail-closed transition prevents the older helper from bypassing v0.1.1's instance-specific readiness and retry-safe rollback behavior.
+
 ## Apply flow
 
 After the user chooses **Update now** and confirms:
 
 1. AppDock reuses the trusted release metadata it fetched from the configured repository.
 2. It selects only `appdock-windows.zip` and `SHA256SUMS.txt` assets from that same release.
-3. It applies bounded timeouts and download-size limits.
+3. It applies bounded timeouts and download-size limits, and validates the final redirect against GitHub-owned release-asset hosts.
 4. It parses the checksum file and verifies the ZIP with SHA-256.
 5. It verifies `RELEASE-MANIFEST.json`: every packaged program file must be listed with its own SHA-256 digest, required AppDock files must be present, and unlisted or missing files are rejected.
 6. It rejects absolute paths, `..` traversal, symlinks, device/reserved paths, and entries outside the update staging directory.
 7. It extracts into the AppDock data directory's update staging area.
-8. An external helper waits for the server to exit, backs up current managed program files, replaces the installation, removes only obsolete files listed by the previous release inventory, and restarts AppDock.
-9. If replacement or launching the restarted process fails, the helper restores overwritten and removed program files from the backup.
+8. AppDock launches the checksum-verified incoming helper and waits for a fresh token-bound startup handshake. Only after the helper has imported, parsed its trusted arguments, opened its update log, and entered the wait/recovery path does the current server shut down. The helper then waits for the server to exit, backs up current managed files, replaces the installation, removes obsolete inventory-owned files, and restarts AppDock.
+9. The helper gives the restarted process a fresh, instance-specific readiness token and accepts only an exact, non-redirected response from its local `/health` endpoint containing that token. Backup creation must finish before any installed file changes. If replacement, launch, early startup, redirect, token validation, or readiness fails, it stops the failed process, restores only files whose prior state was recorded, and verifies a restart of the restored AppDock version. Completed and failed version stages are removed so a failed update can be retried.
 
 The browser cannot supply an arbitrary download URL to the update endpoint. Update assets must come from the expected configured GitHub release.
 
@@ -49,11 +53,12 @@ Do not delete the data directory during rollback.
 
 ## Manual update
 
-1. Download and checksum-verify the desired release.
-2. Stop AppDock.
-3. Copy the new program files over the installation directory.
-4. Leave the data directory unchanged.
-5. Start AppDock and check `/health` plus the displayed version.
+1. Download `appdock-windows.zip` and `SHA256SUMS.txt` from the release.
+2. Verify the ZIP checksum.
+3. Stop AppDock.
+4. Extract the ZIP to a temporary folder and run `scripts\install.ps1` with the intended existing data directory.
+5. Leave the data directory unchanged.
+6. Start AppDock and check `/health` plus the displayed version.
 
 ## Release publisher checklist
 

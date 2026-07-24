@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
 import stat
@@ -24,7 +25,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable
 
 MANIFEST_NAME = "appdock.json"
-CURRENT_VERSION = "0.1.0"
+CURRENT_VERSION = "0.1.1"
 DEFAULT_UPDATE_REPOSITORY = "eWOOD29/appdock"
 APP_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 SEMVER_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$")
@@ -32,12 +33,18 @@ MAX_JSON_BYTES = 128 * 1024
 MAX_UPDATE_ASSET_BYTES = 100 * 1024 * 1024
 MAX_UPDATE_FILE_COUNT = 4096
 MAX_UPDATE_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
+MAX_GITHUB_STAGE_BYTES = 250 * 1024 * 1024
+MAX_GITHUB_STAGE_FILES = 20_000
+MAX_GITHUB_STAGING_TOTAL_BYTES = 500 * 1024 * 1024
+MAX_GITHUB_STAGING_TOTAL_FILES = 40_000
+GITHUB_STAGE_TTL_SECONDS = 24 * 60 * 60
 RELEASE_MANIFEST_NAME = "RELEASE-MANIFEST.json"
 REQUIRED_RELEASE_FILES = {
     "appdock.py",
     "static/app.js",
     "static/app.css",
     "scripts/update_helper.py",
+    "scripts/path_safety.ps1",
     "scripts/install.ps1",
     "scripts/uninstall.ps1",
 }
@@ -84,7 +91,7 @@ class AppDockConfig:
             root = Path(local_app_data or os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")) / "AppDock"
         else:
             root = Path.home() / ".local" / "share" / "appdock"
-        root = root.expanduser().resolve()
+        root = root.expanduser().absolute()
         return cls(
             data_root=root,
             registry_root=root / "registry",
@@ -98,7 +105,9 @@ class AppDockConfig:
         )
 
     def ensure(self) -> None:
+        _assert_no_link_or_reparse_ancestor(self.data_root)
         for path in (self.registry_root, self.install_root, self.runtime_root, self.logs_root, self.staging_root, self.updates_root):
+            _assert_no_link_or_reparse_ancestor(path)
             path.mkdir(parents=True, exist_ok=True)
 
 
@@ -145,11 +154,61 @@ def _inside(path: Path, root: Path) -> bool:
         return False
 
 
+def _remove_tree(path: Path, *, ignore_errors: bool = False) -> None:
+    if _is_link_or_reparse(path):
+        try:
+            if path.is_dir() and not path.is_symlink():
+                os.rmdir(path)
+            else:
+                path.unlink()
+        except OSError:
+            if not ignore_errors:
+                raise
+        return
+
+    def make_writable_and_retry(function: Callable[..., Any], raw_path: str, _exc_info: Any) -> None:
+        os.chmod(raw_path, stat.S_IWRITE)
+        function(raw_path)
+
+    try:
+        shutil.rmtree(path, onerror=make_writable_and_retry)
+    except FileNotFoundError:
+        return
+    except OSError:
+        if not ignore_errors:
+            raise
+
+
+def _is_link_or_reparse(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    try:
+        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+    except OSError:
+        return False
+    return bool(attributes & 0x400)
+
+
+def _assert_no_link_or_reparse_ancestor(path: Path) -> None:
+    current = path.expanduser().absolute()
+    while True:
+        if _is_link_or_reparse(current):
+            raise AppDockError("AppDock data root is beneath a symlink or reparse point")
+        parent = current.parent
+        if parent == current:
+            return
+        current = parent
+
+
 def _safe_child(root: Path, name: str) -> Path:
     if not isinstance(name, str) or not name or name in {".", ".."} or "/" in name or "\\" in name or not APP_ID_RE.fullmatch(name):
         raise ManifestError("unsafe app id")
-    child = (root / name).resolve()
-    if not _inside(child, root):
+    root = root.expanduser().absolute()
+    _assert_no_link_or_reparse_ancestor(root)
+    child = root / name
+    if _is_link_or_reparse(child):
+        raise ManifestError("AppDock data path is a symlink or reparse point")
+    if not _inside(child.resolve(), root):
         raise ManifestError("path escapes AppDock data directory")
     return child
 
@@ -157,13 +216,18 @@ def _safe_child(root: Path, name: str) -> Path:
 def _safe_version_child(root: Path, version: str) -> Path:
     if not SEMVER_RE.fullmatch(version):
         raise AppDockError("invalid update version")
-    child = (root / version).resolve()
-    if not _inside(child, root):
+    root = root.expanduser().absolute()
+    _assert_no_link_or_reparse_ancestor(root)
+    child = root / version
+    if _is_link_or_reparse(child):
+        raise AppDockError("update path is a symlink or reparse point")
+    if not _inside(child.resolve(), root):
         raise AppDockError("update path escapes data directory")
     return child
 
 
 def _assert_tree_safe(root: Path, containment_root: Path) -> None:
+    _assert_no_link_or_reparse_ancestor(root)
     root = root.resolve()
     if not _inside(root, containment_root):
         raise AppDockError("staging path escapes data directory")
@@ -424,7 +488,7 @@ class AppManager:
             running = managed or bool(external_pids)
             health, detail = self._health(spec) if running else (None, "not running")
             state = "healthy" if running and health is True else "unhealthy" if running and health is False else "running" if running else "crashed" if runtime.last_exit_code not in (None, 0) and not runtime.intentional_stop else "stopped"
-            return {"id": spec.app_id, "name": spec.name, "description": spec.description, "state": state, "pid": process.pid if managed else (external_pids[0] if external_pids else None), "managed": managed, "started_at": runtime.started_at, "last_exit_code": runtime.last_exit_code, "health": health, "health_detail": detail, "port": spec.port, "local_url": spec.local_url, "private_url": spec.private_url, "directory": str(spec.directory), "log_path": str(self.log_path(spec))}
+            return {"id": spec.app_id, "name": spec.name, "description": spec.description, "state": state, "pid": process.pid if managed else (external_pids[0] if external_pids else None), "managed": managed, "started_at": runtime.started_at, "last_exit_code": runtime.last_exit_code, "health": health, "health_detail": detail, "port": spec.port, "local_url": spec.local_url, "private_url": spec.private_url}
 
     def all_status(self) -> list[dict[str, Any]]:
         return [self.status(spec) for spec in self._ordered_specs(self.discover())]
@@ -572,7 +636,7 @@ class LocalFolderOnboarding:
         try:
             _atomic_json(registry_manifest, normalized)
         except Exception:
-            shutil.rmtree(registry_dir, ignore_errors=True)
+            _remove_tree(registry_dir, ignore_errors=True)
             raise
         return {"registered": True, "id": app_id, "started": False}
 
@@ -584,10 +648,101 @@ def _atomic_json(path: Path, payload: Any) -> None:
     temp.replace(path)
 
 
+def _tree_usage(root: Path) -> tuple[int, int]:
+    files = 0
+    total_bytes = 0
+    if not root.exists():
+        return files, total_bytes
+    for path in root.rglob("*"):
+        if path.is_symlink():
+            raise PreviewError("GitHub checkout contains a symlink")
+        if not path.is_file():
+            continue
+        files += 1
+        try:
+            total_bytes += path.stat().st_size
+        except OSError as exc:
+            raise PreviewError("could not inspect GitHub checkout") from exc
+    return files, total_bytes
+
+
+def _assert_staging_quota(stage: Path, staging_root: Path) -> None:
+    files, total_bytes = _tree_usage(stage)
+    if files > MAX_GITHUB_STAGE_FILES or total_bytes > MAX_GITHUB_STAGE_BYTES:
+        raise PreviewError("GitHub checkout exceeds the staging quota")
+    all_files, all_bytes = _tree_usage(staging_root)
+    if all_files > MAX_GITHUB_STAGING_TOTAL_FILES or all_bytes > MAX_GITHUB_STAGING_TOTAL_BYTES:
+        raise PreviewError("GitHub staging area exceeds the total quota")
+
+
+def _terminate_process_tree(process: Any) -> None:
+    pid = getattr(process, "pid", None)
+    if isinstance(pid, int) and pid > 4:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True, check=False)
+        else:
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+    try:
+        process.terminate()
+        process.wait(timeout=1)
+    except Exception:
+        try:
+            process.kill()
+            process.wait(timeout=1)
+        except Exception:
+            pass
+
+
+def _run_bounded_clone(
+    command: list[str],
+    stage: Path,
+    *,
+    staging_root: Path | None = None,
+    popen: Callable[..., Any] | None = None,
+    timeout: float = 120,
+    poll_interval: float = 0.05,
+) -> Any:
+    runner = popen or subprocess.Popen
+    environment = os.environ.copy()
+    environment["GIT_LFS_SKIP_SMUDGE"] = "1"
+    process = runner(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        shell=False,
+        env=environment,
+        **_process_group_options(),
+    )
+    deadline = time.monotonic() + timeout
+    root = staging_root or stage.parent
+    while process.poll() is None:
+        try:
+            _assert_staging_quota(stage, root)
+        except PreviewError:
+            _terminate_process_tree(process)
+            raise
+        if time.monotonic() >= deadline:
+            _terminate_process_tree(process)
+            raise PreviewError("GitHub clone timed out")
+        if poll_interval:
+            time.sleep(poll_interval)
+    stdout, stderr = process.communicate()
+    if getattr(process, "returncode", 0) != 0:
+        raise PreviewError("GitHub clone failed")
+    _assert_staging_quota(stage, root)
+    return subprocess.CompletedProcess(command, 0, stdout, stderr)
+
+
 class GitHubOnboarding:
+    _clone_lock = threading.Lock()
+
     def __init__(self, config: AppDockConfig, runner: Callable[..., Any] | None = None):
         self.config = config
-        self.runner = runner or subprocess.run
+        self.runner = runner
 
     @staticmethod
     def canonical_url(url: str) -> str:
@@ -616,13 +771,18 @@ class GitHubOnboarding:
     def preview(self, url: str) -> dict[str, Any]:
         canonical = self.canonical_url(url)
         self.config.ensure()
+        self.cleanup_stale()
         stage = Path(tempfile.mkdtemp(prefix="repo-", dir=self.config.staging_root)).resolve()
-        command = ["git", "clone", "--depth", "1", canonical, str(stage)]
+        command = ["git", "-c", "core.hooksPath=", "clone", "--depth", "1", "--single-branch", "--no-tags", canonical, str(stage)]
         try:
-            try:
-                result = self.runner(command, capture_output=True, text=True, timeout=120, check=False, shell=False)
-            except TypeError:
-                result = self.runner(command)
+            with self._clone_lock:
+                if self.runner is None:
+                    result = _run_bounded_clone(command, stage, staging_root=self.config.staging_root)
+                else:
+                    try:
+                        result = self.runner(command, capture_output=True, text=True, timeout=120, check=False, shell=False)
+                    except TypeError:
+                        result = self.runner(command)
             returncode = getattr(result, "returncode", 0)
             if returncode != 0:
                 raise PreviewError("GitHub clone failed")
@@ -630,13 +790,14 @@ class GitHubOnboarding:
             if not manifest.is_file() or manifest.is_symlink():
                 raise PreviewError("repository root must contain appdock.json")
             _assert_tree_safe(stage, self.config.data_root)
+            _assert_staging_quota(stage, self.config.staging_root)
             raw = json.loads(manifest.read_text(encoding="utf-8"))
             normalized = normalize_manifest(raw, manifest_dir=stage, directory=stage)
             public = {k: v for k, v in normalized.items() if k not in {"env"}}
             digest = _digest({"canonical_url": canonical, "stage": stage.name, "manifest": normalized})
             return {"kind": "github", "url": canonical, "app": public, "staging_id": stage.name, "digest": digest, "confirmation_required": True}
         except (OSError, ValueError, TypeError, subprocess.TimeoutExpired, json.JSONDecodeError, ManifestError) as exc:
-            shutil.rmtree(stage, ignore_errors=True)
+            _remove_tree(stage, ignore_errors=True)
             if isinstance(exc, PreviewError):
                 raise
             raise PreviewError(str(exc)) from exc
@@ -672,16 +833,48 @@ class GitHubOnboarding:
         except Exception:
             if destination.exists() and not stage.exists():
                 destination.replace(stage)
-            shutil.rmtree(registry, ignore_errors=True)
+            _remove_tree(registry, ignore_errors=True)
             raise PreviewError("could not register repository")
         return {"registered": True, "id": app_id, "started": False}
 
     def cleanup(self, staging_id: str) -> bool:
         stage = _safe_child(self.config.staging_root, staging_id)
         if stage.exists():
-            shutil.rmtree(stage)
+            _remove_tree(stage)
             return True
         return False
+
+    def cleanup_stale(self, *, now: float | None = None, ttl_seconds: float = GITHUB_STAGE_TTL_SECONDS) -> int:
+        self.config.ensure()
+        cutoff = (time.time() if now is None else now) - ttl_seconds
+        removed = 0
+        for stage in self.config.staging_root.iterdir():
+            if not stage.name.startswith("repo-") or not stage.is_dir() or stage.is_symlink():
+                continue
+            try:
+                modified = stage.stat().st_mtime
+            except OSError:
+                continue
+            if modified < cutoff:
+                _remove_tree(stage, ignore_errors=True)
+                removed += 1
+        return removed
+
+
+def _staging_cleanup_loop(
+    onboarding: GitHubOnboarding,
+    stop_event: threading.Event,
+    *,
+    interval_seconds: float = 300,
+    ttl_seconds: float = GITHUB_STAGE_TTL_SECONDS,
+) -> None:
+    while not stop_event.is_set():
+        try:
+            onboarding.cleanup_stale(ttl_seconds=ttl_seconds)
+        except OSError:
+            pass
+        if stop_event.wait(interval_seconds):
+            return
 
 
 def canonical_github_url(url: str) -> str:
@@ -806,6 +999,16 @@ def _read_asset(opener: Callable[..., Any], url: str, max_bytes: int) -> bytes:
     except TypeError:
         response = opener(request)
     def read_stream(stream: Any) -> bytes:
+        final_url = stream.geturl() if callable(getattr(stream, "geturl", None)) else url
+        parsed = urllib.parse.urlsplit(final_url)
+        host = (parsed.hostname or "").lower()
+        allowed_host = host == "github.com" or host == "objects.githubusercontent.com" or host.endswith(".githubusercontent.com")
+        try:
+            explicit_port = parsed.port
+        except ValueError as exc:
+            raise AppDockError("update asset redirected to an invalid URL") from exc
+        if parsed.scheme != "https" or explicit_port is not None or not allowed_host or parsed.username or parsed.password:
+            raise AppDockError("update asset redirected to an untrusted host")
         length = stream.headers.get("Content-Length") if getattr(stream, "headers", None) else None
         if length is not None and int(length) > max_bytes:
             raise AppDockError("update asset is too large")
@@ -849,7 +1052,7 @@ def _assert_zip_member(name: str, info: zipfile.ZipInfo) -> None:
         if part.endswith((".", " ")):
             raise AppDockError("update ZIP contains a Windows-unsafe path")
         device = part.split(".", 1)[0].upper()
-        if device in {"CON", "PRN", "AUX", "NUL", *{f"COM{i}" for i in range(1, 10)}, *{f"LPT{i}" for i in range(1, 10)}}:
+        if device in {"CON", "PRN", "AUX", "NUL", *{f"COM{i}" for i in range(1, 10)}, *{f"LPT{i}" for i in range(1, 10)}} or re.fullmatch(r"(?:COM|LPT)[¹²³]", device):
             raise AppDockError("update ZIP contains a Windows device name")
     reserved = {"data", "registry", "apps", "runtime", "staging", "updates", "user-data"}
     if any(part.lower() in reserved for part in parts):
@@ -864,7 +1067,7 @@ def _parse_release_manifest(data: bytes) -> dict[str, str]:
         payload = json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise AppDockError("release inventory is invalid") from exc
-    if not isinstance(payload, dict) or payload.get("schema_version") != 1 or not isinstance(payload.get("files"), list):
+    if not isinstance(payload, dict) or payload.get("schema_version") not in {1, 2} or not isinstance(payload.get("files"), list):
         raise AppDockError("release inventory is invalid")
     inventory: dict[str, str] = {}
     for item in payload["files"]:
@@ -980,17 +1183,22 @@ def stage_update(release: dict[str, Any], config: AppDockConfig, *, opener: Call
                 archive.extract(info, temporary)
         temporary.replace(destination)
     except Exception:
-        shutil.rmtree(temporary, ignore_errors=True)
+        _remove_tree(temporary, ignore_errors=True)
         raise
     return {"staged": True, "version": version, "path": str(destination), "digest": _digest({"version": version, "release_url": release.get("release_url"), "assets": assets})}
 
 
 def apply_update(staged_dir: str | Path, install_dir: str | Path, data_dir: str | Path, *, restart: Callable[[], Any] | None = None) -> dict[str, Any]:
-    staged, install, data = Path(staged_dir).resolve(), Path(install_dir).resolve(), Path(data_dir).resolve()
+    staged_lexical = Path(staged_dir).expanduser().absolute()
+    install, data = Path(install_dir).resolve(), Path(data_dir).resolve()
+    if _is_link_or_reparse(staged_lexical):
+        raise AppDockError("staged update root is a symlink or reparse point")
+    staged = staged_lexical.resolve()
     if _inside(install, data) or _inside(data, install):
         raise AppDockError("installation and data roots must not overlap")
     if not staged.is_dir() or not _inside(staged, data / "updates"):
         raise AppDockError("staged update path is invalid")
+    _assert_tree_safe(staged_lexical, data / "updates")
     target_inventory = _load_release_inventory(staged, complete=True)
     current_inventory = _load_release_inventory(install, complete=False) if install.exists() else {}
     target_files = {*target_inventory, RELEASE_MANIFEST_NAME}
@@ -1000,7 +1208,8 @@ def apply_update(staged_dir: str | Path, install_dir: str | Path, data_dir: str 
     affected = sorted(target_files | current_files)
     backup = data / "updates" / "backups" / uuid.uuid4().hex
     backup.mkdir(parents=True, exist_ok=False)
-    result = {"applied": True, "backup": str(backup), "files": affected}
+    preexisting: list[str] = []
+    result = {"applied": True, "backup": str(backup), "files": affected, "preexisting": preexisting}
     try:
         install.mkdir(parents=True, exist_ok=True)
         for relative in affected:
@@ -1011,6 +1220,11 @@ def apply_update(staged_dir: str | Path, install_dir: str | Path, data_dir: str 
                 backup_target = _release_path(backup, relative)
                 backup_target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(old, backup_target)
+                preexisting.append(relative)
+    except Exception as exc:
+        _remove_tree(backup, ignore_errors=True)
+        raise AppDockError("update backup failed; installation was not changed") from exc
+    try:
         for relative in sorted(target_files):
             source = _release_path(staged, relative)
             destination = _release_path(install, relative)
@@ -1036,8 +1250,10 @@ def rollback_update(applied: dict[str, Any], install_dir: str | Path, data_dir: 
     if not backup.is_dir() or not _inside(backup, backup_root):
         raise AppDockError("update backup path is invalid")
     files = applied.get("files")
-    if not isinstance(files, list):
+    preexisting = applied.get("preexisting")
+    if not isinstance(files, list) or not isinstance(preexisting, list) or not all(isinstance(item, str) for item in preexisting):
         raise AppDockError("update rollback file list is invalid")
+    preexisting_set = set(preexisting)
     for raw_relative in files:
         if not isinstance(raw_relative, str):
             raise AppDockError("update rollback path is invalid")
@@ -1048,7 +1264,9 @@ def rollback_update(applied: dict[str, Any], install_dir: str | Path, data_dir: 
         saved = (backup / relative).resolve()
         if not _inside(target, install) or not _inside(saved, backup):
             raise AppDockError("update rollback path escapes its root")
-        if saved.is_file():
+        if raw_relative in preexisting_set:
+            if not saved.is_file():
+                raise AppDockError("update rollback backup is incomplete")
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(saved, target)
         else:
@@ -1076,19 +1294,24 @@ def launch_update_helper(
     ``restart_command`` and ``popen`` are injection points for tests and trusted
     callers only; the HTTP API never takes either value from a request body.
     """
-    staged = Path(staged_dir).expanduser().resolve()
-    install = Path(install_dir).expanduser().resolve()
-    data = Path(data_dir).expanduser().resolve()
+    staged = Path(staged_dir).expanduser().absolute()
+    install = Path(install_dir).expanduser().absolute()
+    data = Path(data_dir).expanduser().absolute()
+    for root in (staged, install, data):
+        _assert_no_link_or_reparse_ancestor(root)
     if _is_development_checkout(install):
         raise AppDockError("one-click updates are disabled in a .git checkout; use git pull")
-    helper = Path(helper_path).expanduser().resolve() if helper_path else Path(__file__).resolve().parent / "scripts" / "update_helper.py"
-    if not helper.is_file():
-        raise AppDockError("update helper is not installed")
+    helper = Path(helper_path).expanduser().resolve() if helper_path else staged / "scripts" / "update_helper.py"
+    if not _inside(staged, data / "updates"):
+        raise AppDockError("staged update path is invalid")
+    if not helper.is_file() or helper.is_symlink() or not _inside(helper, staged):
+        raise AppDockError("verified staged update helper is not installed")
     command = [sys.executable, str(install / "appdock.py"), *list(restart_args)] if restart_command is None else restart_command
     if not isinstance(command, list) or not command or not all(isinstance(item, str) and item for item in command):
         raise AppDockError("restart command is invalid")
     helper_command = [
         sys.executable,
+        "-B",
         str(helper),
         "--staged", str(staged),
         "--install", str(install),
@@ -1096,15 +1319,44 @@ def launch_update_helper(
         "--pid", str(current_pid if current_pid is not None else os.getpid()),
         "--restart-script", command[1] if len(command) > 1 else str(install / "appdock.py"),
     ]
+    handshake = data / "runtime" / f"update-helper-{uuid.uuid4().hex}.ready"
+    handshake_token = secrets.token_urlsafe(32)
+    handshake.parent.mkdir(parents=True, exist_ok=True)
+    handshake.unlink(missing_ok=True)
+    helper_command.extend(["--handshake", str(handshake), "--handshake-token", handshake_token])
     if command and command[0] != sys.executable:
         raise AppDockError("restart command must use the configured Python executable")
     for argument in command[2:]:
         helper_command.append(f"--restart-arg={argument}")
     runner = popen or subprocess.Popen
     try:
-        return runner(helper_command, shell=False, close_fds=True)
+        process = runner(helper_command, shell=False, close_fds=True)
     except OSError as exc:
         raise AppDockError("could not launch update helper") from exc
+    deadline = time.monotonic() + 5
+    confirmed = False
+    try:
+        while time.monotonic() < deadline:
+            if handshake.is_file():
+                if not secrets.compare_digest(handshake.read_text(encoding="utf-8"), handshake_token):
+                    raise AppDockError("update helper startup handshake is invalid")
+                if callable(getattr(process, "poll", None)) and process.poll() is not None:
+                    raise AppDockError("update helper exited during startup")
+                confirmed = True
+                return process
+            if callable(getattr(process, "poll", None)) and process.poll() is not None:
+                raise AppDockError("update helper exited before startup handshake")
+            time.sleep(0.05)
+        raise AppDockError("update helper did not confirm startup")
+    finally:
+        handshake.unlink(missing_ok=True)
+        if not confirmed and callable(getattr(process, "poll", None)) and process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=2)
+            except Exception:
+                if callable(getattr(process, "kill", None)):
+                    process.kill()
 
 
 def restart_appdock() -> None:
@@ -1185,13 +1437,96 @@ HTML = r'''<!doctype html>
 </html>'''
 
 
+class UpdateCoordinator:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._staged: dict[str, Any] | None = None
+        self._staging = False
+        self._applying = False
+
+    def begin_stage(self) -> None:
+        with self._lock:
+            if self._applying:
+                raise AppDockError("an update is already being applied")
+            if self._staged is not None or self._staging:
+                raise AppDockError("an update is already staged or staging")
+            self._staging = True
+
+    def finish_stage(self, staged: dict[str, Any]) -> None:
+        if not isinstance(staged, dict) or not isinstance(staged.get("digest"), str):
+            raise AppDockError("staged update is invalid")
+        with self._lock:
+            if not self._staging or self._applying or self._staged is not None:
+                raise AppDockError("update staging reservation is invalid")
+            self._staged = staged
+            self._staging = False
+
+    def cancel_stage(self) -> None:
+        with self._lock:
+            self._staging = False
+
+    def store(self, staged: dict[str, Any]) -> None:
+        if not isinstance(staged, dict) or not isinstance(staged.get("digest"), str):
+            raise AppDockError("staged update is invalid")
+        with self._lock:
+            if self._applying:
+                raise AppDockError("an update is already being applied")
+            if self._staged is not None or self._staging:
+                raise AppDockError("an update is already staged")
+            self._staged = staged
+
+    def claim(self, confirmation: str) -> dict[str, Any]:
+        with self._lock:
+            if self._applying:
+                raise AppDockError("an update is already being applied")
+            if self._staging:
+                raise AppDockError("an update is still staging")
+            if not self._staged or confirmation != self._staged.get("digest"):
+                raise AppDockError("staged update confirmation is stale or invalid")
+            staged = self._staged
+            self._staged = None
+            self._applying = True
+            return staged
+
+    def restore(self, staged: dict[str, Any]) -> None:
+        with self._lock:
+            self._applying = False
+            self._staged = staged
+
+
+def stage_coordinated_update(
+    release: dict[str, Any],
+    config: AppDockConfig,
+    coordinator: UpdateCoordinator,
+    *,
+    repository: str,
+    stager: Callable[..., dict[str, Any]] = stage_update,
+) -> dict[str, Any]:
+    coordinator.begin_stage()
+    staged: dict[str, Any] | None = None
+    try:
+        staged = stager(release, config, repository=repository)
+        coordinator.finish_stage(staged)
+    except Exception:
+        if staged is not None:
+            raw_path = staged.get("path")
+            if isinstance(raw_path, str):
+                staged_path = Path(raw_path).resolve()
+                if staged_path != config.updates_root.resolve() and _inside(staged_path, config.updates_root):
+                    _remove_tree(staged_path, ignore_errors=True)
+        coordinator.cancel_stage()
+        raise
+    return staged
+
+
 class Handler(BaseHTTPRequestHandler):
     manager: AppManager = AppManager()
     config: AppDockConfig = manager.config
     local: LocalFolderOnboarding = LocalFolderOnboarding(config)
     github: GitHubOnboarding = GitHubOnboarding(config)
     checker: ReleaseChecker = ReleaseChecker(config.update_repository)
-    staged_update: dict[str, Any] | None = None
+    coordinator: UpdateCoordinator = UpdateCoordinator()
+    ready_token: str | None = None
     def _security_headers(self) -> None:
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
@@ -1273,9 +1608,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._html(HTML)
             elif path == "/static/app.css": self._static("app.css", "text/css; charset=utf-8")
             elif path == "/static/app.js": self._static("app.js", "text/javascript; charset=utf-8")
-            elif path == "/health": self._json({"ok": True, "service": "appdock", "version": CURRENT_VERSION})
+            elif path == "/health":
+                health = {"ok": True, "service": "appdock", "version": CURRENT_VERSION}
+                if self.ready_token is not None:
+                    health["ready_token"] = self.ready_token
+                self._json(health)
             elif path == "/api/apps": self._json(self.manager.all_status())
-            elif path == "/api/config": self._json({"version": CURRENT_VERSION, "data_root": str(self.config.data_root), "registry_root": str(self.config.registry_root), "install_root": str(self.config.install_root), "update_repository": self.config.update_repository})
+            elif path == "/api/config": self._json({"version": CURRENT_VERSION, "update_repository": self.config.update_repository})
             elif path == "/api/updates/check":
                 release = self.checker.check()
                 self._json({**release, "confirmation_digest": _digest(release)})
@@ -1306,16 +1645,17 @@ class Handler(BaseHTTPRequestHandler):
                 release = self.checker.check()
                 if not release.get("update_available") or body.get("confirmation") != _digest(release):
                     raise AppDockError("update confirmation is stale or invalid")
-                Handler.staged_update = stage_update(release, self.config, repository=self.config.update_repository)
-                self._json({"staged": True, "version": Handler.staged_update["version"], "confirmation_digest": Handler.staged_update["digest"]}); return
+                staged = stage_coordinated_update(release, self.config, Handler.coordinator, repository=self.config.update_repository)
+                self._json({"staged": True, "version": staged["version"], "confirmation_digest": staged["digest"]}); return
             if path == "/api/updates/apply":
-                staged = Handler.staged_update
-                if not staged or body.get("confirmation") != staged.get("digest"):
-                    raise AppDockError("staged update confirmation is stale or invalid")
+                staged = Handler.coordinator.claim(body.get("confirmation", ""))
                 install_dir = Path(__file__).resolve().parent
                 restart_args = ["--host", str(self.server.server_address[0]), "--port", str(self.server.server_address[1]), "--data-dir", str(self.config.data_root)]
-                launch_update_helper(staged["path"], install_dir, self.config.data_root, current_pid=os.getpid(), restart_args=restart_args)
-                Handler.staged_update = None
+                try:
+                    launch_update_helper(staged["path"], install_dir, self.config.data_root, current_pid=os.getpid(), restart_args=restart_args)
+                except Exception:
+                    Handler.coordinator.restore(staged)
+                    raise
                 self._json({"restart_pending": True, "version": staged.get("version")}, 202)
                 threading.Thread(target=self.server.shutdown, daemon=True).start(); return
             self._json({"error": "not found"}, 404)
@@ -1330,15 +1670,23 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--data-dir", default=None)
+    parser.add_argument("--ready-token", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
     validate_bind_host(args.host)
+    if args.ready_token is not None and not re.fullmatch(r"[A-Za-z0-9_-]{20,128}", args.ready_token):
+        parser.error("invalid readiness token")
     config = AppDockConfig.from_environment(data_dir=args.data_dir)
-    config.ensure(); Handler.config = config; Handler.manager = AppManager(config=config); Handler.local = LocalFolderOnboarding(config); Handler.github = GitHubOnboarding(config); Handler.checker = ReleaseChecker(config.update_repository); Handler.staged_update = None
+    config.ensure(); Handler.config = config; Handler.manager = AppManager(config=config); Handler.local = LocalFolderOnboarding(config); Handler.github = GitHubOnboarding(config); Handler.checker = ReleaseChecker(config.update_repository); Handler.coordinator = UpdateCoordinator(); Handler.ready_token = args.ready_token
+    cleanup_stop = threading.Event()
+    cleanup_thread = threading.Thread(target=_staging_cleanup_loop, args=(Handler.github, cleanup_stop), name="appdock-staging-cleanup", daemon=True)
+    cleanup_thread.start()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"AppDock listening at http://{args.host}:{args.port}", flush=True)
     try: server.serve_forever()
     except KeyboardInterrupt: pass
-    finally: server.server_close()
+    finally:
+        cleanup_stop.set()
+        server.server_close()
 
 
 if __name__ == "__main__": main()

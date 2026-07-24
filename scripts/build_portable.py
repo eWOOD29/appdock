@@ -60,7 +60,7 @@ def build_archive(output: Path = DEFAULT_OUTPUT, root: Path = ROOT) -> str:
     files = release_files(root)
     payloads = {safe_archive_name(path, root): path.read_bytes() for path in files}
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "files": [
             {"path": name, "sha256": hashlib.sha256(content).hexdigest()}
             for name, content in sorted(payloads.items())

@@ -76,6 +76,20 @@ Do not overlap the program and data directories.
 
 Keep the old program folder and launcher backup until the public build has survived normal use. User data and app source folders should remain untouched by rollback.
 
+## v0.1.0 → v0.1.1 safety migration
+
+Use the Windows installer or portable ZIP manually for this one transition. Do **not** rely on the v0.1.0 one-click updater.
+
+The v0.1.1 archive intentionally uses release-inventory schema `2`. AppDock v0.1.0 rejects that schema before replacement, preventing its older external helper from applying the update without the newer readiness and rollback guarantees. After v0.1.1 is installed, later compatible releases use the checksum-verified helper from the incoming staged release.
+
+1. Download `appdock-windows.zip` and `SHA256SUMS.txt` from the v0.1.1 GitHub release.
+2. Verify the ZIP checksum.
+3. Stop v0.1.0.
+4. Extract the ZIP and run `scripts\install.ps1` with the existing intended data directory, or use the portable build with that data directory.
+5. Start v0.1.1 and verify <http://127.0.0.1:8765/health> before removing the old program backup.
+
+User data remains separate and should not be deleted or moved for this transition.
+
 ## Compatibility notes
 
 - Public AppDock stores mutable state outside the repository and installation directory.

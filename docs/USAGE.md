@@ -34,8 +34,8 @@ GitHub import is intentionally separated from routine local registration because
 1. Open **Add app** → **Advanced: GitHub**.
 2. Paste `https://github.com/owner/repository`.
 3. Select **Clone and preview**.
-4. AppDock clones into its staging directory without running repository code.
-5. AppDock requires `appdock.json` at the repository root and validates it.
+4. AppDock performs one shallow, single-branch, no-tag clone at a time into its staging directory without running repository code. Git hooks and LFS smudging are disabled. While Git runs, AppDock monitors both the checkout and total staging area and terminates the clone if file-count, byte, or time limits are crossed.
+5. AppDock requires `appdock.json` at the repository root and validates it. Unregistered browser previews are cleaned when replaced/closed, late or superseded responses clean their own stages, and a background janitor removes abandoned stages after the TTL.
 6. Review the exact command and resolved paths.
 7. Select **Register** to move the staged checkout into the configured app-install directory.
 8. Start the app only after completing any documented prerequisites and deciding you trust it.

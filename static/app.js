@@ -4,6 +4,8 @@ const byId = (id) => document.getElementById(id);
 let previewState = null;
 let previewKind = "";
 let verifiedRelease = null;
+let previewRequestId = 0;
+let addDialogOpen = false;
 
 function element(tag, text = "", className = "") {
   const node = document.createElement(tag);
@@ -126,8 +128,12 @@ async function runAction(button) {
 }
 
 function showAddDialog() {
+  addDialogOpen = true;
+  previewRequestId += 1;
+  const abandonedStage = previewKind === "github" ? previewState?.staging_id : "";
   previewState = null;
   previewKind = "";
+  void cleanupGitHubStage(abandonedStage);
   byId("previewPanel").hidden = true;
   byId("registerButton").hidden = true;
   byId("previewOutput").textContent = "";
@@ -135,8 +141,30 @@ function showAddDialog() {
   byId("localFolder").focus();
 }
 
+async function cleanupGitHubStage(stagingId) {
+  if (!stagingId) return;
+  try {
+    await api("/api/onboarding/github/cleanup", {
+      method: "POST",
+      body: JSON.stringify({ staging_id: stagingId }),
+    });
+  } catch (_error) {
+    // Staging may already have been moved by a successful registration.
+  }
+}
+
+async function cleanupGitHubPreview() {
+  const stagingId = previewKind === "github" ? previewState?.staging_id : "";
+  previewState = null;
+  previewKind = "";
+  await cleanupGitHubStage(stagingId);
+}
+
 function closeAddDialog() {
+  addDialogOpen = false;
+  previewRequestId += 1;
   byId("addModal").hidden = true;
+  void cleanupGitHubPreview();
 }
 
 async function previewApp(kind) {
@@ -148,13 +176,22 @@ async function previewApp(kind) {
   }
   const path = isLocal ? "/api/onboarding/local/preview" : "/api/onboarding/github/preview";
   const payload = isLocal ? { folder: value } : { url: value };
+  const requestId = ++previewRequestId;
   try {
-    previewState = await api(path, { method: "POST", body: JSON.stringify(payload) });
+    await cleanupGitHubPreview();
+    if (!addDialogOpen || requestId !== previewRequestId) return;
+    const result = await api(path, { method: "POST", body: JSON.stringify(payload) });
+    if (!addDialogOpen || requestId !== previewRequestId) {
+      if (kind === "github") await cleanupGitHubStage(result.staging_id);
+      return;
+    }
+    previewState = result;
     previewKind = kind;
     byId("previewOutput").textContent = JSON.stringify(previewState, null, 2);
     byId("previewPanel").hidden = false;
     byId("registerButton").hidden = false;
   } catch (error) {
+    if (!addDialogOpen || requestId !== previewRequestId) return;
     byId("previewPanel").hidden = false;
     byId("registerButton").hidden = true;
     byId("previewOutput").textContent = error.message;
@@ -172,6 +209,8 @@ async function registerPreview() {
     const result = await api(path, { method: "POST", body: JSON.stringify(payload) });
     byId("previewOutput").textContent = `${result.id} registered. It remains stopped until you press Start.`;
     byId("registerButton").hidden = true;
+    previewState = null;
+    previewKind = "";
     await loadApps();
   } catch (error) {
     byId("previewOutput").textContent = error.message;
