@@ -153,9 +153,11 @@ Write-Output 'process ownership probe passed'
 
     def test_uninstaller_bootstraps_path_safety_hash_before_dot_sourcing(self) -> None:
         script = (Path(__file__).resolve().parents[1] / "scripts" / "uninstall.ps1").read_text(encoding="utf-8")
-        bootstrap = script.index("Get-FileHash")
+        bootstrap = script.index("Get-AppDockBootstrapSha256")
         dot_source = script.index(". (Join-Path $PSScriptRoot 'path_safety.ps1')")
         self.assertLess(bootstrap, dot_source)
+        self.assertIn("System.Security.Cryptography.SHA256", script)
+        self.assertNotIn("Get-FileHash", script)
 
     def test_uninstall_rejects_file_valued_data_dir_before_deleting_anything(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
