@@ -46,6 +46,7 @@ MAX_EXTENSION_WIDGETS = 16
 MAX_WIDGET_METRICS = 12
 MAX_WIDGET_PROGRESS = 6
 PRIVATE_PACKAGE_MANIFEST = "appdock-private-package.json"
+PRIVATE_PACKAGE_HASH_MANIFEST = "PACKAGE-MANIFEST.json"
 RELEASE_MANIFEST_NAME = "RELEASE-MANIFEST.json"
 REQUIRED_RELEASE_FILES = {
     "appdock.py",
@@ -167,6 +168,56 @@ def _canonical_json(value: Any) -> bytes:
 
 def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value)).hexdigest()
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise AppDockError(f"JSON contains duplicate key: {key}")
+        result[key] = value
+    return result
+
+
+def _loads_strict_json(text: str) -> Any:
+    try:
+        return json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+    except AppDockError:
+        raise
+    except json.JSONDecodeError as exc:
+        raise AppDockError("JSON file is invalid") from exc
+
+
+def _fsync_directory(path: Path) -> None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
+def _durable_write_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    with temporary.open("wb") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+    _fsync_directory(path.parent)
+
+
+def _durable_write_json(path: Path, payload: Any) -> None:
+    _durable_write_bytes(path, (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+
+
+def _durable_copy(source: Path, destination: Path) -> None:
+    _durable_write_bytes(destination, source.read_bytes())
 
 
 def _inside(path: Path, root: Path) -> bool:
@@ -598,38 +649,48 @@ class ExtensionManager:
     def __init__(self, config: AppDockConfig):
         self.config = config
         self._lock = threading.RLock()
-        self._last_good: ExtensionConfig = ExtensionConfig()
-        self._last_config_signature: tuple[int, int] | None = None
+        self._active = ExtensionConfig()
+        self._last_config_signature: tuple[int, int, tuple[str, ...] | None] | None = None
         self._config_error = ""
         self._provider_cache: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
 
-    def _load_config(self) -> ExtensionConfig:
+    def _disable(self, error: str, signature: tuple[int, int, tuple[str, ...] | None] | None) -> ExtensionConfig:
+        self._active = ExtensionConfig()
+        self._last_config_signature = signature
+        self._config_error = error
+        self._provider_cache.clear()
+        return self._active
+
+    def _load_config(self, valid_app_ids: Iterable[str] | None = None) -> ExtensionConfig:
         path = self.config.extension_config_path
+        known = tuple(sorted(set(valid_app_ids))) if valid_app_ids is not None else None
         try:
             stat_result = path.stat()
-            signature = (stat_result.st_mtime_ns, stat_result.st_size)
+            signature = (stat_result.st_mtime_ns, stat_result.st_size, known)
             if signature == self._last_config_signature:
-                return self._last_good
-            if not path.is_file() or path.is_symlink() or stat_result.st_size > MAX_EXTENSION_CONFIG_BYTES:
+                return self._active
+            if not path.is_file() or path.is_symlink() or _is_link_or_reparse(path) or stat_result.st_size > MAX_EXTENSION_CONFIG_BYTES:
                 raise AppDockError("private extension configuration is invalid")
-            raw = json.loads(path.read_text(encoding="utf-8"))
+            raw = _loads_strict_json(path.read_text(encoding="utf-8"))
             parsed = parse_extension_config(raw)
-            self._last_good = parsed
+            if known is not None and not parsed.hidden_app_ids.issubset(set(known)):
+                raise AppDockError("visibility configuration references an unknown registration")
+            self._active = parsed
             self._last_config_signature = signature
             self._config_error = ""
+            self._provider_cache.clear()
             return parsed
         except FileNotFoundError:
-            self._last_good = ExtensionConfig()
-            self._last_config_signature = None
-            self._config_error = ""
-            return self._last_good
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError, AppDockError):
-            self._config_error = "Private extensions are unavailable because their configuration is invalid."
-            return self._last_good
+            return self._disable("", None)
+        except (OSError, UnicodeDecodeError, AppDockError):
+            return self._disable(
+                "Private extensions are unavailable because their configuration is invalid.",
+                locals().get("signature"),
+            )
 
-    def hidden_app_ids(self) -> frozenset[str]:
+    def hidden_app_ids(self, valid_app_ids: Iterable[str] | None = None) -> frozenset[str]:
         with self._lock:
-            return self._load_config().hidden_app_ids
+            return self._load_config(valid_app_ids).hidden_app_ids
 
     def _fetch_provider(self, spec: ProviderSpec) -> dict[str, Any]:
         key = (spec.provider_id, spec.url, spec.connect_timeout, spec.read_timeout, spec.cache_seconds)
@@ -660,22 +721,22 @@ class ExtensionManager:
             body = response.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
             if len(body) > MAX_PROVIDER_RESPONSE_BYTES:
                 raise AppDockError("provider response is too large")
-            raw = json.loads(body.decode("utf-8"))
+            raw = _loads_strict_json(body.decode("utf-8"))
             if not isinstance(raw, dict) or set(raw) != {"schema_version", "widgets"} or raw.get("schema_version") != 1:
                 raise AppDockError("provider response schema is invalid")
             if not isinstance(raw.get("widgets"), dict) or _json_depth(raw) > 5:
                 raise AppDockError("provider response is unbounded")
             payload = raw
-        except (OSError, TimeoutError, ValueError, UnicodeDecodeError, json.JSONDecodeError, http.client.HTTPException, AppDockError) as exc:
+        except (OSError, TimeoutError, ValueError, UnicodeDecodeError, http.client.HTTPException, AppDockError) as exc:
             payload = {"error": str(exc)}
         finally:
             connection.close()
         self._provider_cache[key] = (now + max(1.0, spec.cache_seconds), payload)
         return payload
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self, valid_app_ids: Iterable[str] | None = None) -> dict[str, Any]:
         with self._lock:
-            config = self._load_config()
+            config = self._load_config(valid_app_ids)
             providers = {item.provider_id: item for item in config.providers}
             provider_payloads = {provider_id: self._fetch_provider(spec) for provider_id, spec in providers.items()}
             widgets: list[dict[str, Any]] = []
@@ -714,24 +775,86 @@ def _safe_package_file(root: Path, relative: Any) -> Path:
     if pure.is_absolute() or not pure.parts or any(part in {"", ".", ".."} for part in pure.parts):
         raise AppDockError("private package path is invalid")
     path = (root / Path(*pure.parts)).resolve()
-    if not _inside(path, root) or not path.is_file() or path.is_symlink():
+    if not _inside(path, root) or not path.is_file() or path.is_symlink() or _is_link_or_reparse(path):
         raise AppDockError("private package file is missing or unsafe")
     return path
 
 
 def _read_bounded_json(path: Path, maximum: int = MAX_JSON_BYTES) -> Any:
-    if path.stat().st_size > maximum:
-        raise AppDockError("JSON file is too large")
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        if not path.is_file() or path.is_symlink() or _is_link_or_reparse(path) or path.stat().st_size > maximum:
+            raise AppDockError("JSON file is missing, unsafe, or too large")
+        return _loads_strict_json(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError) as exc:
         raise AppDockError("JSON file is invalid") from exc
+
+
+def _private_package_files(root: Path) -> set[str]:
+    files: set[str] = set()
+    for current, directories, filenames in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        if _is_link_or_reparse(current_path):
+            raise AppDockError("private package contains a symlink or reparse point")
+        for name in directories:
+            if _is_link_or_reparse(current_path / name):
+                raise AppDockError("private package contains a symlink or reparse point")
+        for name in filenames:
+            path = current_path / name
+            if path.is_symlink() or _is_link_or_reparse(path) or not path.is_file():
+                raise AppDockError("private package contains a non-file or unsafe member")
+            relative = path.relative_to(root).as_posix()
+            _safe_package_file(root, relative)
+            if relative in files:
+                raise AppDockError("private package contains duplicate members")
+            files.add(relative)
+    return files
+
+
+def _verify_private_package_manifest(root: Path) -> dict[str, Any]:
+    manifest_path = _safe_package_file(root, PRIVATE_PACKAGE_HASH_MANIFEST)
+    manifest = _read_bounded_json(manifest_path)
+    if (
+        not isinstance(manifest, dict)
+        or set(manifest) != {"schema_version", "package", "migration_digest", "files"}
+        or manifest.get("schema_version") != 1
+        or manifest.get("package") != "AppDock private integration package"
+        or not isinstance(manifest.get("migration_digest"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", manifest["migration_digest"])
+        or not isinstance(manifest.get("files"), list)
+        or not manifest["files"]
+    ):
+        raise AppDockError("private package hash manifest is invalid")
+    declared: dict[str, dict[str, Any]] = {}
+    for item in manifest["files"]:
+        if not isinstance(item, dict) or set(item) != {"path", "sha256", "size"}:
+            raise AppDockError("private package hash manifest entry is invalid")
+        relative, digest, size = item["path"], item["sha256"], item["size"]
+        if relative in declared or relative == PRIVATE_PACKAGE_HASH_MANIFEST:
+            raise AppDockError("private package hash manifest contains duplicate or self entries")
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise AppDockError("private package hash manifest checksum is invalid")
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0 or size > MAX_UPDATE_UNCOMPRESSED_BYTES:
+            raise AppDockError("private package hash manifest size is invalid")
+        path = _safe_package_file(root, relative)
+        payload = path.read_bytes()
+        if len(payload) != size or hashlib.sha256(payload).hexdigest() != digest:
+            raise AppDockError("private package file does not match its declared size and checksum")
+        declared[relative] = item
+    actual = _private_package_files(root)
+    if actual != {*declared, PRIVATE_PACKAGE_HASH_MANIFEST}:
+        raise AppDockError("private package member set does not exactly match its hash manifest")
+    identity = {
+        relative: hashlib.sha256(_safe_package_file(root, relative).read_bytes()).hexdigest()
+        for relative in sorted(actual)
+    }
+    return {"manifest": manifest, "declared": declared, "identity": identity}
 
 
 def preview_private_package(package_root: str | Path) -> dict[str, Any]:
     root = Path(package_root).expanduser().resolve()
-    if not root.is_dir() or root.is_symlink():
+    if not root.is_dir() or root.is_symlink() or _is_link_or_reparse(root):
         raise AppDockError("private package directory is invalid")
+    package_integrity = _verify_private_package_manifest(root)
     package_path = _safe_package_file(root, PRIVATE_PACKAGE_MANIFEST)
     package = _read_bounded_json(package_path)
     required = {"schema_version", "registrations", "order_path", "extension_config_path"}
@@ -740,6 +863,8 @@ def preview_private_package(package_root: str | Path) -> dict[str, Any]:
     registration_paths = package.get("registrations")
     if not isinstance(registration_paths, list) or not registration_paths or len(registration_paths) > 256:
         raise AppDockError("private package registrations are invalid")
+    if len(set(registration_paths)) != len(registration_paths):
+        raise AppDockError("private package contains duplicate registration paths")
     registrations: dict[str, dict[str, Any]] = {}
     for relative in registration_paths:
         path = _safe_package_file(root, relative)
@@ -778,13 +903,17 @@ def preview_private_package(package_root: str | Path) -> dict[str, Any]:
         "order": order,
         "extensions": normalized_extensions,
     }
+    digest = _digest(normalized)
+    if digest != package_integrity["manifest"]["migration_digest"]:
+        raise AppDockError("private package migration digest does not match its hash manifest")
     return {
         "schema_version": 1,
         "registration_count": len(registrations),
         "visible_count": len(registrations) - len(extension.hidden_app_ids),
         "order_count": len(order),
-        "digest": _digest(normalized),
+        "digest": digest,
         "normalized": normalized,
+        "package_identity": package_integrity["identity"],
     }
 
 
@@ -798,114 +927,216 @@ def _migration_targets(preview: dict[str, Any], config: AppDockConfig) -> dict[P
     return targets
 
 
-def _restore_migration_receipt(receipt: dict[str, Any], config: AppDockConfig, *, verify_applied: bool) -> None:
-    entries = receipt.get("entries")
-    backup_root = Path(receipt.get("backup_root", "")).resolve()
-    if not isinstance(entries, list) or not _inside(backup_root, config.migration_root):
-        raise AppDockError("migration receipt is invalid")
-    validated: list[tuple[Path, dict[str, Any]]] = []
-    for entry in entries:
-        if not isinstance(entry, dict) or set(entry) != {"target", "existed", "backup", "applied_sha256"}:
-            raise AppDockError("migration receipt is invalid")
-        target = (config.data_root / Path(*PurePosixPath(entry["target"]).parts)).resolve()
-        if not _inside(target, config.data_root):
-            raise AppDockError("migration receipt target is unsafe")
-        if verify_applied:
-            if not target.is_file() or hashlib.sha256(target.read_bytes()).hexdigest() != entry["applied_sha256"]:
-                raise AppDockError("migration rollback refused because imported state changed")
-        validated.append((target, entry))
-    for target, entry in reversed(validated):
-        if entry["existed"]:
-            backup = (backup_root / Path(*PurePosixPath(entry["backup"]).parts)).resolve()
-            if not _inside(backup, backup_root) or not backup.is_file() or backup.is_symlink():
-                raise AppDockError("migration backup is missing or unsafe")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            temp = target.with_name(target.name + ".rollback.tmp")
-            temp.write_bytes(backup.read_bytes())
-            temp.replace(target)
+def _migration_transaction_path(config: AppDockConfig, operation_id: str) -> Path:
+    if not re.fullmatch(r"[0-9a-f]{32}", operation_id):
+        raise AppDockError("migration transaction identity is invalid")
+    path = (config.migration_root / "transactions" / operation_id).resolve()
+    if not _inside(path, config.migration_root):
+        raise AppDockError("migration transaction path is unsafe")
+    return path
+
+
+def _migration_journal(path: Path) -> dict[str, Any]:
+    journal = _read_bounded_json(path / "transaction.json")
+    if not isinstance(journal, dict) or journal.get("schema_version") != 2:
+        raise AppDockError("migration transaction is invalid")
+    required = {"schema_version", "operation_id", "digest", "phase", "recovery", "entries"}
+    if set(journal) != required or journal["phase"] not in {"prepared", "applying", "committed", "complete", "rolled_back"}:
+        raise AppDockError("migration transaction is invalid")
+    if journal["recovery"] not in {"restore-old", "finish-new"} or not isinstance(journal["entries"], list):
+        raise AppDockError("migration transaction is invalid")
+    return journal
+
+
+def _migration_entry_paths(entry: dict[str, Any], tx_root: Path, config: AppDockConfig) -> tuple[Path, Path, Path]:
+    required = {"target", "existed", "old_sha256", "new_sha256", "backup", "staged"}
+    if not isinstance(entry, dict) or set(entry) != required or not isinstance(entry["existed"], bool):
+        raise AppDockError("migration transaction entry is invalid")
+    target = (config.data_root / Path(*PurePosixPath(entry["target"]).parts)).resolve()
+    backup = (tx_root / Path(*PurePosixPath(entry["backup"]).parts)).resolve()
+    staged = (tx_root / Path(*PurePosixPath(entry["staged"]).parts)).resolve()
+    if not _inside(target, config.data_root) or not _inside(backup, tx_root) or not _inside(staged, tx_root):
+        raise AppDockError("migration transaction path escapes its root")
+    return target, backup, staged
+
+
+def _set_migration_phase(tx_root: Path, journal: dict[str, Any], phase: str, recovery: str) -> None:
+    journal["phase"] = phase
+    journal["recovery"] = recovery
+    _durable_write_json(tx_root / "transaction.json", journal)
+
+
+def _recover_one_migration(tx_root: Path, config: AppDockConfig, phase_hook: Callable[[str], None] | None = None) -> str:
+    journal = _migration_journal(tx_root)
+    if journal["phase"] in {"complete", "rolled_back"}:
+        return journal["phase"]
+    finish_new = journal["phase"] == "committed" or journal["recovery"] == "finish-new"
+    direction = "finish-new" if finish_new else "restore-old"
+    for entry in journal["entries"]:
+        target, backup, staged = _migration_entry_paths(entry, tx_root, config)
+        if phase_hook:
+            phase_hook(f"recovery:{direction}:{entry['target']}")
+        if finish_new:
+            if not staged.is_file() or hashlib.sha256(staged.read_bytes()).hexdigest() != entry["new_sha256"]:
+                raise AppDockError("migration staged recovery payload is missing or invalid")
+            _durable_copy(staged, target)
+        elif entry["existed"]:
+            if not backup.is_file() or hashlib.sha256(backup.read_bytes()).hexdigest() != entry["old_sha256"]:
+                raise AppDockError("migration backup is missing or invalid")
+            _durable_copy(backup, target)
         else:
             target.unlink(missing_ok=True)
+            _fsync_directory(target.parent)
+    final_phase = "complete" if finish_new else "rolled_back"
+    _set_migration_phase(tx_root, journal, final_phase, direction)
+    return final_phase
+
+
+def recover_private_migrations(config: AppDockConfig, *, phase_hook: Callable[[str], None] | None = None) -> list[str]:
+    config.ensure()
+    transactions_root = config.migration_root / "transactions"
+    transactions_root.mkdir(parents=True, exist_ok=True)
+    recovered: list[str] = []
+    for tx_root in sorted(transactions_root.iterdir(), key=lambda item: item.name):
+        if not tx_root.is_dir() or tx_root.is_symlink() or _is_link_or_reparse(tx_root):
+            raise AppDockError("migration transaction root is unsafe")
+        journal = _migration_journal(tx_root)
+        if journal["phase"] not in {"complete", "rolled_back"}:
+            recovered.append(_recover_one_migration(tx_root, config, phase_hook))
+    return recovered
+
+
+def _migration_receipt(tx_root: Path, journal: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": 2,
+        "digest": journal["digest"],
+        "transaction_root": str(tx_root),
+        "entries": journal["entries"],
+    }
 
 
 def import_private_package(
     package_root: str | Path,
     config: AppDockConfig,
     *,
+    expected_digest: str | None = None,
     failure_hook: Callable[[str], None] | None = None,
+    phase_hook: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     config.ensure()
+    recover_private_migrations(config)
     preview = preview_private_package(package_root)
+    if not isinstance(expected_digest, str) or not secrets.compare_digest(expected_digest, preview["digest"]):
+        raise AppDockError("caller-confirmed migration digest is stale or invalid")
     targets = _migration_targets(preview, config)
     if all(path.is_file() and path.read_bytes() == payload for path, payload in targets.items()):
         return {"changed": False, "digest": preview["digest"], "receipt": "", "registration_count": preview["registration_count"]}
     operation_id = uuid.uuid4().hex
-    staging_root = config.migration_root / "staging" / operation_id
-    backup_root = config.migration_root / "backups" / operation_id
-    staging_root.mkdir(parents=True, exist_ok=False)
+    tx_root = _migration_transaction_path(config, operation_id)
+    staged_root = tx_root / "staged"
+    backup_root = tx_root / "backup"
+    staged_root.mkdir(parents=True, exist_ok=False)
     backup_root.mkdir(parents=True, exist_ok=False)
     entries: list[dict[str, Any]] = []
+    ordered_targets = sorted(targets.items(), key=lambda item: str(item[0]))
+    for index, (target, payload) in enumerate(ordered_targets):
+        if not _inside(target.resolve(), config.data_root):
+            raise AppDockError("migration target escapes the AppDock data root")
+        relative = target.resolve().relative_to(config.data_root.resolve()).as_posix()
+        staged_relative = f"staged/{index:04d}.json"
+        backup_relative = f"backup/{index:04d}.backup"
+        staged = tx_root / staged_relative
+        _durable_write_bytes(staged, payload)
+        existed = target.is_file()
+        old_sha = ""
+        if existed:
+            old_payload = target.read_bytes()
+            old_sha = hashlib.sha256(old_payload).hexdigest()
+            _durable_write_bytes(tx_root / backup_relative, old_payload)
+        entries.append({
+            "target": relative,
+            "existed": existed,
+            "old_sha256": old_sha,
+            "new_sha256": hashlib.sha256(payload).hexdigest(),
+            "backup": backup_relative,
+            "staged": staged_relative,
+        })
+    journal = {
+        "schema_version": 2,
+        "operation_id": operation_id,
+        "digest": preview["digest"],
+        "phase": "prepared",
+        "recovery": "restore-old",
+        "entries": entries,
+    }
+    _durable_write_json(tx_root / "transaction.json", journal)
+    if phase_hook:
+        phase_hook("after-journal")
+        phase_hook("after-staging")
     try:
-        for index, (target, payload) in enumerate(sorted(targets.items(), key=lambda item: str(item[0]))):
-            if not _inside(target.resolve(), config.data_root):
-                raise AppDockError("migration target escapes the AppDock data root")
-            relative = target.resolve().relative_to(config.data_root.resolve()).as_posix()
-            staged = staging_root / f"{index:04d}.json"
-            staged.write_bytes(payload)
-            existed = target.is_file()
-            backup_relative = f"{index:04d}.backup"
-            if existed:
-                backup = backup_root / backup_relative
-                backup.write_bytes(target.read_bytes())
-            entries.append(
-                {
-                    "target": relative,
-                    "existed": existed,
-                    "backup": backup_relative,
-                    "applied_sha256": hashlib.sha256(payload).hexdigest(),
-                }
-            )
-        receipt = {
-            "schema_version": 1,
-            "digest": preview["digest"],
-            "backup_root": str(backup_root),
-            "entries": entries,
-        }
-        receipt_path = backup_root / "receipt.json"
-        receipt_path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        for index, (target, _payload) in enumerate(sorted(targets.items(), key=lambda item: str(item[0]))):
+        fresh = preview_private_package(package_root)
+        if fresh["digest"] != preview["digest"] or fresh["package_identity"] != preview["package_identity"]:
+            raise AppDockError("private package changed after preview")
+        for entry in entries:
+            _target, _backup, staged = _migration_entry_paths(entry, tx_root, config)
+            if hashlib.sha256(staged.read_bytes()).hexdigest() != entry["new_sha256"]:
+                raise AppDockError("staged migration payload changed before write")
+        _set_migration_phase(tx_root, journal, "applying", "restore-old")
+        for entry in entries:
+            target, _backup, staged = _migration_entry_paths(entry, tx_root, config)
             if failure_hook:
-                failure_hook(target.relative_to(config.data_root).as_posix())
-            target.parent.mkdir(parents=True, exist_ok=True)
-            staged = staging_root / f"{index:04d}.json"
-            staged.replace(target)
+                failure_hook(entry["target"])
+            if phase_hook:
+                phase_hook(f"before-replace:{entry['target']}")
+            _durable_copy(staged, target)
+            if phase_hook:
+                phase_hook(f"after-replace:{entry['target']}")
+        for entry in entries:
+            target, _backup, _staged = _migration_entry_paths(entry, tx_root, config)
+            if not target.is_file() or hashlib.sha256(target.read_bytes()).hexdigest() != entry["new_sha256"]:
+                raise AppDockError("migration target verification failed")
+        if phase_hook:
+            phase_hook("before-commit")
+        _set_migration_phase(tx_root, journal, "committed", "finish-new")
+        if phase_hook:
+            phase_hook("after-commit")
+        receipt = _migration_receipt(tx_root, journal)
+        receipt_path = tx_root / "receipt.json"
+        _durable_write_json(receipt_path, receipt)
+        _set_migration_phase(tx_root, journal, "complete", "finish-new")
         return {
             "changed": True,
             "digest": preview["digest"],
             "receipt": str(receipt_path),
             "registration_count": preview["registration_count"],
         }
-    except Exception:
-        try:
-            receipt = {
-                "backup_root": str(backup_root),
-                "entries": entries,
-            }
-            _restore_migration_receipt(receipt, config, verify_applied=False)
-        finally:
-            _remove_tree(staging_root, ignore_errors=True)
+    except BaseException:
+        _recover_one_migration(tx_root, config)
         raise
-    finally:
-        _remove_tree(staging_root, ignore_errors=True)
 
 
 def rollback_private_package(receipt_path: str | Path, config: AppDockConfig) -> dict[str, Any]:
+    recover_private_migrations(config)
     path = Path(receipt_path).expanduser().resolve()
-    if not path.is_file() or path.is_symlink() or not _inside(path, config.migration_root / "backups"):
+    if not path.is_file() or path.is_symlink() or not _inside(path, config.migration_root / "transactions"):
         raise AppDockError("migration receipt is invalid")
     receipt = _read_bounded_json(path)
-    if not isinstance(receipt, dict) or receipt.get("schema_version") != 1:
+    if not isinstance(receipt, dict) or set(receipt) != {"schema_version", "digest", "transaction_root", "entries"} or receipt.get("schema_version") != 2:
         raise AppDockError("migration receipt is invalid")
-    _restore_migration_receipt(receipt, config, verify_applied=True)
+    tx_root = Path(receipt["transaction_root"]).resolve()
+    if not _inside(tx_root, config.migration_root / "transactions") or path.parent != tx_root:
+        raise AppDockError("migration receipt is invalid")
+    journal = _migration_journal(tx_root)
+    if journal["phase"] != "complete" or journal["entries"] != receipt["entries"]:
+        raise AppDockError("migration receipt is not final")
+    for entry in journal["entries"]:
+        target, _backup, _staged = _migration_entry_paths(entry, tx_root, config)
+        if not target.is_file() or hashlib.sha256(target.read_bytes()).hexdigest() != entry["new_sha256"]:
+            raise AppDockError("migration rollback refused because imported state changed")
+    journal["phase"] = "applying"
+    journal["recovery"] = "restore-old"
+    _durable_write_json(tx_root / "transaction.json", journal)
+    _recover_one_migration(tx_root, config)
     return {"rolled_back": True, "digest": receipt.get("digest", "")}
 
 
@@ -913,6 +1144,8 @@ class AppManager:
     def __init__(self, apps_root: Path | None = None, config: AppDockConfig | None = None, extensions: ExtensionManager | None = None):
         self.config = config or AppDockConfig.from_environment()
         self.legacy_direct_root = apps_root is not None
+        if not self.legacy_direct_root:
+            recover_private_migrations(self.config)
         self.apps_root = Path(apps_root).expanduser().resolve() if apps_root is not None else self.config.registry_root
         self.order_path = (self.apps_root / ".appdock-order.json") if self.legacy_direct_root else self.config.order_path
         self.extensions = extensions or ExtensionManager(self.config)
@@ -1060,15 +1293,16 @@ class AppManager:
             return {"id": spec.app_id, "name": spec.name, "description": spec.description, "state": state, "pid": process.pid if managed else (external_pids[0] if external_pids else None), "managed": managed, "started_at": runtime.started_at, "last_exit_code": runtime.last_exit_code, "health": health, "health_detail": detail, "port": spec.port, "local_url": spec.local_url, "private_url": spec.private_url}
 
     def all_status(self) -> list[dict[str, Any]]:
-        hidden = self.extensions.hidden_app_ids() if not self.legacy_direct_root else frozenset()
-        return [self.status(spec) for spec in self._ordered_specs(self.discover()) if spec.app_id not in hidden]
+        specs = self.discover()
+        hidden = self.extensions.hidden_app_ids(specs) if not self.legacy_direct_root else frozenset()
+        return [self.status(spec) for spec in self._ordered_specs(specs) if spec.app_id not in hidden]
 
     def move(self, app_id: str, direction: str) -> dict[str, Any]:
         specs = self.discover()
         if app_id not in specs:
             raise KeyError(app_id)
         ids = [spec.app_id for spec in self._ordered_specs(specs)]
-        hidden = self.extensions.hidden_app_ids() if not self.legacy_direct_root else frozenset()
+        hidden = self.extensions.hidden_app_ids(specs) if not self.legacy_direct_root else frozenset()
         movable = [item for item in ids if item not in hidden]
         index = movable.index(app_id)
         target = index - 1 if direction == "up" else index + 1 if direction == "down" else index
@@ -1761,7 +1995,140 @@ def stage_update(release: dict[str, Any], config: AppDockConfig, *, opener: Call
     return {"staged": True, "version": version, "path": str(destination), "digest": _digest({"version": version, "release_url": release.get("release_url"), "assets": assets})}
 
 
-def apply_update(staged_dir: str | Path, install_dir: str | Path, data_dir: str | Path, *, restart: Callable[[], Any] | None = None) -> dict[str, Any]:
+def _update_transactions_root(data: Path) -> Path:
+    root = (data / "updates" / "transactions").resolve()
+    if not _inside(root, data):
+        raise AppDockError("update transaction root is unsafe")
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _update_journal(tx_root: Path) -> dict[str, Any]:
+    journal = _read_bounded_json(tx_root / "transaction.json")
+    required = {"schema_version", "operation_id", "install", "candidate", "backup", "old_exists", "phase", "recovery", "files", "preexisting"}
+    if (
+        not isinstance(journal, dict)
+        or set(journal) != required
+        or journal.get("schema_version") != 2
+        or journal.get("phase") not in {"prepared", "swapping", "committed", "complete", "rolled_back"}
+        or journal.get("recovery") not in {"restore-old", "finish-new"}
+        or not isinstance(journal.get("old_exists"), bool)
+        or not isinstance(journal.get("files"), list)
+        or not isinstance(journal.get("preexisting"), list)
+    ):
+        raise AppDockError("update transaction is invalid")
+    return journal
+
+
+def _set_update_phase(tx_root: Path, journal: dict[str, Any], phase: str, recovery: str) -> None:
+    journal["phase"] = phase
+    journal["recovery"] = recovery
+    _durable_write_json(tx_root / "transaction.json", journal)
+
+
+def _copy_release_tree(source: Path, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=False)
+    for path in sorted(source.rglob("*")):
+        relative = path.relative_to(source)
+        target = destination / relative
+        if path.is_symlink() or _is_link_or_reparse(path):
+            raise AppDockError("release tree contains a symlink or reparse point")
+        if path.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        elif path.is_file():
+            _durable_copy(path, target)
+        else:
+            raise AppDockError("release tree contains a non-file member")
+    _fsync_directory(destination)
+
+
+def _validate_installed_tree(install: Path) -> tuple[dict[str, str], list[str]]:
+    if not install.exists():
+        return {}, []
+    if not install.is_dir() or install.is_symlink() or _is_link_or_reparse(install):
+        raise AppDockError("managed installation root is unsafe")
+    inventory = _load_release_inventory(install, complete=False)
+    actual = {path.relative_to(install).as_posix() for path in install.rglob("*") if path.is_file()}
+    if not inventory:
+        if actual:
+            raise AppDockError("managed installation has no trusted release inventory")
+        return {}, []
+    expected = {*inventory, RELEASE_MANIFEST_NAME}
+    allowed_generated = {"run-appdock.cmd"}
+    extras = actual - expected
+    if not extras.issubset(allowed_generated):
+        raise AppDockError("managed installation contains unexpected unowned files")
+    for relative, digest in inventory.items():
+        target = _release_path(install, relative)
+        if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
+            raise AppDockError("managed installation file does not match its release inventory")
+    return inventory, sorted(extras)
+
+
+def _recover_one_update(tx_root: Path, *, phase_hook: Callable[[str], None] | None = None) -> str:
+    journal = _update_journal(tx_root)
+    if journal["phase"] in {"complete", "rolled_back"}:
+        return journal["phase"]
+    install = Path(journal["install"]).resolve()
+    candidate = Path(journal["candidate"]).resolve()
+    backup = Path(journal["backup"]).resolve()
+    finish_new = journal["phase"] == "committed" or journal["recovery"] == "finish-new"
+    if phase_hook:
+        phase_hook("recovery:finish-new" if finish_new else "recovery:restore-old")
+    if finish_new:
+        if not install.exists() and candidate.is_dir():
+            os.replace(candidate, install)
+            _fsync_directory(install.parent)
+        _validate_installed_tree(install)
+        if backup.exists():
+            _remove_tree(backup)
+        if candidate.exists():
+            _remove_tree(candidate)
+        _remove_tree(tx_root.parent.parent / "backups" / journal["operation_id"], ignore_errors=True)
+        _set_update_phase(tx_root, journal, "complete", "finish-new")
+        return "complete"
+    if journal["old_exists"]:
+        if backup.is_dir():
+            if install.exists():
+                _remove_tree(install)
+            os.replace(backup, install)
+            _fsync_directory(install.parent)
+        elif not install.is_dir():
+            raise AppDockError("update backup is missing during recovery")
+        _validate_installed_tree(install)
+    elif install.exists():
+        _remove_tree(install)
+    if candidate.exists():
+        _remove_tree(candidate)
+    _remove_tree(tx_root.parent.parent / "backups" / journal["operation_id"], ignore_errors=True)
+    _set_update_phase(tx_root, journal, "rolled_back", "restore-old")
+    return "rolled_back"
+
+
+def recover_update_transactions(data_dir: str | Path, *, expected_install: str | Path | None = None, phase_hook: Callable[[str], None] | None = None) -> list[str]:
+    data = Path(data_dir).expanduser().resolve()
+    root = _update_transactions_root(data)
+    expected = Path(expected_install).expanduser().resolve() if expected_install is not None else None
+    recovered: list[str] = []
+    for tx_root in sorted(root.iterdir(), key=lambda item: item.name):
+        if not tx_root.is_dir() or tx_root.is_symlink() or _is_link_or_reparse(tx_root):
+            raise AppDockError("update transaction root is unsafe")
+        journal = _update_journal(tx_root)
+        if expected is not None and Path(journal["install"]).resolve() != expected:
+            continue
+        if journal["phase"] not in {"complete", "rolled_back"}:
+            recovered.append(_recover_one_update(tx_root, phase_hook=phase_hook))
+    return recovered
+
+
+def apply_update(
+    staged_dir: str | Path,
+    install_dir: str | Path,
+    data_dir: str | Path,
+    *,
+    restart: Callable[[], Any] | None = None,
+    phase_hook: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
     staged_lexical = Path(staged_dir).expanduser().absolute()
     install, data = Path(install_dir).resolve(), Path(data_dir).resolve()
     if _is_link_or_reparse(staged_lexical):
@@ -1772,52 +2139,126 @@ def apply_update(staged_dir: str | Path, install_dir: str | Path, data_dir: str 
     if not staged.is_dir() or not _inside(staged, data / "updates"):
         raise AppDockError("staged update path is invalid")
     _assert_tree_safe(staged_lexical, data / "updates")
+    recover_update_transactions(data, expected_install=install)
     target_inventory = _load_release_inventory(staged, complete=True)
-    current_inventory = _load_release_inventory(install, complete=False) if install.exists() else {}
+    current_inventory, generated = _validate_installed_tree(install)
     target_files = {*target_inventory, RELEASE_MANIFEST_NAME}
-    current_files = set(current_inventory)
-    if current_inventory:
-        current_files.add(RELEASE_MANIFEST_NAME)
+    current_files = {*current_inventory, RELEASE_MANIFEST_NAME} if current_inventory else set()
     affected = sorted(target_files | current_files)
-    backup = data / "updates" / "backups" / uuid.uuid4().hex
-    backup.mkdir(parents=True, exist_ok=False)
-    preexisting: list[str] = []
-    result = {"applied": True, "backup": str(backup), "files": affected, "preexisting": preexisting}
+    operation_id = uuid.uuid4().hex
+    tx_root = _update_transactions_root(data) / operation_id
+    tx_root.mkdir(parents=True, exist_ok=False)
+    evidence_backup = data / "updates" / "backups" / operation_id
     try:
-        install.mkdir(parents=True, exist_ok=True)
-        for relative in affected:
-            old = _release_path(install, relative)
-            if old.is_symlink() or (old.exists() and not old.is_file()):
-                raise AppDockError("managed installation path is not a regular file")
-            if old.is_file():
-                backup_target = _release_path(backup, relative)
-                backup_target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(old, backup_target)
-                preexisting.append(relative)
+        if install.exists():
+            for path in sorted(install.rglob("*")):
+                if path.is_file():
+                    destination = evidence_backup / path.relative_to(install)
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(path, destination)
     except Exception as exc:
-        _remove_tree(backup, ignore_errors=True)
+        _remove_tree(evidence_backup, ignore_errors=True)
+        _remove_tree(tx_root, ignore_errors=True)
         raise AppDockError("update backup failed; installation was not changed") from exc
+    candidate = install.parent / f".{install.name}.appdock-{operation_id}.candidate"
+    backup = install.parent / f".{install.name}.appdock-{operation_id}.backup"
+    if candidate.exists() or backup.exists():
+        raise AppDockError("update transaction paths already exist")
     try:
-        for relative in sorted(target_files):
-            source = _release_path(staged, relative)
-            destination = _release_path(install, relative)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, destination)
-        for relative in sorted(current_files - target_files):
-            _release_path(install, relative).unlink(missing_ok=True)
+        _copy_release_tree(staged, candidate)
+        for relative in generated:
+            _durable_copy(_release_path(install, relative), _release_path(candidate, relative))
+        _load_release_inventory(candidate, complete=False)
+        candidate_inventory, candidate_generated = _validate_installed_tree(candidate)
+        if candidate_inventory != target_inventory or candidate_generated != generated:
+            raise AppDockError("candidate program tree verification failed")
+    except Exception:
+        _remove_tree(candidate, ignore_errors=True)
+        _remove_tree(tx_root, ignore_errors=True)
+        raise
+    journal = {
+        "schema_version": 2,
+        "operation_id": operation_id,
+        "install": str(install),
+        "candidate": str(candidate),
+        "backup": str(backup),
+        "old_exists": install.exists(),
+        "phase": "prepared",
+        "recovery": "restore-old",
+        "files": affected,
+        "preexisting": sorted(current_files),
+    }
+    _durable_write_json(tx_root / "transaction.json", journal)
+    if phase_hook:
+        phase_hook("prepared")
+    result = {
+        "applied": True,
+        "backup": str(backup),
+        "files": affected,
+        "preexisting": sorted(current_files),
+        "transaction": str(tx_root / "transaction.json"),
+    }
+    try:
+        _set_update_phase(tx_root, journal, "swapping", "restore-old")
+        if install.exists():
+            os.replace(install, backup)
+            _fsync_directory(install.parent)
+        if phase_hook:
+            phase_hook("after-backup")
+        os.replace(candidate, install)
+        _fsync_directory(install.parent)
+        if phase_hook:
+            phase_hook("after-activate")
+        _validate_installed_tree(install)
+        if phase_hook:
+            phase_hook("before-commit")
+        _set_update_phase(tx_root, journal, "committed", "finish-new")
+        if phase_hook:
+            phase_hook("after-commit")
         if restart:
             restart()
-    except Exception as exc:
-        rollback_update(result, install, data)
+            finalize_update(result, install, data)
+    except BaseException as exc:
+        _recover_one_update(tx_root)
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
         raise AppDockError("update failed and was rolled back") from exc
     return result
 
 
+def finalize_update(applied: dict[str, Any], install_dir: str | Path, data_dir: str | Path) -> None:
+    install, data = Path(install_dir).resolve(), Path(data_dir).resolve()
+    transaction = Path(str(applied.get("transaction") or "")).resolve()
+    if not transaction.is_file() or not _inside(transaction, _update_transactions_root(data)):
+        raise AppDockError("update transaction path is invalid")
+    tx_root = transaction.parent
+    journal = _update_journal(tx_root)
+    if Path(journal["install"]).resolve() != install or journal["phase"] != "committed":
+        raise AppDockError("update transaction is not ready to finalize")
+    _recover_one_update(tx_root)
+
+
 def rollback_update(applied: dict[str, Any], install_dir: str | Path, data_dir: str | Path) -> None:
-    """Restore files recorded by ``apply_update`` after a restart launch failure."""
     install, data = Path(install_dir).resolve(), Path(data_dir).resolve()
     if _inside(install, data) or _inside(data, install):
         raise AppDockError("installation and data roots must not overlap")
+    transaction_raw = applied.get("transaction")
+    if isinstance(transaction_raw, str) and transaction_raw:
+        transaction = Path(transaction_raw).resolve()
+        if not transaction.is_file() or not _inside(transaction, _update_transactions_root(data)):
+            raise AppDockError("update transaction path is invalid")
+        tx_root = transaction.parent
+        journal = _update_journal(tx_root)
+        if Path(journal["install"]).resolve() != install:
+            raise AppDockError("update transaction installation path is invalid")
+        if journal["phase"] == "complete":
+            raise AppDockError("finalized update can no longer be rolled back automatically")
+        journal["phase"] = "swapping"
+        journal["recovery"] = "restore-old"
+        _durable_write_json(transaction, journal)
+        _recover_one_update(tx_root)
+        return
+    # Compatibility for pre-v0.1.1 in-memory results retained for focused rollback tests.
     backup = Path(str(applied.get("backup") or "")).resolve()
     backup_root = (data / "updates" / "backups").resolve()
     if not backup.is_dir() or not _inside(backup, backup_root):
@@ -1840,8 +2281,7 @@ def rollback_update(applied: dict[str, Any], install_dir: str | Path, data_dir: 
         if raw_relative in preexisting_set:
             if not saved.is_file():
                 raise AppDockError("update rollback backup is incomplete")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(saved, target)
+            _durable_copy(saved, target)
         else:
             target.unlink(missing_ok=True)
 
@@ -2173,7 +2613,7 @@ class Handler(BaseHTTPRequestHandler):
         if length < 0 or length > MAX_JSON_BYTES:
             raise AppDockError("request body is too large")
         raw = self.rfile.read(length)
-        value = json.loads(raw.decode("utf-8")) if raw else {}
+        value = _loads_strict_json(raw.decode("utf-8")) if raw else {}
         if not isinstance(value, dict):
             raise AppDockError("JSON body must be an object")
         return value
@@ -2194,7 +2634,7 @@ class Handler(BaseHTTPRequestHandler):
                     health["ready_token"] = self.ready_token
                 self._json(health)
             elif path == "/api/apps": self._json(self.manager.all_status())
-            elif path == "/api/extensions": self._json(self.extensions.snapshot())
+            elif path == "/api/extensions": self._json(self.extensions.snapshot(self.manager.discover()))
             elif path == "/api/config": self._json({"version": CURRENT_VERSION, "update_repository": self.config.update_repository})
             elif path == "/api/updates/check":
                 release = self.checker.check()
@@ -2257,7 +2697,10 @@ def main() -> None:
     if args.ready_token is not None and not re.fullmatch(r"[A-Za-z0-9_-]{20,128}", args.ready_token):
         parser.error("invalid readiness token")
     config = AppDockConfig.from_environment(data_dir=args.data_dir)
-    config.ensure(); Handler.config = config; Handler.extensions = ExtensionManager(config); Handler.manager = AppManager(config=config, extensions=Handler.extensions); Handler.local = LocalFolderOnboarding(config); Handler.github = GitHubOnboarding(config); Handler.checker = ReleaseChecker(config.update_repository); Handler.coordinator = UpdateCoordinator(); Handler.ready_token = args.ready_token
+    config.ensure()
+    recover_private_migrations(config)
+    recover_update_transactions(config.data_root, expected_install=Path(__file__).resolve().parent)
+    Handler.config = config; Handler.extensions = ExtensionManager(config); Handler.manager = AppManager(config=config, extensions=Handler.extensions); Handler.local = LocalFolderOnboarding(config); Handler.github = GitHubOnboarding(config); Handler.checker = ReleaseChecker(config.update_repository); Handler.coordinator = UpdateCoordinator(); Handler.ready_token = args.ready_token
     cleanup_stop = threading.Event()
     cleanup_thread = threading.Thread(target=_staging_cleanup_loop, args=(Handler.github, cleanup_stop), name="appdock-staging-cleanup", daemon=True)
     cleanup_thread.start()

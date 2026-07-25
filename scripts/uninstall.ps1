@@ -5,6 +5,21 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+function Get-AppDockBootstrapSha256 {
+    param([Parameter(Mandatory=$true)][string]$Path)
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            return ([System.BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-', '').ToLowerInvariant()
+        } finally {
+            $sha.Dispose()
+        }
+    } finally {
+        $stream.Dispose()
+    }
+}
+
 $BootstrapRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..')).TrimEnd([char[]]@('\', '/'))
 $RequestedInstall = [System.IO.Path]::GetFullPath($InstallDir).TrimEnd([char[]]@('\', '/'))
 if (-not $BootstrapRoot.Equals($RequestedInstall, [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -29,7 +44,7 @@ foreach ($BootstrapFile in @(
     $Entries = @($BootstrapManifest.files | Where-Object { $_.path -eq $BootstrapFile.path })
     if ($BootstrapManifest.schema_version -ne 2 -or $Entries.Count -ne 1 -or
         -not ($Entries[0].sha256 -is [string]) -or $Entries[0].sha256 -notmatch '^[0-9a-fA-F]{64}$' -or
-        (Get-FileHash -LiteralPath $BootstrapFile.file -Algorithm SHA256).Hash -ne $Entries[0].sha256) {
+        (Get-AppDockBootstrapSha256 -Path $BootstrapFile.file) -ne $Entries[0].sha256.ToLowerInvariant()) {
         throw 'Refusing to uninstall because bootstrap files are not trusted by the release inventory.'
     }
 }

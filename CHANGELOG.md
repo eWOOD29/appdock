@@ -8,6 +8,10 @@ All notable changes to AppDock are documented here. The project follows Semantic
 
 ### Fixed
 
+- Enforce the protected private package's exact root manifest, per-file size and SHA-256 values, exact member set, migration digest, duplicate-key rejection, caller-confirmed preview digest, and immediate pre-write re-verification.
+- Make private-state migration and updater replacement durable and crash-recoverable with explicit transaction phases, mandatory startup recovery, complete old/new state convergence, and abrupt-process-death tests.
+- Disable stale extension visibility, widgets, providers, and caches when replacement configuration is invalid; reject duplicate JSON keys and hidden IDs that do not resolve to current registrations.
+- Produce host-independent public ZIP bytes with explicit fixed ZIP metadata, build deterministic rootless private ZIPs, and remove the bootstrap uninstaller's `Get-FileHash` dependency.
 - Reject installer and uninstaller paths that are filesystem/volume roots or broad ancestors of system, program, users, public, profile, AppData, or standard personal-data roots; reject source/install and install/data overlap, lexical staging/update-root aliases, and symlink/reparse ancestors.
 - Build installs in a sibling staging directory and swap only after the complete program tree is ready; validate a release-inventory-backed install identity before replacement or recursive deletion; bootstrap-verify the uninstaller and path-safety module before loading safety code; and terminate only a Python process whose first script argument is the exact installed entry point.
 - Bound GitHub preview staging during clone by time, per-checkout and aggregate file/byte quotas; disable Git LFS smudging; run an independent stale-stage janitor; and clean abandoned, late, or superseded browser previews.

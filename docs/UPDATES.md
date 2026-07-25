@@ -11,7 +11,7 @@ AppDock's updater is designed around versioned GitHub release assets and a user-
 
 ## Updating from v0.1.0
 
-The v0.1.0 one-click updater intentionally cannot apply v0.1.1's release-inventory schema. Install v0.1.1 manually once using the verified ZIP and Windows installer; see [Migrating an existing AppDock setup](MIGRATING.md#v010--v011-safety-migration). This fail-closed transition prevents the older helper from bypassing v0.1.1's instance-specific readiness and retry-safe rollback behavior.
+The v0.1.0 one-click updater intentionally cannot apply v0.1.1's release-inventory schema. Install v0.1.1 manually once using the verified ZIP and Windows installer; see [Migrating an existing AppDock setup](MIGRATING.md#v010--v011-safety-migration). This fail-closed transition prevents the older helper from bypassing v0.1.1's instance-specific readiness and durable replacement behavior.
 
 ## Apply flow
 
@@ -24,8 +24,10 @@ After the user chooses **Update now** and confirms:
 5. It verifies `RELEASE-MANIFEST.json`: every packaged program file must be listed with its own SHA-256 digest, required AppDock files must be present, and unlisted or missing files are rejected.
 6. It rejects absolute paths, `..` traversal, symlinks, device/reserved paths, and entries outside the update staging directory.
 7. It extracts into the AppDock data directory's update staging area.
-8. AppDock launches the checksum-verified incoming helper and waits for a fresh token-bound startup handshake. Only after the helper has imported, parsed its trusted arguments, opened its update log, and entered the wait/recovery path does the current server shut down. The helper then waits for the server to exit, backs up current managed files, replaces the installation, removes obsolete inventory-owned files, and restarts AppDock.
-9. The helper gives the restarted process a fresh, instance-specific readiness token and accepts only an exact, non-redirected response from its local `/health` endpoint containing that token. Backup creation must finish before any installed file changes. If replacement, launch, early startup, redirect, token validation, or readiness fails, it stops the failed process, restores only files whose prior state was recorded, and verifies a restart of the restored AppDock version. Completed and failed version stages are removed so a failed update can be retried.
+8. AppDock launches the checksum-verified incoming helper and waits for a fresh token-bound startup handshake. Only after the helper has imported and validated its fixed arguments does the current server shut down.
+9. The helper validates the complete current managed installation, rejects unexpected unowned files, builds and verifies a complete candidate program tree beside the active installation, writes a durable transaction journal, and records a complete backup identity before activation.
+10. Activation uses directory-level replacement rather than per-file mutation. Before the durable commit marker, recovery deterministically restores the complete old program tree. After the commit marker, recovery deterministically completes and verifies the complete new program tree. The helper and AppDock startup both execute mandatory recovery before update state can be consumed; recovery is idempotent if interrupted.
+11. The helper gives the restarted process a fresh, instance-specific readiness token and accepts only an exact, non-redirected response from its local `/health` endpoint containing that token. Restart failure restores and verifies the previous complete tree. Successful readiness finalizes the transaction and removes the rollback tree.
 
 The browser cannot supply an arbitrary download URL to the update endpoint. Update assets must come from the expected configured GitHub release.
 
@@ -38,18 +40,9 @@ The updater does not replace the user data directory. On Windows, the defaults a
 
 Registry manifests, downloaded apps, ordering, settings, and logs remain in the data directory.
 
-## Manual rollback
+## Manual recovery
 
-If AppDock does not restart:
-
-1. Open `%LOCALAPPDATA%\AppDock\updates` and locate the most recent backup recorded in the update log.
-2. Stop any remaining AppDock process.
-3. Rename the failed program directory out of the way.
-4. Restore the backup to the previous program path.
-5. Run `scripts\start-appdock.cmd` from the restored installation.
-6. Review `%LOCALAPPDATA%\AppDock\runtime\update.log` before retrying.
-
-Do not delete the data directory during rollback.
+Normal crash recovery is automatic at helper or AppDock startup. If neither can start, preserve the transaction journal and update log before manual action. Do not delete the data directory. A manual recovery should be performed only under an explicitly authorized procedure using the journal's exact active, candidate, and backup identities.
 
 ## Manual update
 
@@ -66,7 +59,7 @@ Every release must:
 
 - use a semantic version tag such as `v0.2.0`;
 - run the test suite on Windows and Linux;
-- build `appdock-windows.zip` from tracked release files;
+- build `appdock-windows.zip` from tracked release files on Windows and Ubuntu and prove the exact ZIP bytes are identical;
 - publish `SHA256SUMS.txt` containing the archive digest;
 - avoid user data, logs, local manifests, `.env` files, credentials, and personal paths;
 - include a generated `RELEASE-MANIFEST.json` covering every program file;

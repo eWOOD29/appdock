@@ -17,7 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from appdock import _remove_tree, apply_update, rollback_update  # noqa: E402
+from appdock import _remove_tree, apply_update, finalize_update, recover_update_transactions, rollback_update  # noqa: E402
 
 RESTART_READY_TIMEOUT_SECONDS = 20.0
 
@@ -135,6 +135,7 @@ def run(
     *,
     handshake: Path | None = None,
     handshake_token: str | None = None,
+    phase_hook: object | None = None,
 ) -> int:
     log_path = data / "runtime" / "update.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -150,13 +151,15 @@ def run(
         temporary.replace(handshake)
     while _alive(pid):
         time.sleep(0.2)
+    recover_update_transactions(data, expected_install=install)
     service_restored = False
     try:
-        result = apply_update(staged, install, data)
+        result = apply_update(staged, install, data, phase_hook=phase_hook if callable(phase_hook) else None)
         log(f"update applied: {result['files']}")
         log("restarting AppDock with a fixed argument list")
         try:
             _launch_and_wait(restart_script, install, restart_args)
+            finalize_update(result, install, data)
         except Exception as restart_exc:
             rollback_update(result, install, data)
             log("restart readiness failed; previous program files restored")
