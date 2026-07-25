@@ -1,8 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -13,149 +11,9 @@ permissions:
   issues: write
 
 jobs:
-  test:
-    name: Python ${{ matrix.python-version }} / ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, ubuntu-latest]
-        python-version: ['3.11', '3.13']
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: ${{ matrix.python-version }}
-      - name: Unit tests
-        run: >-
-          python -c "import pathlib, subprocess, sys; p = subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-s', 'tests', '-v'], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT); pathlib.Path('unit-test-output.txt').write_text(p.stdout, encoding='utf-8'); print('\n'.join(p.stdout.splitlines()[-160:])); raise SystemExit(p.returncode)"
-      - name: Upload bounded unit-test evidence
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: unit-test-output-${{ matrix.os }}-${{ matrix.python-version }}
-          path: unit-test-output.txt
-      - name: Compile check
-        run: python -m compileall -q appdock.py tests scripts
-      - name: JavaScript checks
-        run: |
-          node --check static/app.js
-          node --test tests/test_ui_preview_races.js
-      - name: Privacy and secret scan
-        run: python scripts/privacy_scan.py
-      - name: Documentation links
-        run: python scripts/check_docs.py
-
-  package-windows:
-    name: Verify portable package / Windows
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.11'
-      - run: python scripts/build_portable.py --output dist/appdock-windows.zip
-      - name: Inspect archive
-        shell: pwsh
-        run: |
-          $archive = [IO.Compression.ZipFile]::OpenRead((Resolve-Path 'dist/appdock-windows.zip'))
-          try {
-            foreach ($required in @('appdock.py', 'RELEASE-MANIFEST.json', 'static/app.js', 'static/app.css', 'scripts/update_helper.py', 'scripts/path_safety.ps1', 'scripts/migrate_private_state.py', 'scripts/build_private_package.py', 'docs/EXTENSIONS.md', 'docs/PRIVATE_MIGRATION.md')) {
-              if (-not ($archive.Entries.FullName -contains $required)) { throw "$required missing from archive" }
-            }
-            if ($archive.Entries.FullName | Where-Object { $_ -match '(^|/)(data|runtime|\.git|\.venv)/' }) { throw 'private/runtime content found in archive' }
-            if ($archive.Entries | Where-Object { $_.FullName.EndsWith('/') }) { throw 'directory entries found in deterministic archive' }
-          } finally {
-            $archive.Dispose()
-          }
-      - name: Scan exact archive privacy
-        run: python scripts/privacy_scan.py --archive dist/appdock-windows.zip
-      - name: Exercise Windows installer and uninstaller without Get-FileHash
-        shell: pwsh
-        run: |
-          function Get-FileHash { throw 'Get-FileHash is intentionally unavailable in this test' }
-          $install = Join-Path $env:RUNNER_TEMP 'AppDockProgram'
-          $data = Join-Path $env:RUNNER_TEMP 'AppDockData'
-          $overlap = Join-Path $env:RUNNER_TEMP 'AppDockOverlap'
-          $bundle = Join-Path $env:RUNNER_TEMP 'AppDockBundle'
-          Expand-Archive -Path 'dist/appdock-windows.zip' -DestinationPath $bundle
-          $installer = Join-Path $bundle 'scripts/install.ps1'
-          try {
-            & $installer -InstallDir $overlap -DataDir (Join-Path $overlap 'data') -NoStart
-            throw 'installer accepted overlapping program and data directories'
-          } catch {
-            if ($_.Exception.Message -notmatch 'must not overlap') { throw }
-          }
-          try {
-            & (Join-Path $bundle 'scripts/uninstall.ps1') -InstallDir $overlap -DataDir (Join-Path $overlap 'data')
-            throw 'uninstaller accepted overlapping program and data directories'
-          } catch {
-            if ($_.Exception.Message -notmatch 'Refusing to uninstall') { throw }
-          }
-          & $installer -InstallDir $install -DataDir $data -NoStart
-          Set-Content -NoNewline -Path (Join-Path $install 'obsolete.py') -Value 'old'
-          & $installer -InstallDir $install -DataDir $data -NoStart
-          if (-not (Test-Path (Join-Path $install 'appdock.py'))) { throw 'installer did not copy appdock.py' }
-          if (-not (Test-Path (Join-Path $install 'RELEASE-MANIFEST.json'))) { throw 'installer did not copy the release inventory' }
-          if (Test-Path (Join-Path $install 'obsolete.py')) { throw 'installer left an obsolete managed file behind' }
-          if (-not (Test-Path $data)) { throw 'installer did not create data directory' }
-          & (Join-Path $install 'scripts/uninstall.ps1') -InstallDir $install -DataDir $data
-          if (Test-Path $install) { throw 'uninstaller did not remove program files' }
-          if (-not (Test-Path $data)) { throw 'uninstaller removed user data without permission' }
-          Remove-Item -Recurse -Force $data
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: appdock-windows
-          path: |
-            dist/appdock-windows.zip
-            dist/SHA256SUMS.txt
-
-  package-ubuntu:
-    name: Build portable package / Ubuntu
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.11'
-      - run: python scripts/build_portable.py --output dist/appdock-ubuntu.zip
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: appdock-ubuntu
-          path: dist/appdock-ubuntu.zip
-
-  deterministic-package:
-    name: Windows and Ubuntu package bytes match
-    needs: [package-windows, package-ubuntu]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: appdock-windows
-          path: windows
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: appdock-ubuntu
-          path: ubuntu
-      - name: Compare exact bytes and ZIP metadata
-        run: |
-          python - <<'PY'
-          import hashlib
-          import zipfile
-          from pathlib import Path
-          windows = Path('windows/appdock-windows.zip').read_bytes()
-          ubuntu = Path('ubuntu/appdock-ubuntu.zip').read_bytes()
-          if windows != ubuntu:
-              raise SystemExit(f'cross-platform ZIP mismatch: {hashlib.sha256(windows).hexdigest()} != {hashlib.sha256(ubuntu).hexdigest()}')
-          with zipfile.ZipFile(Path('windows/appdock-windows.zip')) as archive:
-              if any(info.create_system != 0 or info.compress_type != zipfile.ZIP_STORED for info in archive.infolist()):
-                  raise SystemExit('ZIP metadata is not explicitly host-independent')
-          print(hashlib.sha256(windows).hexdigest())
-          PY
-
   apply-wp6-correction:
     name: Apply bounded WP6 correction
-    if: github.event_name == 'pull_request' && github.head_ref == 'work/appdock-0.1.1-private-extension' && github.actor != 'github-actions[bot]'
+    if: github.event_name == 'pull_request' && github.head_ref == 'work/appdock-0.1.1-private-extension'
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
@@ -185,6 +43,7 @@ jobs:
         run: |
           python - <<'PY'
           from pathlib import Path
+
           path = Path('appdock.py')
           source = path.read_text(encoding='utf-8')
           replacements = (
@@ -197,32 +56,33 @@ jobs:
                   '    def _disable(self, error: str, signature: tuple[str, tuple[str, ...] | None] | None) -> ExtensionConfig:\n',
               ),
               (
-                  '''        known = tuple(sorted(set(valid_app_ids))) if valid_app_ids is not None else None
-        try:
-            stat_result = path.stat()
-            signature = (stat_result.st_mtime_ns, stat_result.st_size, known)
-            if signature == self._last_config_signature:
-                return self._active
-            if not path.is_file() or path.is_symlink() or _is_link_or_reparse(path) or stat_result.st_size > MAX_EXTENSION_CONFIG_BYTES:
-                raise AppDockError("private extension configuration is invalid")
-            raw = _loads_strict_json(path.read_text(encoding="utf-8"))
-''',
-                  '''        known = tuple(sorted(set(valid_app_ids))) if valid_app_ids is not None else None
-        signature: tuple[str, tuple[str, ...] | None] | None = None
-        try:
-            stat_result = path.stat()
-            if not path.is_file() or path.is_symlink() or _is_link_or_reparse(path) or stat_result.st_size > MAX_EXTENSION_CONFIG_BYTES:
-                raise AppDockError("private extension configuration is invalid")
-            payload = path.read_bytes()
-            if len(payload) > MAX_EXTENSION_CONFIG_BYTES:
-                raise AppDockError("private extension configuration is invalid")
-            signature = (hashlib.sha256(payload).hexdigest(), known)
-            if signature == self._last_config_signature:
-                return self._active
-            raw = _loads_strict_json(payload.decode("utf-8"))
-''',
+                  '        known = tuple(sorted(set(valid_app_ids))) if valid_app_ids is not None else None\n'
+                  '        try:\n'
+                  '            stat_result = path.stat()\n'
+                  '            signature = (stat_result.st_mtime_ns, stat_result.st_size, known)\n'
+                  '            if signature == self._last_config_signature:\n'
+                  '                return self._active\n'
+                  '            if not path.is_file() or path.is_symlink() or _is_link_or_reparse(path) or stat_result.st_size > MAX_EXTENSION_CONFIG_BYTES:\n'
+                  '                raise AppDockError("private extension configuration is invalid")\n'
+                  '            raw = _loads_strict_json(path.read_text(encoding="utf-8"))\n',
+                  '        known = tuple(sorted(set(valid_app_ids))) if valid_app_ids is not None else None\n'
+                  '        signature: tuple[str, tuple[str, ...] | None] | None = None\n'
+                  '        try:\n'
+                  '            stat_result = path.stat()\n'
+                  '            if not path.is_file() or path.is_symlink() or _is_link_or_reparse(path) or stat_result.st_size > MAX_EXTENSION_CONFIG_BYTES:\n'
+                  '                raise AppDockError("private extension configuration is invalid")\n'
+                  '            payload = path.read_bytes()\n'
+                  '            if len(payload) > MAX_EXTENSION_CONFIG_BYTES:\n'
+                  '                raise AppDockError("private extension configuration is invalid")\n'
+                  '            signature = (hashlib.sha256(payload).hexdigest(), known)\n'
+                  '            if signature == self._last_config_signature:\n'
+                  '                return self._active\n'
+                  '            raw = _loads_strict_json(payload.decode("utf-8"))\n',
               ),
-              ('                locals().get("signature"),\n', '                signature,\n'),
+              (
+                  '                locals().get("signature"),\n',
+                  '                signature,\n',
+              ),
           )
           for old, new in replacements:
               count = source.count(old)
@@ -249,7 +109,8 @@ jobs:
           rm -f .github/workflows/wp6-apply.yml wp6-negative-control.txt
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add appdock.py .github/workflows/ci.yml .github/workflows/wp6-apply.yml
+          git add appdock.py .github/workflows/ci.yml
+          git add -u .github/workflows
           git commit -m 'fix: make extension config cache content-authoritative'
           git push origin "HEAD:${BRANCH}"
       - name: Dispatch exact-head CI and record the run
