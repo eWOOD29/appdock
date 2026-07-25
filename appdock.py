@@ -2042,19 +2042,49 @@ def _copy_release_tree(source: Path, destination: Path) -> None:
     _fsync_directory(destination)
 
 
+LEGACY_RELEASE_TOP_LEVEL = {
+    "appdock.py",
+    "appdock.example.json",
+    "pyproject.toml",
+    "README.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "LICENSE",
+}
+LEGACY_RELEASE_TOP_LEVEL_DIRS = {"appdock", "appdock_core", "static", "docs", "scripts", "templates"}
+
+
+def _legacy_release_path(relative: str) -> bool:
+    path = PurePosixPath(relative)
+    return relative in LEGACY_RELEASE_TOP_LEVEL or (len(path.parts) > 1 and path.parts[0] in LEGACY_RELEASE_TOP_LEVEL_DIRS)
+
+
 def _validate_installed_tree(install: Path) -> tuple[dict[str, str], list[str]]:
     if not install.exists():
         return {}, []
     if not install.is_dir() or install.is_symlink() or _is_link_or_reparse(install):
         raise AppDockError("managed installation root is unsafe")
     inventory = _load_release_inventory(install, complete=False)
-    actual = {path.relative_to(install).as_posix() for path in install.rglob("*") if path.is_file()}
-    if not inventory:
-        if actual:
-            raise AppDockError("managed installation has no trusted release inventory")
-        return {}, []
-    expected = {*inventory, RELEASE_MANIFEST_NAME}
+    actual: set[str] = set()
+    for path in install.rglob("*"):
+        if path.is_symlink() or _is_link_or_reparse(path):
+            raise AppDockError("managed installation contains a symlink or reparse point")
+        if path.is_file():
+            actual.add(path.relative_to(install).as_posix())
     allowed_generated = {"run-appdock.cmd"}
+    if not inventory:
+        if not actual:
+            return {}, []
+        managed = actual - allowed_generated
+        if "appdock.py" not in managed or not all(_legacy_release_path(relative) for relative in managed):
+            raise AppDockError("managed installation has no trusted release inventory")
+        inventory = {
+            relative: hashlib.sha256(_release_path(install, relative).read_bytes()).hexdigest()
+            for relative in sorted(managed)
+        }
+        return inventory, sorted(actual - managed)
+    expected = {*inventory, RELEASE_MANIFEST_NAME}
     extras = actual - expected
     if not extras.issubset(allowed_generated):
         raise AppDockError("managed installation contains unexpected unowned files")
@@ -2143,7 +2173,9 @@ def apply_update(
     target_inventory = _load_release_inventory(staged, complete=True)
     current_inventory, generated = _validate_installed_tree(install)
     target_files = {*target_inventory, RELEASE_MANIFEST_NAME}
-    current_files = {*current_inventory, RELEASE_MANIFEST_NAME} if current_inventory else set()
+    current_files = set(current_inventory)
+    if (install / RELEASE_MANIFEST_NAME).is_file():
+        current_files.add(RELEASE_MANIFEST_NAME)
     affected = sorted(target_files | current_files)
     operation_id = uuid.uuid4().hex
     tx_root = _update_transactions_root(data) / operation_id
