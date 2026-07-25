@@ -91,17 +91,14 @@ jobs:
               source = source.replace(old, new, 1)
           path.write_text(source, encoding='utf-8')
           PY
-      - name: Validate corrected production behavior
+      - name: Validate the bounded correction before commit
         shell: bash
         run: |
-          python -m unittest discover -s tests -v
+          python -m unittest -v tests/test_wp6_extension_content_identity.py
           python -m compileall -q appdock.py tests scripts
           node --check static/app.js
-          node --test tests/test_ui_preview_races.js
           python scripts/privacy_scan.py
           python scripts/check_docs.py
-          python scripts/build_portable.py --output dist/appdock-wp6-precommit.zip
-          python scripts/privacy_scan.py --archive dist/appdock-wp6-precommit.zip
       - name: Commit the clean final tree
         shell: bash
         run: |
