@@ -67,7 +67,8 @@ class AppDockTests(unittest.TestCase):
 
     def test_public_defaults_are_machine_neutral(self) -> None:
         config = AppDockConfig.from_environment(repo_root=self.root, platform="win32", local_app_data=self.root / "local")
-        self.assertEqual(config.data_root, (self.root / "local" / "AppDock").resolve())
+        expected = self.root / "local" / "AppDock"
+        self.assertEqual(os.path.normcase(os.path.realpath(config.data_root)), os.path.normcase(os.path.realpath(expected)))
         self.assertEqual(config.registry_root, config.data_root / "registry")
         self.assertEqual(config.install_root, config.data_root / "apps")
         self.assertNotIn("Ethan", str(config.data_root))
@@ -76,7 +77,8 @@ class AppDockTests(unittest.TestCase):
     def test_data_dir_override_wins_and_state_is_outside_repo(self) -> None:
         with patch.dict(os.environ, {"APPDOCK_DATA_DIR": str(self.root / "override")}):
             config = AppDockConfig.from_environment(repo_root=self.root)
-        self.assertEqual(config.data_root, (self.root / "override").resolve())
+        expected = self.root / "override"
+        self.assertEqual(os.path.normcase(os.path.realpath(config.data_root)), os.path.normcase(os.path.realpath(expected)))
         self.assertNotEqual(config.data_root, self.root)
 
     def test_discover_start_stop_and_shell_false(self) -> None:

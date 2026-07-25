@@ -91,6 +91,21 @@ function Assert-AppDockSafePath {
     return $FullPath
 }
 
+function Get-AppDockFileSha256([string]$Path) {
+    $FullPath = [System.IO.Path]::GetFullPath($Path)
+    $Stream = [System.IO.File]::OpenRead($FullPath)
+    try {
+        $Hasher = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            return ([System.BitConverter]::ToString($Hasher.ComputeHash($Stream))).Replace('-', '').ToLowerInvariant()
+        } finally {
+            $Hasher.Dispose()
+        }
+    } finally {
+        $Stream.Dispose()
+    }
+}
+
 function Assert-AppDockInstallMarker([string]$Path) {
     $Root = Get-AppDockFullPath $Path
     $Launcher = Join-Path $Root 'run-appdock.cmd'
@@ -114,7 +129,7 @@ function Assert-AppDockInstallMarker([string]$Path) {
         $File = Join-Path $Root ($Relative -replace '/', '\')
         if ($Entries.Count -ne 1 -or -not (Test-Path -LiteralPath $File -PathType Leaf) -or
             -not ($Entries[0].sha256 -is [string]) -or $Entries[0].sha256 -notmatch '^[0-9a-fA-F]{64}$' -or
-            (Get-FileHash -LiteralPath $File -Algorithm SHA256).Hash -ne $Entries[0].sha256) {
+            (Get-AppDockFileSha256 $File) -ne $Entries[0].sha256.ToLowerInvariant()) {
             throw 'Refusing to remove an AppDock installation whose release inventory does not validate.'
         }
     }

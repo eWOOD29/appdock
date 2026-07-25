@@ -56,7 +56,7 @@ if (Test-Path -LiteralPath $IncomingReleaseManifest -PathType Leaf) {
             -not (Test-Path -LiteralPath $Source -PathType Leaf)) {
             throw "The incoming release inventory is missing $Relative."
         }
-        $Actual = (Get-FileHash -LiteralPath $Source -Algorithm SHA256).Hash.ToLowerInvariant()
+        $Actual = Get-AppDockFileSha256 $Source
         if ($Actual -ne $Entry.sha256.ToLowerInvariant()) {
             throw "The incoming release inventory checksum failed for $Relative."
         }
@@ -120,7 +120,7 @@ $PythonLine "$InstallDir\appdock.py" --host 127.0.0.1 --port 8765
             $_.FullName -ne $Launcher -and $_.FullName -ne $StageManifest
         } | ForEach-Object {
             $Relative = $_.FullName.Substring($StageDir.Length).TrimStart([char[]]@('\', '/')).Replace('\', '/')
-            @{path=$Relative; sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()}
+            @{path=$Relative; sha256=Get-AppDockFileSha256 $_.FullName}
         })
         $Inventory = @{schema_version=2; files=$InventoryFiles} | ConvertTo-Json -Depth 5
         [System.IO.File]::WriteAllText($StageManifest, $Inventory, [System.Text.UTF8Encoding]::new($false))

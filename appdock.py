@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -38,6 +39,13 @@ MAX_GITHUB_STAGE_FILES = 20_000
 MAX_GITHUB_STAGING_TOTAL_BYTES = 500 * 1024 * 1024
 MAX_GITHUB_STAGING_TOTAL_FILES = 40_000
 GITHUB_STAGE_TTL_SECONDS = 24 * 60 * 60
+MAX_EXTENSION_CONFIG_BYTES = 64 * 1024
+MAX_PROVIDER_RESPONSE_BYTES = 64 * 1024
+MAX_EXTENSION_PROVIDERS = 8
+MAX_EXTENSION_WIDGETS = 16
+MAX_WIDGET_METRICS = 12
+MAX_WIDGET_PROGRESS = 6
+PRIVATE_PACKAGE_MANIFEST = "appdock-private-package.json"
 RELEASE_MANIFEST_NAME = "RELEASE-MANIFEST.json"
 REQUIRED_RELEASE_FILES = {
     "appdock.py",
@@ -72,6 +80,9 @@ class AppDockConfig:
     logs_root: Path
     staging_root: Path
     updates_root: Path
+    private_root: Path
+    extension_config_path: Path
+    migration_root: Path
     update_repository: str = DEFAULT_UPDATE_REPOSITORY
 
     @classmethod
@@ -101,12 +112,24 @@ class AppDockConfig:
             logs_root=root / "runtime" / "logs",
             staging_root=root / "staging",
             updates_root=root / "updates",
+            private_root=root / "private",
+            extension_config_path=root / "private" / "extensions.json",
+            migration_root=root / "migrations",
             update_repository=os.environ.get("APPDOCK_UPDATE_REPOSITORY", DEFAULT_UPDATE_REPOSITORY),
         )
 
     def ensure(self) -> None:
         _assert_no_link_or_reparse_ancestor(self.data_root)
-        for path in (self.registry_root, self.install_root, self.runtime_root, self.logs_root, self.staging_root, self.updates_root):
+        for path in (
+            self.registry_root,
+            self.install_root,
+            self.runtime_root,
+            self.logs_root,
+            self.staging_root,
+            self.updates_root,
+            self.private_root,
+            self.migration_root,
+        ):
             _assert_no_link_or_reparse_ancestor(path)
             path.mkdir(parents=True, exist_ok=True)
 
@@ -341,12 +364,558 @@ def validate_manifest(raw: dict[str, Any], manifest_dir: Path, *, directory: Pat
     return normalize_manifest(raw, manifest_dir=manifest_dir, directory=directory)
 
 
+@dataclass(frozen=True)
+class ProviderSpec:
+    provider_id: str
+    url: str
+    connect_timeout: float
+    read_timeout: float
+    cache_seconds: float
+
+
+@dataclass(frozen=True)
+class WidgetSpec:
+    widget_id: str
+    widget_type: str
+    title: str
+    provider_id: str
+    drill_down_url: str = ""
+
+
+@dataclass(frozen=True)
+class ExtensionConfig:
+    hidden_app_ids: frozenset[str] = frozenset()
+    providers: tuple[ProviderSpec, ...] = ()
+    widgets: tuple[WidgetSpec, ...] = ()
+
+
+def _bounded_text(value: Any, field_name: str, *, maximum: int, allow_empty: bool = False) -> str:
+    if not isinstance(value, str):
+        raise AppDockError(f"{field_name} must be text")
+    text = value.strip()
+    if (not text and not allow_empty) or len(text) > maximum:
+        raise AppDockError(f"{field_name} is invalid")
+    if any(ord(char) < 32 and char not in "\t" for char in text) or "<" in text or ">" in text:
+        raise AppDockError(f"{field_name} contains unsupported markup or control characters")
+    return text
+
+
+def _literal_loopback_provider_url(value: Any) -> str:
+    if not isinstance(value, str) or len(value) > 2048:
+        raise AppDockError("provider URL is invalid")
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise AppDockError("provider URL is invalid") from exc
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "::1"}
+        or parsed.username
+        or parsed.password
+        or parsed.fragment
+        or not parsed.netloc
+        or port is None
+    ):
+        raise AppDockError("provider URL must be an explicit literal-loopback http URL with a port")
+    return urllib.parse.urlunsplit(parsed)
+
+
+def _normalized_extension_payload(config: ExtensionConfig) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "visibility": {"hidden_app_ids": sorted(config.hidden_app_ids)},
+        "providers": [
+            {
+                "id": item.provider_id,
+                "url": item.url,
+                "connect_timeout_ms": int(item.connect_timeout * 1000),
+                "read_timeout_ms": int(item.read_timeout * 1000),
+                "cache_seconds": item.cache_seconds,
+            }
+            for item in config.providers
+        ],
+        "widgets": [
+            {
+                "id": item.widget_id,
+                "type": item.widget_type,
+                "title": item.title,
+                "provider_id": item.provider_id,
+                **({"drill_down_url": item.drill_down_url} if item.drill_down_url else {}),
+            }
+            for item in config.widgets
+        ],
+    }
+
+
+def parse_extension_config(raw: Any) -> ExtensionConfig:
+    if not isinstance(raw, dict) or set(raw) != {"schema_version", "visibility", "providers", "widgets"}:
+        raise AppDockError("private extension configuration is invalid")
+    if raw.get("schema_version") != 1:
+        raise AppDockError("unsupported private extension configuration schema")
+    visibility = raw.get("visibility")
+    if not isinstance(visibility, dict) or set(visibility) != {"hidden_app_ids"}:
+        raise AppDockError("visibility configuration is invalid")
+    hidden = visibility.get("hidden_app_ids")
+    if not isinstance(hidden, list) or len(hidden) > 256:
+        raise AppDockError("hidden app IDs are invalid")
+    hidden_ids: list[str] = []
+    for item in hidden:
+        if not isinstance(item, str) or not APP_ID_RE.fullmatch(item) or item in hidden_ids:
+            raise AppDockError("hidden app IDs are invalid")
+        hidden_ids.append(item)
+
+    providers_raw = raw.get("providers")
+    if not isinstance(providers_raw, list) or len(providers_raw) > MAX_EXTENSION_PROVIDERS:
+        raise AppDockError("provider configuration is invalid")
+    providers: list[ProviderSpec] = []
+    provider_ids: set[str] = set()
+    for item in providers_raw:
+        required = {"id", "url", "connect_timeout_ms", "read_timeout_ms", "cache_seconds"}
+        if not isinstance(item, dict) or set(item) != required:
+            raise AppDockError("provider configuration is invalid")
+        provider_id = item.get("id")
+        if not isinstance(provider_id, str) or not APP_ID_RE.fullmatch(provider_id) or provider_id in provider_ids:
+            raise AppDockError("provider ID is invalid")
+        try:
+            connect_ms = int(item.get("connect_timeout_ms"))
+            read_ms = int(item.get("read_timeout_ms"))
+            cache_seconds = float(item.get("cache_seconds"))
+        except (TypeError, ValueError):
+            raise AppDockError("provider bounds are invalid") from None
+        if not 50 <= connect_ms <= 2000 or not 50 <= read_ms <= 5000 or not 0 <= cache_seconds <= 30:
+            raise AppDockError("provider bounds are invalid")
+        providers.append(
+            ProviderSpec(
+                provider_id=provider_id,
+                url=_literal_loopback_provider_url(item.get("url")),
+                connect_timeout=connect_ms / 1000,
+                read_timeout=read_ms / 1000,
+                cache_seconds=cache_seconds,
+            )
+        )
+        provider_ids.add(provider_id)
+
+    widgets_raw = raw.get("widgets")
+    if not isinstance(widgets_raw, list) or len(widgets_raw) > MAX_EXTENSION_WIDGETS:
+        raise AppDockError("widget configuration is invalid")
+    widgets: list[WidgetSpec] = []
+    widget_ids: set[str] = set()
+    for item in widgets_raw:
+        if not isinstance(item, dict) or not {"id", "type", "title", "provider_id"}.issubset(item) or not set(item).issubset(
+            {"id", "type", "title", "provider_id", "drill_down_url"}
+        ):
+            raise AppDockError("widget configuration is invalid")
+        widget_id = item.get("id")
+        provider_id = item.get("provider_id")
+        widget_type = item.get("type")
+        if not isinstance(widget_id, str) or not APP_ID_RE.fullmatch(widget_id) or widget_id in widget_ids:
+            raise AppDockError("widget ID is invalid")
+        if provider_id not in provider_ids or widget_type not in {"metrics", "progress"}:
+            raise AppDockError("widget provider or type is invalid")
+        title = _bounded_text(item.get("title"), "widget title", maximum=80)
+        drill_down_url = _validate_url(item.get("drill_down_url"), "drill_down_url")
+        widgets.append(WidgetSpec(widget_id, widget_type, title, provider_id, drill_down_url))
+        widget_ids.add(widget_id)
+    return ExtensionConfig(frozenset(hidden_ids), tuple(providers), tuple(widgets))
+
+
+def _json_depth(value: Any, depth: int = 0) -> int:
+    if depth > 8:
+        return depth
+    if isinstance(value, dict):
+        return max([depth, *(_json_depth(item, depth + 1) for item in value.values())])
+    if isinstance(value, list):
+        return max([depth, *(_json_depth(item, depth + 1) for item in value)])
+    return depth
+
+
+def _normalize_provider_widget(raw: Any, spec: WidgetSpec) -> dict[str, Any]:
+    if not isinstance(raw, dict) or not set(raw).issubset({"status", "metrics", "progress", "timestamp"}):
+        raise AppDockError("provider widget payload is invalid")
+    status = raw.get("status", "unavailable")
+    if status not in {"ok", "warning", "unavailable"}:
+        raise AppDockError("provider widget status is invalid")
+    timestamp = raw.get("timestamp", "")
+    if timestamp:
+        timestamp = _bounded_text(timestamp, "provider timestamp", maximum=64)
+    result: dict[str, Any] = {
+        "id": spec.widget_id,
+        "type": spec.widget_type,
+        "title": spec.title,
+        "status": status,
+        "timestamp": timestamp,
+        "drill_down_url": spec.drill_down_url,
+    }
+    if spec.widget_type == "metrics":
+        if "progress" in raw:
+            raise AppDockError("metrics widget cannot contain progress data")
+        metrics = raw.get("metrics", [])
+        if not isinstance(metrics, list) or len(metrics) > MAX_WIDGET_METRICS:
+            raise AppDockError("provider metrics are invalid")
+        normalized_metrics: list[dict[str, str]] = []
+        for item in metrics:
+            if not isinstance(item, dict) or set(item) != {"label", "value"}:
+                raise AppDockError("provider metric is invalid")
+            normalized_metrics.append(
+                {
+                    "label": _bounded_text(item.get("label"), "metric label", maximum=40),
+                    "value": _bounded_text(item.get("value"), "metric value", maximum=80),
+                }
+            )
+        result["metrics"] = normalized_metrics
+    else:
+        if "metrics" in raw:
+            raise AppDockError("progress widget cannot contain metric data")
+        progress = raw.get("progress", [])
+        if not isinstance(progress, list) or len(progress) > MAX_WIDGET_PROGRESS:
+            raise AppDockError("provider progress data is invalid")
+        normalized_progress: list[dict[str, Any]] = []
+        for item in progress:
+            if not isinstance(item, dict) or not set(item).issubset({"label", "value", "reset_at"}) or not {"label", "value"}.issubset(item):
+                raise AppDockError("provider progress item is invalid")
+            try:
+                value = float(item.get("value"))
+            except (TypeError, ValueError):
+                raise AppDockError("provider progress value is invalid") from None
+            if not 0 <= value <= 1:
+                raise AppDockError("provider progress value is invalid")
+            reset_at = item.get("reset_at", "")
+            if reset_at:
+                reset_at = _bounded_text(reset_at, "progress reset value", maximum=80)
+            normalized_progress.append(
+                {
+                    "label": _bounded_text(item.get("label"), "progress label", maximum=40),
+                    "value": value,
+                    "reset_at": reset_at,
+                }
+            )
+        result["progress"] = normalized_progress
+    return result
+
+
+class ExtensionManager:
+    def __init__(self, config: AppDockConfig):
+        self.config = config
+        self._lock = threading.RLock()
+        self._last_good: ExtensionConfig = ExtensionConfig()
+        self._last_config_signature: tuple[int, int] | None = None
+        self._config_error = ""
+        self._provider_cache: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
+
+    def _load_config(self) -> ExtensionConfig:
+        path = self.config.extension_config_path
+        try:
+            stat_result = path.stat()
+            signature = (stat_result.st_mtime_ns, stat_result.st_size)
+            if signature == self._last_config_signature:
+                return self._last_good
+            if not path.is_file() or path.is_symlink() or stat_result.st_size > MAX_EXTENSION_CONFIG_BYTES:
+                raise AppDockError("private extension configuration is invalid")
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            parsed = parse_extension_config(raw)
+            self._last_good = parsed
+            self._last_config_signature = signature
+            self._config_error = ""
+            return parsed
+        except FileNotFoundError:
+            self._last_good = ExtensionConfig()
+            self._last_config_signature = None
+            self._config_error = ""
+            return self._last_good
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, AppDockError):
+            self._config_error = "Private extensions are unavailable because their configuration is invalid."
+            return self._last_good
+
+    def hidden_app_ids(self) -> frozenset[str]:
+        with self._lock:
+            return self._load_config().hidden_app_ids
+
+    def _fetch_provider(self, spec: ProviderSpec) -> dict[str, Any]:
+        key = (spec.provider_id, spec.url, spec.connect_timeout, spec.read_timeout, spec.cache_seconds)
+        now = time.monotonic()
+        cached = self._provider_cache.get(key)
+        if cached and cached[0] >= now:
+            return cached[1]
+        parsed = urllib.parse.urlsplit(spec.url)
+        target = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+        connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=spec.connect_timeout)
+        try:
+            connection.connect()
+            if connection.sock is None:
+                raise AppDockError("provider connection failed")
+            connection.sock.settimeout(spec.read_timeout)
+            connection.request("GET", target, headers={"Accept": "application/json", "User-Agent": f"AppDock/{CURRENT_VERSION}"})
+            response = connection.getresponse()
+            if 300 <= response.status < 400 or response.getheader("Location"):
+                raise AppDockError("provider redirects are not allowed")
+            if response.status != 200:
+                raise AppDockError("provider returned an unavailable status")
+            content_type = response.getheader("Content-Type", "").split(";", 1)[0].strip().lower()
+            if content_type != "application/json":
+                raise AppDockError("provider response must be JSON")
+            content_length = response.getheader("Content-Length")
+            if content_length is not None and int(content_length) > MAX_PROVIDER_RESPONSE_BYTES:
+                raise AppDockError("provider response is too large")
+            body = response.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
+            if len(body) > MAX_PROVIDER_RESPONSE_BYTES:
+                raise AppDockError("provider response is too large")
+            raw = json.loads(body.decode("utf-8"))
+            if not isinstance(raw, dict) or set(raw) != {"schema_version", "widgets"} or raw.get("schema_version") != 1:
+                raise AppDockError("provider response schema is invalid")
+            if not isinstance(raw.get("widgets"), dict) or _json_depth(raw) > 5:
+                raise AppDockError("provider response is unbounded")
+            payload = raw
+        except (OSError, TimeoutError, ValueError, UnicodeDecodeError, json.JSONDecodeError, http.client.HTTPException, AppDockError) as exc:
+            payload = {"error": str(exc)}
+        finally:
+            connection.close()
+        self._provider_cache[key] = (now + max(1.0, spec.cache_seconds), payload)
+        return payload
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            config = self._load_config()
+            providers = {item.provider_id: item for item in config.providers}
+            provider_payloads = {provider_id: self._fetch_provider(spec) for provider_id, spec in providers.items()}
+            widgets: list[dict[str, Any]] = []
+            for spec in config.widgets:
+                payload = provider_payloads.get(spec.provider_id, {})
+                try:
+                    if "error" in payload:
+                        raise AppDockError("provider unavailable")
+                    raw_widget = payload.get("widgets", {}).get(spec.widget_id)
+                    widgets.append(_normalize_provider_widget(raw_widget, spec))
+                except AppDockError:
+                    widgets.append(
+                        {
+                            "id": spec.widget_id,
+                            "type": spec.widget_type,
+                            "title": spec.title,
+                            "status": "unavailable",
+                            "timestamp": "",
+                            "drill_down_url": spec.drill_down_url,
+                            "metrics": [] if spec.widget_type == "metrics" else None,
+                            "progress": [] if spec.widget_type == "progress" else None,
+                        }
+                    )
+            for widget in widgets:
+                if widget.get("metrics") is None:
+                    widget.pop("metrics", None)
+                if widget.get("progress") is None:
+                    widget.pop("progress", None)
+            return {"enabled": bool(config.widgets), "widgets": widgets, "error": self._config_error}
+
+
+def _safe_package_file(root: Path, relative: Any) -> Path:
+    if not isinstance(relative, str) or "\\" in relative or "\x00" in relative:
+        raise AppDockError("private package path is invalid")
+    pure = PurePosixPath(relative)
+    if pure.is_absolute() or not pure.parts or any(part in {"", ".", ".."} for part in pure.parts):
+        raise AppDockError("private package path is invalid")
+    path = (root / Path(*pure.parts)).resolve()
+    if not _inside(path, root) or not path.is_file() or path.is_symlink():
+        raise AppDockError("private package file is missing or unsafe")
+    return path
+
+
+def _read_bounded_json(path: Path, maximum: int = MAX_JSON_BYTES) -> Any:
+    if path.stat().st_size > maximum:
+        raise AppDockError("JSON file is too large")
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AppDockError("JSON file is invalid") from exc
+
+
+def preview_private_package(package_root: str | Path) -> dict[str, Any]:
+    root = Path(package_root).expanduser().resolve()
+    if not root.is_dir() or root.is_symlink():
+        raise AppDockError("private package directory is invalid")
+    package_path = _safe_package_file(root, PRIVATE_PACKAGE_MANIFEST)
+    package = _read_bounded_json(package_path)
+    required = {"schema_version", "registrations", "order_path", "extension_config_path"}
+    if not isinstance(package, dict) or set(package) != required or package.get("schema_version") != 1:
+        raise AppDockError("private package manifest is invalid")
+    registration_paths = package.get("registrations")
+    if not isinstance(registration_paths, list) or not registration_paths or len(registration_paths) > 256:
+        raise AppDockError("private package registrations are invalid")
+    registrations: dict[str, dict[str, Any]] = {}
+    for relative in registration_paths:
+        path = _safe_package_file(root, relative)
+        raw = _read_bounded_json(path)
+        if not isinstance(raw, dict) or not isinstance(raw.get("directory"), str) or not Path(raw["directory"]).expanduser().is_absolute():
+            raise AppDockError("private registration must preserve an absolute external directory")
+        normalized = normalize_manifest(
+            raw,
+            manifest_dir=path.parent,
+            directory=Path(raw["directory"]).expanduser(),
+            external=True,
+            allow_outside=True,
+        )
+        app_id = normalized["id"]
+        if app_id in registrations:
+            raise AppDockError("private package contains duplicate registrations")
+        registrations[app_id] = normalized
+    order_path = _safe_package_file(root, package.get("order_path"))
+    order = _read_bounded_json(order_path)
+    if (
+        not isinstance(order, list)
+        or len(order) != len(registrations)
+        or any(not isinstance(item, str) or item not in registrations for item in order)
+        or len(set(order)) != len(order)
+    ):
+        raise AppDockError("private package order must contain each registration exactly once")
+    extension_path = _safe_package_file(root, package.get("extension_config_path"))
+    extension_raw = _read_bounded_json(extension_path, MAX_EXTENSION_CONFIG_BYTES)
+    extension = parse_extension_config(extension_raw)
+    if not extension.hidden_app_ids.issubset(registrations):
+        raise AppDockError("visibility configuration references an unknown registration")
+    normalized_extensions = _normalized_extension_payload(extension)
+    normalized = {
+        "schema_version": 1,
+        "registrations": {app_id: registrations[app_id] for app_id in sorted(registrations)},
+        "order": order,
+        "extensions": normalized_extensions,
+    }
+    return {
+        "schema_version": 1,
+        "registration_count": len(registrations),
+        "visible_count": len(registrations) - len(extension.hidden_app_ids),
+        "order_count": len(order),
+        "digest": _digest(normalized),
+        "normalized": normalized,
+    }
+
+
+def _migration_targets(preview: dict[str, Any], config: AppDockConfig) -> dict[Path, bytes]:
+    normalized = preview["normalized"]
+    targets: dict[Path, bytes] = {}
+    for app_id, manifest in normalized["registrations"].items():
+        targets[config.registry_root / app_id / MANIFEST_NAME] = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+    targets[config.order_path] = json.dumps(normalized["order"], indent=2).encode("utf-8") + b"\n"
+    targets[config.extension_config_path] = json.dumps(normalized["extensions"], indent=2, sort_keys=True).encode("utf-8") + b"\n"
+    return targets
+
+
+def _restore_migration_receipt(receipt: dict[str, Any], config: AppDockConfig, *, verify_applied: bool) -> None:
+    entries = receipt.get("entries")
+    backup_root = Path(receipt.get("backup_root", "")).resolve()
+    if not isinstance(entries, list) or not _inside(backup_root, config.migration_root):
+        raise AppDockError("migration receipt is invalid")
+    validated: list[tuple[Path, dict[str, Any]]] = []
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {"target", "existed", "backup", "applied_sha256"}:
+            raise AppDockError("migration receipt is invalid")
+        target = (config.data_root / Path(*PurePosixPath(entry["target"]).parts)).resolve()
+        if not _inside(target, config.data_root):
+            raise AppDockError("migration receipt target is unsafe")
+        if verify_applied:
+            if not target.is_file() or hashlib.sha256(target.read_bytes()).hexdigest() != entry["applied_sha256"]:
+                raise AppDockError("migration rollback refused because imported state changed")
+        validated.append((target, entry))
+    for target, entry in reversed(validated):
+        if entry["existed"]:
+            backup = (backup_root / Path(*PurePosixPath(entry["backup"]).parts)).resolve()
+            if not _inside(backup, backup_root) or not backup.is_file() or backup.is_symlink():
+                raise AppDockError("migration backup is missing or unsafe")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temp = target.with_name(target.name + ".rollback.tmp")
+            temp.write_bytes(backup.read_bytes())
+            temp.replace(target)
+        else:
+            target.unlink(missing_ok=True)
+
+
+def import_private_package(
+    package_root: str | Path,
+    config: AppDockConfig,
+    *,
+    failure_hook: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    config.ensure()
+    preview = preview_private_package(package_root)
+    targets = _migration_targets(preview, config)
+    if all(path.is_file() and path.read_bytes() == payload for path, payload in targets.items()):
+        return {"changed": False, "digest": preview["digest"], "receipt": "", "registration_count": preview["registration_count"]}
+    operation_id = uuid.uuid4().hex
+    staging_root = config.migration_root / "staging" / operation_id
+    backup_root = config.migration_root / "backups" / operation_id
+    staging_root.mkdir(parents=True, exist_ok=False)
+    backup_root.mkdir(parents=True, exist_ok=False)
+    entries: list[dict[str, Any]] = []
+    try:
+        for index, (target, payload) in enumerate(sorted(targets.items(), key=lambda item: str(item[0]))):
+            if not _inside(target.resolve(), config.data_root):
+                raise AppDockError("migration target escapes the AppDock data root")
+            relative = target.resolve().relative_to(config.data_root.resolve()).as_posix()
+            staged = staging_root / f"{index:04d}.json"
+            staged.write_bytes(payload)
+            existed = target.is_file()
+            backup_relative = f"{index:04d}.backup"
+            if existed:
+                backup = backup_root / backup_relative
+                backup.write_bytes(target.read_bytes())
+            entries.append(
+                {
+                    "target": relative,
+                    "existed": existed,
+                    "backup": backup_relative,
+                    "applied_sha256": hashlib.sha256(payload).hexdigest(),
+                }
+            )
+        receipt = {
+            "schema_version": 1,
+            "digest": preview["digest"],
+            "backup_root": str(backup_root),
+            "entries": entries,
+        }
+        receipt_path = backup_root / "receipt.json"
+        receipt_path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        for index, (target, _payload) in enumerate(sorted(targets.items(), key=lambda item: str(item[0]))):
+            if failure_hook:
+                failure_hook(target.relative_to(config.data_root).as_posix())
+            target.parent.mkdir(parents=True, exist_ok=True)
+            staged = staging_root / f"{index:04d}.json"
+            staged.replace(target)
+        return {
+            "changed": True,
+            "digest": preview["digest"],
+            "receipt": str(receipt_path),
+            "registration_count": preview["registration_count"],
+        }
+    except Exception:
+        try:
+            receipt = {
+                "backup_root": str(backup_root),
+                "entries": entries,
+            }
+            _restore_migration_receipt(receipt, config, verify_applied=False)
+        finally:
+            _remove_tree(staging_root, ignore_errors=True)
+        raise
+    finally:
+        _remove_tree(staging_root, ignore_errors=True)
+
+
+def rollback_private_package(receipt_path: str | Path, config: AppDockConfig) -> dict[str, Any]:
+    path = Path(receipt_path).expanduser().resolve()
+    if not path.is_file() or path.is_symlink() or not _inside(path, config.migration_root / "backups"):
+        raise AppDockError("migration receipt is invalid")
+    receipt = _read_bounded_json(path)
+    if not isinstance(receipt, dict) or receipt.get("schema_version") != 1:
+        raise AppDockError("migration receipt is invalid")
+    _restore_migration_receipt(receipt, config, verify_applied=True)
+    return {"rolled_back": True, "digest": receipt.get("digest", "")}
+
+
 class AppManager:
-    def __init__(self, apps_root: Path | None = None, config: AppDockConfig | None = None):
+    def __init__(self, apps_root: Path | None = None, config: AppDockConfig | None = None, extensions: ExtensionManager | None = None):
         self.config = config or AppDockConfig.from_environment()
         self.legacy_direct_root = apps_root is not None
         self.apps_root = Path(apps_root).expanduser().resolve() if apps_root is not None else self.config.registry_root
         self.order_path = (self.apps_root / ".appdock-order.json") if self.legacy_direct_root else self.config.order_path
+        self.extensions = extensions or ExtensionManager(self.config)
         self._runtimes: dict[str, AppRuntime] = {}
         self._lock = threading.RLock()
 
@@ -491,17 +1060,21 @@ class AppManager:
             return {"id": spec.app_id, "name": spec.name, "description": spec.description, "state": state, "pid": process.pid if managed else (external_pids[0] if external_pids else None), "managed": managed, "started_at": runtime.started_at, "last_exit_code": runtime.last_exit_code, "health": health, "health_detail": detail, "port": spec.port, "local_url": spec.local_url, "private_url": spec.private_url}
 
     def all_status(self) -> list[dict[str, Any]]:
-        return [self.status(spec) for spec in self._ordered_specs(self.discover())]
+        hidden = self.extensions.hidden_app_ids() if not self.legacy_direct_root else frozenset()
+        return [self.status(spec) for spec in self._ordered_specs(self.discover()) if spec.app_id not in hidden]
 
     def move(self, app_id: str, direction: str) -> dict[str, Any]:
         specs = self.discover()
         if app_id not in specs:
             raise KeyError(app_id)
         ids = [spec.app_id for spec in self._ordered_specs(specs)]
-        index = ids.index(app_id)
+        hidden = self.extensions.hidden_app_ids() if not self.legacy_direct_root else frozenset()
+        movable = [item for item in ids if item not in hidden]
+        index = movable.index(app_id)
         target = index - 1 if direction == "up" else index + 1 if direction == "down" else index
-        if 0 <= target < len(ids):
-            ids[index], ids[target] = ids[target], ids[index]
+        if 0 <= target < len(movable):
+            left, right = ids.index(movable[index]), ids.index(movable[target])
+            ids[left], ids[right] = ids[right], ids[left]
             self._write_order(ids)
         return self.status(specs[app_id])
 
@@ -1393,6 +1966,12 @@ HTML = r'''<!doctype html>
     </div>
     <section id="apps" class="apps" aria-live="polite"></section>
 
+    <section id="extensionsPanel" class="extensions" aria-labelledby="extensionsTitle" hidden>
+      <h2 id="extensionsTitle">Extensions</h2>
+      <p id="extensionsError" class="status warning" role="status" hidden></p>
+      <div id="widgets" class="widgets" aria-live="polite"></div>
+    </section>
+
     <section id="updatesPanel" class="panel" hidden>
       <h2>AppDock updates</h2>
       <p class="muted">Release assets are downloaded from the configured GitHub repository, checksum-verified, staged, and applied with rollback.</p>
@@ -1522,6 +2101,7 @@ def stage_coordinated_update(
 class Handler(BaseHTTPRequestHandler):
     manager: AppManager = AppManager()
     config: AppDockConfig = manager.config
+    extensions: ExtensionManager = manager.extensions
     local: LocalFolderOnboarding = LocalFolderOnboarding(config)
     github: GitHubOnboarding = GitHubOnboarding(config)
     checker: ReleaseChecker = ReleaseChecker(config.update_repository)
@@ -1614,6 +2194,7 @@ class Handler(BaseHTTPRequestHandler):
                     health["ready_token"] = self.ready_token
                 self._json(health)
             elif path == "/api/apps": self._json(self.manager.all_status())
+            elif path == "/api/extensions": self._json(self.extensions.snapshot())
             elif path == "/api/config": self._json({"version": CURRENT_VERSION, "update_repository": self.config.update_repository})
             elif path == "/api/updates/check":
                 release = self.checker.check()
@@ -1676,7 +2257,7 @@ def main() -> None:
     if args.ready_token is not None and not re.fullmatch(r"[A-Za-z0-9_-]{20,128}", args.ready_token):
         parser.error("invalid readiness token")
     config = AppDockConfig.from_environment(data_dir=args.data_dir)
-    config.ensure(); Handler.config = config; Handler.manager = AppManager(config=config); Handler.local = LocalFolderOnboarding(config); Handler.github = GitHubOnboarding(config); Handler.checker = ReleaseChecker(config.update_repository); Handler.coordinator = UpdateCoordinator(); Handler.ready_token = args.ready_token
+    config.ensure(); Handler.config = config; Handler.extensions = ExtensionManager(config); Handler.manager = AppManager(config=config, extensions=Handler.extensions); Handler.local = LocalFolderOnboarding(config); Handler.github = GitHubOnboarding(config); Handler.checker = ReleaseChecker(config.update_repository); Handler.coordinator = UpdateCoordinator(); Handler.ready_token = args.ready_token
     cleanup_stop = threading.Event()
     cleanup_thread = threading.Thread(target=_staging_cleanup_loop, args=(Handler.github, cleanup_stop), name="appdock-staging-cleanup", daemon=True)
     cleanup_thread.start()

@@ -17,10 +17,14 @@ function element(tag, text = "", className = "") {
 function safeUrl(value) {
   try {
     const url = new URL(String(value));
-    return ["http:", "https:"].includes(url.protocol) ? url.href : "";
+    return ["http:", "https:"].includes(url.protocol) && !url.username && !url.password ? url.href : "";
   } catch (_error) {
     return "";
   }
+}
+
+function isLoopbackContext() {
+  return ["127.0.0.1", "localhost", "::1", "[::1]"].includes(window.location.hostname.toLowerCase());
 }
 
 async function api(path, options = {}) {
@@ -41,6 +45,16 @@ function addLink(parent, label, value) {
   link.target = "_blank";
   link.rel = "noopener noreferrer";
   parent.append(link);
+}
+
+function addPreferredAppLinks(parent, app) {
+  const localFirst = isLoopbackContext();
+  const primary = localFirst ? app.local_url : app.private_url;
+  const secondary = localFirst ? app.private_url : app.local_url;
+  addLink(parent, "Open ↗", primary || secondary);
+  if (primary && secondary && safeUrl(primary) !== safeUrl(secondary)) {
+    addLink(parent, localFirst ? "Private ↗" : "Local ↗", secondary);
+  }
 }
 
 function actionButton(action, appId, label = "") {
@@ -75,8 +89,7 @@ function renderApps(apps) {
     info.append(meta);
 
     const links = element("div", "", "links");
-    addLink(links, "Local ↗", app.local_url);
-    addLink(links, "Private ↗", app.private_url);
+    addPreferredAppLinks(links, app);
     info.append(links);
 
     const logs = element("details", "", "log-details");
@@ -105,6 +118,91 @@ async function loadApps() {
     renderApps(await api("/api/apps"));
   } catch (error) {
     byId("apps").replaceChildren(element("div", error.message, "empty"));
+  }
+}
+
+function renderMetricWidget(widget) {
+  const card = element("article", "", `widget widget-${widget.status}`);
+  const heading = element("div", "", "widget-heading");
+  heading.append(element("h3", widget.title), element("span", widget.status, `badge ${widget.status}`));
+  card.append(heading);
+  const rows = element("dl", "", "metric-rows");
+  const metrics = Array.isArray(widget.metrics) ? widget.metrics : [];
+  if (!metrics.length) {
+    card.append(element("p", "Data unavailable.", "muted widget-unavailable"));
+  } else {
+    metrics.forEach((metric) => {
+      const row = element("div", "", "metric-row");
+      row.append(element("dt", metric.label), element("dd", metric.value));
+      rows.append(row);
+    });
+    card.append(rows);
+  }
+  return card;
+}
+
+function renderProgressWidget(widget) {
+  const card = element("article", "", `widget widget-${widget.status}`);
+  const heading = element("div", "", "widget-heading");
+  heading.append(element("h3", widget.title), element("span", widget.status, `badge ${widget.status}`));
+  card.append(heading);
+  const items = Array.isArray(widget.progress) ? widget.progress : [];
+  if (!items.length) {
+    card.append(element("p", "Data unavailable.", "muted widget-unavailable"));
+  } else {
+    const root = element("div", "", "progress-rows");
+    items.forEach((item) => {
+      const row = element("div", "", "progress-row");
+      const label = element("div", "", "progress-label");
+      label.append(element("span", item.label), element("strong", `${Math.round(Number(item.value) * 100)}%`));
+      const track = element("div", "", "progress-track");
+      const fill = element("div", "", "progress-fill");
+      fill.style.width = `${Math.max(0, Math.min(100, Number(item.value) * 100))}%`;
+      track.append(fill);
+      row.append(label, track);
+      if (item.reset_at) row.append(element("span", `Resets ${item.reset_at}`, "progress-reset"));
+      root.append(row);
+    });
+    card.append(root);
+  }
+  return card;
+}
+
+function renderExtensions(payload) {
+  const panel = byId("extensionsPanel");
+  const root = byId("widgets");
+  const error = byId("extensionsError");
+  root.replaceChildren();
+  error.hidden = !payload.error;
+  error.textContent = payload.error || "";
+  const widgets = Array.isArray(payload.widgets) ? payload.widgets : [];
+  panel.hidden = !payload.enabled && !payload.error;
+  widgets.forEach((widget) => {
+    const card = widget.type === "progress" ? renderProgressWidget(widget) : renderMetricWidget(widget);
+    const href = safeUrl(widget.drill_down_url);
+    if (href) {
+      card.tabIndex = 0;
+      card.setAttribute("role", "link");
+      card.setAttribute("aria-label", `Open ${widget.title}`);
+      const open = () => window.open(href, "_blank", "noopener,noreferrer");
+      card.addEventListener("click", open);
+      card.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          open();
+        }
+      });
+    }
+    if (widget.timestamp) card.append(element("p", widget.timestamp, "widget-timestamp"));
+    root.append(card);
+  });
+}
+
+async function loadExtensions() {
+  try {
+    renderExtensions(await api("/api/extensions"));
+  } catch (_error) {
+    renderExtensions({ enabled: false, widgets: [], error: "Extensions are unavailable." });
   }
 }
 
@@ -287,4 +385,6 @@ byId("addModal").addEventListener("click", (event) => { if (event.target === byI
 document.addEventListener("keydown", (event) => { if (event.key === "Escape" && !byId("addModal").hidden) closeAddDialog(); });
 
 loadApps();
+loadExtensions();
 window.setInterval(loadApps, 5000);
+window.setInterval(loadExtensions, 5000);

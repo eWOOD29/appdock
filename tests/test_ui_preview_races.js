@@ -23,7 +23,10 @@ function makeHarness() {
       dataset: {},
       disabled: false,
       open: false,
+      style: {},
+      tabIndex: -1,
       addEventListener() {},
+      setAttribute() {},
       append() {},
       appendChild() {},
       replaceChildren() {},
@@ -46,6 +49,7 @@ function makeHarness() {
 
   async function fetch(url, options = {}) {
     if (url === "/api/apps") return response([]);
+    if (url === "/api/extensions") return response({ enabled: false, widgets: [], error: "" });
     if (url === "/api/onboarding/github/cleanup") {
       cleanups.push(JSON.parse(options.body).staging_id);
       return response({ cleaned: true });
@@ -59,6 +63,8 @@ function makeHarness() {
   const window = {
     confirm: () => true,
     alert() {},
+    open() {},
+    location: { hostname: "127.0.0.1" },
     setInterval() { return 1; },
   };
   const context = vm.createContext({ console, document, fetch, URL, window, setTimeout, clearTimeout });
@@ -107,4 +113,15 @@ test("overlapping GitHub previews keep only the newest and clean the stale resul
   vm.runInContext("closeAddDialog()", harness.context);
   await tick();
   assert.deepEqual(harness.cleanups, ["repo-old", "repo-new"]);
+});
+
+test("extension widgets use DOM text and context-aware app links", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "static", "app.js"), "utf8");
+  assert.equal(source.includes("innerHTML"), false);
+  assert.match(source, /textContent/);
+  const harness = makeHarness();
+  assert.equal(vm.runInContext("isLoopbackContext()", harness.context), true);
+  vm.runInContext("window.location.hostname = 'private.example.invalid'", harness.context);
+  assert.equal(vm.runInContext("isLoopbackContext()", harness.context), false);
+  assert.equal(vm.runInContext("safeUrl('https://user:pass@example.invalid')", harness.context), "");
 });
