@@ -23,6 +23,8 @@ TOP_LEVEL_FILES = {
 TOP_LEVEL_DIRS = {"appdock", "appdock_core", "static", "docs", "scripts", "templates"}
 EXCLUDED_PARTS = {"__pycache__", ".pytest_cache", ".git", ".venv", "dist", "build", "runtime", "data"}
 EXCLUDED_SUFFIXES = {".pyc", ".pyo", ".log"}
+TEXT_SUFFIXES = {".css", ".html", ".js", ".json", ".md", ".ps1", ".py", ".toml", ".txt", ".yaml", ".yml"}
+TEXT_FILENAMES = {"LICENSE"}
 
 
 def release_files(root: Path = ROOT) -> list[Path]:
@@ -58,7 +60,12 @@ def safe_archive_name(path: Path, root: Path = ROOT) -> str:
 def build_archive(output: Path = DEFAULT_OUTPUT, root: Path = ROOT) -> str:
     output.parent.mkdir(parents=True, exist_ok=True)
     files = release_files(root)
-    payloads = {safe_archive_name(path, root): path.read_bytes() for path in files}
+    payloads: dict[str, bytes] = {}
+    for path in files:
+        content = path.read_bytes()
+        if path.suffix.lower() in TEXT_SUFFIXES or path.name in TEXT_FILENAMES:
+            content = content.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        payloads[safe_archive_name(path, root)] = content
     manifest = {
         "schema_version": 2,
         "files": [

@@ -24,7 +24,8 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Unit tests
-        run: python -m unittest discover -s tests -v
+        run: >-
+          python -c "import pathlib, subprocess, sys; p = subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-s', 'tests', '-v'], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT); pathlib.Path('unit-test-output.txt').write_text(p.stdout, encoding='utf-8'); print('\n'.join(p.stdout.splitlines()[-160:])); raise SystemExit(p.returncode)"
       - name: Compile check
         run: python -m compileall -q appdock.py tests scripts
       - name: JavaScript checks
