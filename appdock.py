@@ -650,11 +650,11 @@ class ExtensionManager:
         self.config = config
         self._lock = threading.RLock()
         self._active = ExtensionConfig()
-        self._last_config_signature: tuple[int, int, tuple[str, ...] | None] | None = None
+        self._last_config_signature: tuple[str, tuple[str, ...] | None] | None = None
         self._config_error = ""
         self._provider_cache: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
 
-    def _disable(self, error: str, signature: tuple[int, int, tuple[str, ...] | None] | None) -> ExtensionConfig:
+    def _disable(self, error: str, signature: tuple[str, tuple[str, ...] | None] | None) -> ExtensionConfig:
         self._active = ExtensionConfig()
         self._last_config_signature = signature
         self._config_error = error
@@ -664,14 +664,18 @@ class ExtensionManager:
     def _load_config(self, valid_app_ids: Iterable[str] | None = None) -> ExtensionConfig:
         path = self.config.extension_config_path
         known = tuple(sorted(set(valid_app_ids))) if valid_app_ids is not None else None
+        signature: tuple[str, tuple[str, ...] | None] | None = None
         try:
             stat_result = path.stat()
-            signature = (stat_result.st_mtime_ns, stat_result.st_size, known)
-            if signature == self._last_config_signature:
-                return self._active
             if not path.is_file() or path.is_symlink() or _is_link_or_reparse(path) or stat_result.st_size > MAX_EXTENSION_CONFIG_BYTES:
                 raise AppDockError("private extension configuration is invalid")
-            raw = _loads_strict_json(path.read_text(encoding="utf-8"))
+            payload = path.read_bytes()
+            if len(payload) > MAX_EXTENSION_CONFIG_BYTES:
+                raise AppDockError("private extension configuration is invalid")
+            signature = (hashlib.sha256(payload).hexdigest(), known)
+            if signature == self._last_config_signature:
+                return self._active
+            raw = _loads_strict_json(payload.decode("utf-8"))
             parsed = parse_extension_config(raw)
             if known is not None and not parsed.hidden_app_ids.issubset(set(known)):
                 raise AppDockError("visibility configuration references an unknown registration")
@@ -685,7 +689,7 @@ class ExtensionManager:
         except (OSError, UnicodeDecodeError, AppDockError):
             return self._disable(
                 "Private extensions are unavailable because their configuration is invalid.",
-                locals().get("signature"),
+                signature,
             )
 
     def hidden_app_ids(self, valid_app_ids: Iterable[str] | None = None) -> frozenset[str]:
