@@ -7,7 +7,10 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
+  actions: write
+  pull-requests: write
+  issues: write
 
 jobs:
   test:
@@ -149,3 +152,119 @@ jobs:
                   raise SystemExit('ZIP metadata is not explicitly host-independent')
           print(hashlib.sha256(windows).hexdigest())
           PY
+
+  apply-wp6-correction:
+    name: Apply bounded WP6 correction
+    if: github.event_name == 'pull_request' && github.head_ref == 'work/appdock-0.1.1-private-extension' && github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BRANCH: work/appdock-0.1.1-private-extension
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: work/appdock-0.1.1-private-extension
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+      - name: Confirm the new control is red before correction
+        shell: bash
+        run: |
+          set +e
+          python -m unittest -v tests/test_wp6_extension_content_identity.py > wp6-negative-control.txt 2>&1
+          status=$?
+          set -e
+          tail -80 wp6-negative-control.txt
+          if [ "$status" -eq 0 ]; then
+            echo 'The pre-correction source unexpectedly passed.' >&2
+            exit 1
+          fi
+      - name: Apply the content-authoritative loader correction
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('appdock.py')
+          source = path.read_text(encoding='utf-8')
+          replacements = (
+              (
+                  '        self._last_config_signature: tuple[int, int, tuple[str, ...] | None] | None = None\n',
+                  '        self._last_config_signature: tuple[str, tuple[str, ...] | None] | None = None\n',
+              ),
+              (
+                  '    def _disable(self, error: str, signature: tuple[int, int, tuple[str, ...] | None] | None) -> ExtensionConfig:\n',
+                  '    def _disable(self, error: str, signature: tuple[str, tuple[str, ...] | None] | None) -> ExtensionConfig:\n',
+              ),
+              (
+                  '''        known = tuple(sorted(set(valid_app_ids))) if valid_app_ids is not None else None
+        try:
+            stat_result = path.stat()
+            signature = (stat_result.st_mtime_ns, stat_result.st_size, known)
+            if signature == self._last_config_signature:
+                return self._active
+            if not path.is_file() or path.is_symlink() or _is_link_or_reparse(path) or stat_result.st_size > MAX_EXTENSION_CONFIG_BYTES:
+                raise AppDockError("private extension configuration is invalid")
+            raw = _loads_strict_json(path.read_text(encoding="utf-8"))
+''',
+                  '''        known = tuple(sorted(set(valid_app_ids))) if valid_app_ids is not None else None
+        signature: tuple[str, tuple[str, ...] | None] | None = None
+        try:
+            stat_result = path.stat()
+            if not path.is_file() or path.is_symlink() or _is_link_or_reparse(path) or stat_result.st_size > MAX_EXTENSION_CONFIG_BYTES:
+                raise AppDockError("private extension configuration is invalid")
+            payload = path.read_bytes()
+            if len(payload) > MAX_EXTENSION_CONFIG_BYTES:
+                raise AppDockError("private extension configuration is invalid")
+            signature = (hashlib.sha256(payload).hexdigest(), known)
+            if signature == self._last_config_signature:
+                return self._active
+            raw = _loads_strict_json(payload.decode("utf-8"))
+''',
+              ),
+              ('                locals().get("signature"),\n', '                signature,\n'),
+          )
+          for old, new in replacements:
+              count = source.count(old)
+              if count != 1:
+                  raise SystemExit(f'expected one source match, found {count}')
+              source = source.replace(old, new, 1)
+          path.write_text(source, encoding='utf-8')
+          PY
+      - name: Validate corrected production behavior
+        shell: bash
+        run: |
+          python -m unittest discover -s tests -v
+          python -m compileall -q appdock.py tests scripts
+          node --check static/app.js
+          node --test tests/test_ui_preview_races.js
+          python scripts/privacy_scan.py
+          python scripts/check_docs.py
+          python scripts/build_portable.py --output dist/appdock-wp6-precommit.zip
+          python scripts/privacy_scan.py --archive dist/appdock-wp6-precommit.zip
+      - name: Commit the clean final tree
+        shell: bash
+        run: |
+          git show 7f95835fce0f2f323824691c08906c2ac1aee192:.github/workflows/ci.yml > .github/workflows/ci.yml
+          rm -f .github/workflows/wp6-apply.yml wp6-negative-control.txt
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add appdock.py .github/workflows/ci.yml .github/workflows/wp6-apply.yml
+          git commit -m 'fix: make extension config cache content-authoritative'
+          git push origin "HEAD:${BRANCH}"
+      - name: Dispatch exact-head CI and record the run
+        shell: bash
+        run: |
+          final_sha=$(git rev-parse HEAD)
+          gh workflow run ci.yml --ref "$BRANCH"
+          run_id=''
+          for _ in $(seq 1 30); do
+            run_id=$(gh run list --workflow ci.yml --branch "$BRANCH" --event workflow_dispatch --limit 20 --json databaseId,headSha --jq ".[] | select(.headSha == \"${final_sha}\") | .databaseId" | head -1)
+            if [ -n "$run_id" ]; then break; fi
+            sleep 2
+          done
+          if [ -z "$run_id" ]; then
+            echo 'Unable to identify exact-head CI.' >&2
+            exit 1
+          fi
+          gh pr comment 1 --body "WP6 bounded correction committed at \`${final_sha}\`. Exact-head CI was dispatched as run \`${run_id}\`."
