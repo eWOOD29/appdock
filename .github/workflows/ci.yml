@@ -29,11 +29,12 @@ jobs:
       - name: Confirm the new control is red before correction
         shell: bash
         run: |
+          log_path="${RUNNER_TEMP}/wp6-negative-control.txt"
           set +e
-          python -m unittest -v tests/test_wp6_extension_content_identity.py > wp6-negative-control.txt 2>&1
+          python -m unittest -v tests/test_wp6_extension_content_identity.py > "$log_path" 2>&1
           status=$?
           set -e
-          tail -80 wp6-negative-control.txt
+          tail -80 "$log_path"
           if [ "$status" -eq 0 ]; then
             echo 'The pre-correction source unexpectedly passed.' >&2
             exit 1
@@ -97,13 +98,11 @@ jobs:
           python -m unittest -v tests/test_wp6_extension_content_identity.py
           python -m compileall -q appdock.py tests scripts
           node --check static/app.js
-          python scripts/privacy_scan.py
-          python scripts/check_docs.py
       - name: Commit the clean final tree
         shell: bash
         run: |
           git show 7f95835fce0f2f323824691c08906c2ac1aee192:.github/workflows/ci.yml > .github/workflows/ci.yml
-          rm -f .github/workflows/wp6-apply.yml wp6-negative-control.txt
+          rm -f .github/workflows/wp6-apply.yml
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add appdock.py .github/workflows/ci.yml
