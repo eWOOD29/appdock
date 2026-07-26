@@ -29,13 +29,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "87aef0a6ee4d13513759f67182fb7bc226cb251f"
+          test "$(git rev-parse HEAD^)" = "d545908015b2af76a5957b80f685a9bf63819b19"
           test "$(git diff --name-only HEAD^ HEAD)" = ".github/workflows/ci.yml"
-      - name: Correct executor escaping and apply bounded remediation
+      - name: Correct bounded executor and apply remediation
         shell: bash
         run: |
           set -euo pipefail
           python scripts/wp16_executor_fix.py
+          python scripts/wp16_test_fix.py
           python scripts/wp16_apply.py
       - name: Validate corrected tree
         shell: bash
@@ -60,7 +61,7 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
           git diff --cached --name-only | tee /tmp/wp16-changed-files.txt
-          test "$(git diff --cached --name-only | tr '\n' ' ')" = ".github/workflows/ci.yml .github/workflows/wp16-remediation.yml appdock.py scripts/emit_windows_path_fixture.py scripts/wp16_apply.py scripts/wp16_executor_fix.py tests/test_wp16_discovery_contract.py "
+          test "$(git diff --cached --name-only | tr '\n' ' ')" = ".github/workflows/ci.yml .github/workflows/wp16-remediation.yml appdock.py scripts/emit_windows_path_fixture.py scripts/wp16_apply.py scripts/wp16_executor_fix.py scripts/wp16_test_fix.py tests/test_wp16_discovery_contract.py "
           git commit -m 'fix: preserve imported path flavor through discovery'
           git rev-parse HEAD | tee /tmp/wp16-candidate-sha.txt
           git push origin "HEAD:${BRANCH}"
@@ -83,7 +84,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: wp16-remediation-evidence-final
+          name: wp16-remediation-evidence-complete
           path: |
             /tmp/wp16-unit-tests.txt
             /tmp/wp16-changed-files.txt
