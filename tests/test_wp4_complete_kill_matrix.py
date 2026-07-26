@@ -49,12 +49,10 @@ class CompleteKillMatrixTests(unittest.TestCase):
             }
             path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
             registration_paths.append(path.relative_to(root).as_posix())
-            normalized[app_id] = appdock.normalize_manifest(
+            normalized[app_id] = appdock.normalize_private_registration(
                 raw,
                 manifest_dir=path.parent,
-                directory=source_root / app_id,
-                external=True,
-                allow_outside=True,
+                path_flavor="windows" if os.name == "nt" else "posix",
             )
         extensions = {
             "schema_version": 1,
