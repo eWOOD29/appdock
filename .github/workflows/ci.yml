@@ -7,7 +7,9 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
+  actions: write
+  pull-requests: write
 
 jobs:
   test:
@@ -200,3 +202,81 @@ jobs:
                   raise SystemExit('ZIP metadata is not explicitly host-independent')
           print(hashlib.sha256(windows).hexdigest())
           PY
+
+  apply-wp16-remediation:
+    name: Apply bounded WP16 remediation
+    if: github.event_name == 'pull_request' && github.head_ref == 'work/appdock-0.1.2-windows-path-remediation' && github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BRANCH: work/appdock-0.1.2-windows-path-remediation
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: work/appdock-0.1.2-windows-path-remediation
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+      - name: Guard exact append-only input
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "d7ec0a0967ba17b21d1df3285c2211a4686ee60f"
+          test "$(git diff --name-only HEAD^ HEAD)" = ".github/workflows/ci.yml"
+      - name: Apply production correction and final evidence coverage
+        run: python scripts/wp16_apply.py
+      - name: Validate corrected tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m unittest discover -s tests -v 2>&1 | tee /tmp/wp16-unit-tests.txt
+          python -m compileall -q appdock.py tests scripts
+          node --check static/app.js
+          node --test tests/test_ui_preview_races.js
+          python scripts/privacy_scan.py
+          python scripts/check_docs.py
+          python scripts/build_portable.py --output /tmp/appdock-wp16.zip
+          python scripts/privacy_scan.py --archive /tmp/appdock-wp16.zip
+          python scripts/emit_windows_path_fixture.py --output /tmp/wp16-private-fixture
+          test -f /tmp/wp16-private-fixture/discovery.json
+          git diff --check
+      - name: Commit clean final tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git diff --cached --name-only | tee /tmp/wp16-changed-files.txt
+          test "$(git diff --cached --name-only | tr '\n' ' ')" = ".github/workflows/ci.yml .github/workflows/wp16-remediation.yml appdock.py scripts/emit_windows_path_fixture.py scripts/wp16_apply.py tests/test_wp16_discovery_contract.py "
+          git commit -m 'fix: preserve imported path flavor through discovery'
+          git rev-parse HEAD | tee /tmp/wp16-candidate-sha.txt
+          git push origin "HEAD:${BRANCH}"
+      - name: Dispatch exact-head CI
+        shell: bash
+        run: |
+          set -euo pipefail
+          final_sha=$(cat /tmp/wp16-candidate-sha.txt)
+          gh workflow run ci.yml --ref "$BRANCH"
+          run_id=''
+          for _ in $(seq 1 30); do
+            run_id=$(gh run list --workflow ci.yml --branch "$BRANCH" --event workflow_dispatch --limit 20 --json databaseId,headSha --jq ".[] | select(.headSha == \"${final_sha}\") | .databaseId" | head -1)
+            if [ -n "$run_id" ]; then break; fi
+            sleep 2
+          done
+          test -n "$run_id"
+          printf '%s\n' "$run_id" | tee /tmp/wp16-exact-head-run.txt
+          gh pr comment 2 --body "WP16 bounded remediation committed at \`${final_sha}\`. Exact-head CI dispatched as run \`${run_id}\`."
+      - name: Upload bounded remediation evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wp16-remediation-evidence
+          path: |
+            /tmp/wp16-unit-tests.txt
+            /tmp/wp16-changed-files.txt
+            /tmp/wp16-candidate-sha.txt
+            /tmp/wp16-exact-head-run.txt
+            /tmp/wp16-private-fixture/preview.json
+            /tmp/wp16-private-fixture/discovery.json
