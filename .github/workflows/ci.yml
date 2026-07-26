@@ -200,3 +200,35 @@ jobs:
                   raise SystemExit('ZIP metadata is not explicitly host-independent')
           print(hashlib.sha256(windows).hexdigest())
           PY
+
+  # BEGIN WP14 BOUNDED TRANSPORT
+  wp14-apply-public-core:
+    name: Apply bounded WP14 public-core correction
+    if: github.event_name == 'pull_request' && github.head_ref == 'work/appdock-0.1.2-windows-path-remediation'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: work/appdock-0.1.2-windows-path-remediation
+          fetch-depth: 0
+      - name: Apply exact correction and remove transport
+        run: |
+          git apply --check .github/wp14-appdock.patch
+          git apply .github/wp14-appdock.patch
+          rm .github/wp14-appdock.patch .github/workflows/wp14-apply.yml
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('.github/workflows/ci.yml')
+          text = path.read_text(encoding='utf-8')
+          start = text.index('\n  # BEGIN WP14 BOUNDED TRANSPORT')
+          end = text.index('\n  # END WP14 BOUNDED TRANSPORT', start) + len('\n  # END WP14 BOUNDED TRANSPORT')
+          path.write_text(text[:start] + text[end:] + ('\n' if not text[end:].endswith('\n') else ''), encoding='utf-8')
+          PY
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add appdock.py .github
+          git commit -m "fix: make Windows private paths host independent"
+          git push origin HEAD:work/appdock-0.1.2-windows-path-remediation
+  # END WP14 BOUNDED TRANSPORT
