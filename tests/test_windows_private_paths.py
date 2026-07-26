@@ -115,20 +115,8 @@ class WindowsPrivatePathContractTests(unittest.TestCase):
             "order_path": "migration/app-order.json",
             "extension_config_path": "migration/extensions.json",
         })
-        normalized_registration = appdock.normalize_manifest(
-            raw,
-            manifest_dir=path.parent,
-            directory=Path(str(raw["directory"])).expanduser(),
-            external=True,
-            allow_outside=True,
-        )
-        digest = appdock._digest({
-            "schema_version": 1,
-            "registrations": {app_id: normalized_registration},
-            "order": [app_id],
-            "extensions": extensions,
-        })
-        self._write_hash_manifest(package, digest)
+        # The malformed path must be rejected before digest validation.
+        self._write_hash_manifest(package, "0" * 64)
 
     def test_malformed_leading_slash_drive_path_is_rejected_on_every_host(self) -> None:
         package = self.root / "malformed"
