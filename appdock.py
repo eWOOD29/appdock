@@ -140,9 +140,9 @@ class AppSpec:
     app_id: str
     name: str
     manifest_dir: Path
-    directory: Path
+    directory: Path | str
     command: list[str]
-    cwd: Path
+    cwd: Path | str
     description: str = ""
     port: int | None = None
     health_url: str = ""
@@ -151,6 +151,21 @@ class AppSpec:
     env: dict[str, str | None] = field(default_factory=dict)
     process_name: str = ""
     stop_timeout: float = 3.0
+    path_flavor: str = "native"
+
+
+def _native_runtime_cwd(spec: AppSpec) -> Path:
+    if spec.path_flavor == "native":
+        return Path(spec.cwd)
+    if spec.path_flavor == "windows":
+        if os.name != "nt":
+            raise AppDockError("application path flavor is unsupported on this host")
+        return Path(str(spec.cwd))
+    if spec.path_flavor == "posix":
+        if os.name == "nt":
+            raise AppDockError("application path flavor is unsupported on this host")
+        return Path(str(spec.cwd))
+    raise AppDockError("application path flavor is unsupported on this host")
 
 
 @dataclass
@@ -1085,9 +1100,15 @@ def preview_private_package(package_root: str | Path) -> dict[str, Any]:
 
 def _migration_targets(preview: dict[str, Any], config: AppDockConfig) -> dict[Path, bytes]:
     normalized = preview["normalized"]
+    path_flavor = preview.get("path_flavor")
+    if path_flavor not in {"windows", "posix"}:
+        raise AppDockError("private package path flavor is unsupported")
     targets: dict[Path, bytes] = {}
     for app_id, manifest in normalized["registrations"].items():
-        targets[config.registry_root / app_id / MANIFEST_NAME] = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+        persisted = dict(manifest)
+        persisted["_appdock_private_import"] = True
+        persisted["path_flavor"] = path_flavor
+        targets[config.registry_root / app_id / MANIFEST_NAME] = json.dumps(persisted, indent=2, sort_keys=True).encode("utf-8") + b"\n"
     targets[config.order_path] = json.dumps(normalized["order"], indent=2).encode("utf-8") + b"\n"
     targets[config.extension_config_path] = json.dumps(normalized["extensions"], indent=2, sort_keys=True).encode("utf-8") + b"\n"
     return targets
@@ -1333,7 +1354,45 @@ class AppManager:
             if not manifest_path.is_file() or manifest_path.is_symlink():
                 continue
             try:
-                raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+                raw = _loads_strict_json(manifest_path.read_text(encoding="utf-8"))
+                if not isinstance(raw, dict):
+                    raise ManifestError("manifest must be a JSON object")
+                provenance_present = "_appdock_private_import" in raw or "path_flavor" in raw
+                if provenance_present:
+                    if self.legacy_direct_root or raw.get("_appdock_private_import") is not True or raw.get("external") is not True:
+                        raise ManifestError("imported registration provenance is invalid")
+                    path_flavor = raw.get("path_flavor")
+                    if path_flavor not in {"windows", "posix"}:
+                        raise ManifestError("imported registration path flavor is invalid")
+                    normalized = normalize_private_registration(raw, manifest_dir=manifest_dir, path_flavor=path_flavor)
+                    app_id = normalized["id"]
+                    if app_id in specs:
+                        continue
+                    directory = normalized["directory"]
+                    relative_cwd = normalized["cwd"]
+                    if path_flavor == "windows":
+                        cwd = directory if relative_cwd == "." else directory + "\\" + relative_cwd
+                    else:
+                        cwd = directory if relative_cwd == "." else directory.rstrip("/") + "/" + relative_cwd
+                    specs[app_id] = AppSpec(
+                        app_id=app_id,
+                        name=normalized["name"],
+                        manifest_dir=manifest_dir.resolve(),
+                        directory=directory,
+                        command=normalized["command"],
+                        cwd=cwd,
+                        description=normalized["description"],
+                        port=normalized["port"],
+                        health_url=normalized["health_url"],
+                        local_url=normalized["local_url"],
+                        private_url=normalized["private_url"],
+                        env=normalized["env"],
+                        process_name=normalized["process_name"],
+                        stop_timeout=normalized["stop_timeout"],
+                        path_flavor=path_flavor,
+                    )
+                    continue
+
                 target_raw = raw.get("directory")
                 if target_raw:
                     target = Path(str(target_raw)).expanduser()
@@ -1350,7 +1409,7 @@ class AppManager:
                 target_dir = Path(normalized["directory"]).resolve()
                 cwd = (target_dir / normalized["cwd"]).resolve()
                 specs[app_id] = AppSpec(app_id, normalized["name"], manifest_dir.resolve(), target_dir, normalized["command"], cwd, normalized["description"], normalized["port"], normalized["health_url"], normalized["local_url"], normalized["private_url"], normalized["env"], normalized["process_name"], normalized["stop_timeout"])
-            except (OSError, ValueError, TypeError, json.JSONDecodeError, ManifestError):
+            except (OSError, ValueError, TypeError, json.JSONDecodeError, AppDockError):
                 continue
         return specs
 
@@ -1496,6 +1555,7 @@ class AppManager:
         spec = self.discover().get(app_id)
         if spec is None:
             raise KeyError(app_id)
+        runtime_cwd = _native_runtime_cwd(spec)
         with self._lock:
             runtime = self._refresh_process(app_id)
             if runtime.process is None and self._external_pids(spec):
@@ -1506,7 +1566,7 @@ class AppManager:
                 try:
                     runtime.process = subprocess.Popen(
                         spec.command,
-                        cwd=spec.cwd,
+                        cwd=runtime_cwd,
                         stdout=log,
                         stderr=subprocess.STDOUT,
                         text=True,
@@ -1538,6 +1598,7 @@ class AppManager:
         spec = self.discover().get(app_id)
         if spec is None:
             raise KeyError(app_id)
+        _native_runtime_cwd(spec)
         with self._lock:
             runtime = self._refresh_process(app_id)
             process = runtime.process

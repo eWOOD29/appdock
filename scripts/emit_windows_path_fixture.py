@@ -37,7 +37,7 @@ def build_fixture(output: Path) -> dict[str, object]:
             "external": True,
             "directory": rf"C:\Synthetic\Application{index}",
             "command": ["python", "-c", "raise SystemExit('must never execute')"],
-            "cwd": ".",
+            "cwd": r"runtime\worker",
             "port": None,
             "health_url": "",
             "local_url": "http://127.0.0.1:19000",
@@ -91,6 +91,20 @@ def build_fixture(output: Path) -> dict[str, object]:
     write_json(output / "preview.json", preview)
     archive = output / "AppDock-Private-Fixture.zip"
     archive_sha256 = build_private_archive(source, archive)
+    runtime_config = appdock.AppDockConfig.from_environment(data_dir=output / "runtime-data")
+    appdock.import_private_package(source, runtime_config, expected_digest=preview["digest"])
+    manager = appdock.AppManager(config=runtime_config)
+    specs = manager.discover()
+    discovery = {
+        "schema_version": 1,
+        "path_flavor": "windows",
+        "registrations": [
+            {"id": app_id, "directory": str(specs[app_id].directory), "cwd": str(specs[app_id].cwd), "path_flavor": specs[app_id].path_flavor}
+            for app_id in ids
+        ],
+        "visible_ids": [item["id"] for item in manager.all_status()],
+    }
+    write_json(output / "discovery.json", discovery)
     print(json.dumps({
         "digest": preview["digest"],
         "registration_count": preview["registration_count"],

@@ -1,94 +1,204 @@
 name: CI
 
 on:
+  push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  actions: write
-  pull-requests: write
+  contents: read
 
 jobs:
-  apply-wp16-remediation:
-    name: Apply bounded WP16 remediation
-    if: github.event_name == 'pull_request' && github.head_ref == 'work/appdock-0.1.2-windows-path-remediation' && github.actor != 'github-actions[bot]'
-    runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ github.token }}
-      BRANCH: work/appdock-0.1.2-windows-path-remediation
+  test:
+    name: Python ${{ matrix.python-version }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        python-version: ['3.11', '3.13']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: work/appdock-0.1.2-windows-path-remediation
-          fetch-depth: 0
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: '3.11'
-      - name: Guard exact append-only input
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "d545908015b2af76a5957b80f685a9bf63819b19"
-          test "$(git diff --name-only HEAD^ HEAD)" = ".github/workflows/ci.yml"
-      - name: Correct bounded executor and apply remediation
-        shell: bash
-        run: |
-          set -euo pipefail
-          python scripts/wp16_executor_fix.py
-          python scripts/wp16_test_fix.py
-          python scripts/wp16_apply.py
-      - name: Validate corrected tree
-        shell: bash
-        run: |
-          set -euo pipefail
-          python -m unittest discover -s tests -v 2>&1 | tee /tmp/wp16-unit-tests.txt
-          python -m compileall -q appdock.py tests scripts
-          node --check static/app.js
-          node --test tests/test_ui_preview_races.js
-          python scripts/privacy_scan.py
-          python scripts/check_docs.py
-          python scripts/build_portable.py --output /tmp/appdock-wp16.zip
-          python scripts/privacy_scan.py --archive /tmp/appdock-wp16.zip
-          python scripts/emit_windows_path_fixture.py --output /tmp/wp16-private-fixture
-          test -f /tmp/wp16-private-fixture/discovery.json
-          git diff --check
-      - name: Commit clean final tree
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -A
-          git diff --cached --name-only | tee /tmp/wp16-changed-files.txt
-          test "$(git diff --cached --name-only | tr '\n' ' ')" = ".github/workflows/ci.yml .github/workflows/wp16-remediation.yml appdock.py scripts/emit_windows_path_fixture.py scripts/wp16_apply.py scripts/wp16_executor_fix.py scripts/wp16_test_fix.py tests/test_wp16_discovery_contract.py "
-          git commit -m 'fix: preserve imported path flavor through discovery'
-          git rev-parse HEAD | tee /tmp/wp16-candidate-sha.txt
-          git push origin "HEAD:${BRANCH}"
-      - name: Dispatch exact-head CI
-        shell: bash
-        run: |
-          set -euo pipefail
-          final_sha=$(cat /tmp/wp16-candidate-sha.txt)
-          gh workflow run ci.yml --ref "$BRANCH"
-          run_id=''
-          for _ in $(seq 1 30); do
-            run_id=$(gh run list --workflow ci.yml --branch "$BRANCH" --event workflow_dispatch --limit 20 --json databaseId,headSha --jq ".[] | select(.headSha == \"${final_sha}\") | .databaseId" | head -1)
-            if [ -n "$run_id" ]; then break; fi
-            sleep 2
-          done
-          test -n "$run_id"
-          printf '%s\n' "$run_id" | tee /tmp/wp16-exact-head-run.txt
-          gh pr comment 2 --body "WP16 bounded remediation committed at \`${final_sha}\`. Exact-head CI dispatched as run \`${run_id}\`."
-      - name: Upload bounded remediation evidence
+          python-version: ${{ matrix.python-version }}
+      - name: Unit tests
+        run: >-
+          python -c "import pathlib, subprocess, sys; p = subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-s', 'tests', '-v'], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT); pathlib.Path('unit-test-output.txt').write_text(p.stdout, encoding='utf-8'); print('\n'.join(p.stdout.splitlines()[-180:])); raise SystemExit(p.returncode)"
+      - name: Upload bounded unit-test evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: wp16-remediation-evidence-complete
+          name: unit-test-output-${{ matrix.os }}-${{ matrix.python-version }}
+          path: unit-test-output.txt
+      - name: Compile check
+        run: python -m compileall -q appdock.py tests scripts
+      - name: JavaScript checks
+        run: |
+          node --check static/app.js
+          node --test tests/test_ui_preview_races.js
+      - name: Privacy and secret scan
+        run: python scripts/privacy_scan.py
+      - name: Documentation links
+        run: python scripts/check_docs.py
+
+  private-fixture:
+    name: Windows private fixture / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+      - name: Build and preview synthetic Windows-flavor package
+        run: python scripts/emit_windows_path_fixture.py --output private-fixture
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: private-fixture-${{ matrix.os }}
           path: |
-            /tmp/wp16-unit-tests.txt
-            /tmp/wp16-changed-files.txt
-            /tmp/wp16-candidate-sha.txt
-            /tmp/wp16-exact-head-run.txt
-            /tmp/wp16-private-fixture/preview.json
-            /tmp/wp16-private-fixture/discovery.json
+            private-fixture/preview.json
+            private-fixture/discovery.json
+            private-fixture/AppDock-Private-Fixture.zip
+
+  private-fixture-deterministic:
+    name: Windows private preview, digest, and ZIP bytes match
+    needs: [private-fixture]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: private-fixture-windows-latest
+          path: windows
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: private-fixture-ubuntu-latest
+          path: ubuntu
+      - name: Compare exact normalized preview and archive bytes
+        run: |
+          python - <<'PY'
+          import hashlib
+          from pathlib import Path
+          pairs = [
+              ('preview.json', 'normalized preview'),
+              ('discovery.json', 'AppManager discovery'),
+              ('AppDock-Private-Fixture.zip', 'private ZIP'),
+          ]
+          for filename, label in pairs:
+              windows = (Path('windows') / filename).read_bytes()
+              ubuntu = (Path('ubuntu') / filename).read_bytes()
+              if windows != ubuntu:
+                  raise SystemExit(f'{label} mismatch: {hashlib.sha256(windows).hexdigest()} != {hashlib.sha256(ubuntu).hexdigest()}')
+              print(label, hashlib.sha256(windows).hexdigest(), len(windows))
+          PY
+
+  package-windows:
+    name: Verify portable package / Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+      - run: python scripts/build_portable.py --output dist/appdock-windows.zip
+      - name: Inspect archive
+        shell: pwsh
+        run: |
+          $archive = [IO.Compression.ZipFile]::OpenRead((Resolve-Path 'dist/appdock-windows.zip'))
+          try {
+            foreach ($required in @('appdock.py', 'RELEASE-MANIFEST.json', 'static/app.js', 'static/app.css', 'scripts/update_helper.py', 'scripts/path_safety.ps1', 'scripts/migrate_private_state.py', 'scripts/build_private_package.py', 'scripts/emit_windows_path_fixture.py', 'docs/EXTENSIONS.md', 'docs/PRIVATE_MIGRATION.md')) {
+              if (-not ($archive.Entries.FullName -contains $required)) { throw "$required missing from archive" }
+            }
+            if ($archive.Entries.FullName | Where-Object { $_ -match '(^|/)(data|runtime|\.git|\.venv)/' }) { throw 'private/runtime content found in archive' }
+            if ($archive.Entries | Where-Object { $_.FullName.EndsWith('/') }) { throw 'directory entries found in deterministic archive' }
+          } finally {
+            $archive.Dispose()
+          }
+      - name: Scan exact archive privacy
+        run: python scripts/privacy_scan.py --archive dist/appdock-windows.zip
+      - name: Exercise Windows installer and uninstaller without Get-FileHash
+        shell: pwsh
+        run: |
+          function Get-FileHash { throw 'Get-FileHash is intentionally unavailable in this test' }
+          $install = Join-Path $env:RUNNER_TEMP 'AppDockProgram'
+          $data = Join-Path $env:RUNNER_TEMP 'AppDockData'
+          $overlap = Join-Path $env:RUNNER_TEMP 'AppDockOverlap'
+          $bundle = Join-Path $env:RUNNER_TEMP 'AppDockBundle'
+          Expand-Archive -Path 'dist/appdock-windows.zip' -DestinationPath $bundle
+          $installer = Join-Path $bundle 'scripts/install.ps1'
+          try {
+            & $installer -InstallDir $overlap -DataDir (Join-Path $overlap 'data') -NoStart
+            throw 'installer accepted overlapping program and data directories'
+          } catch {
+            if ($_.Exception.Message -notmatch 'must not overlap') { throw }
+          }
+          try {
+            & (Join-Path $bundle 'scripts/uninstall.ps1') -InstallDir $overlap -DataDir (Join-Path $overlap 'data')
+            throw 'uninstaller accepted overlapping program and data directories'
+          } catch {
+            if ($_.Exception.Message -notmatch 'Refusing to uninstall') { throw }
+          }
+          & $installer -InstallDir $install -DataDir $data -NoStart
+          Set-Content -NoNewline -Path (Join-Path $install 'obsolete.py') -Value 'old'
+          & $installer -InstallDir $install -DataDir $data -NoStart
+          if (-not (Test-Path (Join-Path $install 'appdock.py'))) { throw 'installer did not copy appdock.py' }
+          if (-not (Test-Path (Join-Path $install 'RELEASE-MANIFEST.json'))) { throw 'installer did not copy the release inventory' }
+          if (Test-Path (Join-Path $install 'obsolete.py')) { throw 'installer left an obsolete managed file behind' }
+          if (-not (Test-Path $data)) { throw 'installer did not create data directory' }
+          & (Join-Path $install 'scripts/uninstall.ps1') -InstallDir $install -DataDir $data
+          if (Test-Path $install) { throw 'uninstaller did not remove program files' }
+          if (-not (Test-Path $data)) { throw 'uninstaller removed user data without permission' }
+          Remove-Item -Recurse -Force $data
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: appdock-windows
+          path: |
+            dist/appdock-windows.zip
+            dist/SHA256SUMS.txt
+
+  package-ubuntu:
+    name: Build portable package / Ubuntu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+      - run: python scripts/build_portable.py --output dist/appdock-ubuntu.zip
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: appdock-ubuntu
+          path: dist/appdock-ubuntu.zip
+
+  deterministic-package:
+    name: Windows and Ubuntu package bytes match
+    needs: [package-windows, package-ubuntu]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: appdock-windows
+          path: windows
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: appdock-ubuntu
+          path: ubuntu
+      - name: Compare exact bytes and ZIP metadata
+        run: |
+          python - <<'PY'
+          import hashlib
+          import zipfile
+          from pathlib import Path
+          windows = Path('windows/appdock-windows.zip').read_bytes()
+          ubuntu = Path('ubuntu/appdock-ubuntu.zip').read_bytes()
+          if windows != ubuntu:
+              raise SystemExit(f'cross-platform ZIP mismatch: {hashlib.sha256(windows).hexdigest()} != {hashlib.sha256(ubuntu).hexdigest()}')
+          with zipfile.ZipFile(Path('windows/appdock-windows.zip')) as archive:
+              if any(info.create_system != 0 or info.compress_type != zipfile.ZIP_STORED for info in archive.infolist()):
+                  raise SystemExit('ZIP metadata is not explicitly host-independent')
+          print(hashlib.sha256(windows).hexdigest())
+          PY
