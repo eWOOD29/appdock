@@ -28,7 +28,7 @@ AppDock does not include analytics, advertising, or usage telemetry.
 
 ## Browser data
 
-The dashboard is served by the local AppDock process. AppDock does not require a cloud account. Avoid exposing the dashboard to the public internet because it includes local paths and process controls.
+The dashboard is served by the local AppDock process. AppDock does not require a cloud account. Routine status/config responses omit absolute source, registry, installation, data, and log paths; an explicit registration preview still shows the selected app path so the user can review it. Avoid exposing the dashboard to the public internet because it controls local processes.
 
 ## Logs
 

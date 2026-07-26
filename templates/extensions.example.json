@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "visibility": {
+    "hidden_app_ids": [
+      "synthetic-backend"
+    ]
+  },
+  "providers": [
+    {
+      "id": "synthetic-provider",
+      "url": "http://127.0.0.1:19091/widgets",
+      "connect_timeout_ms": 300,
+      "read_timeout_ms": 700,
+      "cache_seconds": 5
+    }
+  ],
+  "widgets": [
+    {
+      "id": "synthetic-metrics",
+      "type": "metrics",
+      "title": "Example metrics",
+      "provider_id": "synthetic-provider",
+      "drill_down_url": "https://private.example.invalid/details"
+    }
+  ]
+}

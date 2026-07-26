@@ -55,7 +55,7 @@ The default destination is `%LOCALAPPDATA%\Programs\AppDock`. No administrator a
 .\scripts\install.ps1 -NoStart
 ```
 
-The installer copies only program files. User data is created separately and is never copied into the installation directory.
+The installer copies only program files. User data is created separately and is never copied into the installation directory. Program files are assembled in a sibling staging directory and swapped into place only after validation. Custom program/data paths that are filesystem/volume roots or broad ancestors of system, users, public, program, profile, AppData, or standard personal-data roots are rejected, as are source/install overlap and symlink/reparse ancestors. Replacement and recursive uninstall require a launcher plus a release inventory whose required AppDock file hashes validate; the installed uninstaller verifies itself and `path_safety.ps1` before dot-sourcing the safety module. Process termination requires the exact installed `appdock.py` as Python's first script argument. The uninstaller also rejects an existing file as its data target before removing anything.
 
 ## Portable mode
 

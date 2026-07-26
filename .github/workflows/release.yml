@@ -23,20 +23,36 @@ jobs:
           if ($env:GITHUB_REF_NAME -ne $expected) { throw "Tag $env:GITHUB_REF_NAME does not match $expected" }
       - name: Test
         run: python -m unittest discover -s tests -v
-      - name: Compile and JavaScript syntax
+      - name: Compile and JavaScript checks
         run: |
           python -m compileall -q appdock.py tests scripts
           node --check static/app.js
+          node --test tests/test_ui_preview_races.js
       - name: Privacy scan
         run: python scripts/privacy_scan.py
       - name: Documentation links
         run: python scripts/check_docs.py
       - name: Build portable release
         run: python scripts/build_portable.py --output dist/appdock-windows.zip
+      - name: Scan exact archive privacy
+        run: python scripts/privacy_scan.py --archive dist/appdock-windows.zip
       - name: Verify release inventory
         run: python -c "from pathlib import Path; import appdock; appdock.validate_zip(Path('dist/appdock-windows.zip').read_bytes())"
       - name: Publish GitHub release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create $env:GITHUB_REF_NAME dist/appdock-windows.zip dist/SHA256SUMS.txt --verify-tag --generate-notes --title "AppDock $env:GITHUB_REF_NAME"
+        run: |
+          $arguments = @(
+            'release', 'create', $env:GITHUB_REF_NAME,
+            'dist/appdock-windows.zip', 'dist/SHA256SUMS.txt',
+            '--verify-tag', '--generate-notes',
+            '--title', "AppDock $env:GITHUB_REF_NAME"
+          )
+          if ($env:GITHUB_REF_NAME -eq 'v0.1.1') {
+            $arguments += @(
+              '--notes',
+              "Updating from v0.1.0: install v0.1.1 manually using the verified ZIP and scripts/install.ps1. The v0.1.0 one-click updater intentionally rejects v0.1.1's release-inventory schema. See docs/MIGRATING.md."
+            )
+          }
+          & gh @arguments

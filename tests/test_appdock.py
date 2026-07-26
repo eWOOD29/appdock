@@ -67,7 +67,8 @@ class AppDockTests(unittest.TestCase):
 
     def test_public_defaults_are_machine_neutral(self) -> None:
         config = AppDockConfig.from_environment(repo_root=self.root, platform="win32", local_app_data=self.root / "local")
-        self.assertEqual(config.data_root, (self.root / "local" / "AppDock").resolve())
+        expected = self.root / "local" / "AppDock"
+        self.assertEqual(os.path.normcase(os.path.realpath(config.data_root)), os.path.normcase(os.path.realpath(expected)))
         self.assertEqual(config.registry_root, config.data_root / "registry")
         self.assertEqual(config.install_root, config.data_root / "apps")
         self.assertNotIn("Ethan", str(config.data_root))
@@ -76,7 +77,8 @@ class AppDockTests(unittest.TestCase):
     def test_data_dir_override_wins_and_state_is_outside_repo(self) -> None:
         with patch.dict(os.environ, {"APPDOCK_DATA_DIR": str(self.root / "override")}):
             config = AppDockConfig.from_environment(repo_root=self.root)
-        self.assertEqual(config.data_root, (self.root / "override").resolve())
+        expected = self.root / "override"
+        self.assertEqual(os.path.normcase(os.path.realpath(config.data_root)), os.path.normcase(os.path.realpath(expected)))
         self.assertNotEqual(config.data_root, self.root)
 
     def test_discover_start_stop_and_shell_false(self) -> None:
@@ -124,6 +126,7 @@ class AppDockTests(unittest.TestCase):
         preview = onboarding.preview(source)
         self.write_manifest(source, description="changed")
         with self.assertRaises(AppDockError): onboarding.register(source, preview["digest"], preview)
+        self.assertFalse((self.config.registry_root / "demo").exists())
 
     def test_github_url_validation(self) -> None:
         self.assertEqual(canonical_github_url("https://github.com/owner/repo"), "https://github.com/owner/repo.git")
@@ -138,7 +141,9 @@ class AppDockTests(unittest.TestCase):
             stage = Path(command[-1]); self.write_manifest(stage, app_id="remote"); return SimpleNamespace(returncode=0)
         onboarding = GitHubOnboarding(self.config, runner=runner)
         preview = onboarding.preview("https://github.com/owner/repo")
-        self.assertEqual(commands[0][:4], ["git", "clone", "--depth", "1"])
+        self.assertEqual(commands[0][:6], ["git", "-c", "core.hooksPath=", "clone", "--depth", "1"])
+        self.assertIn("--single-branch", commands[0])
+        self.assertIn("--no-tags", commands[0])
         self.assertFalse("shell" in commands[0])
         with self.assertRaises(AppDockError): onboarding.register(preview, "tampered")
         result = onboarding.register(preview, preview["digest"])
@@ -182,10 +187,11 @@ class AppDockTests(unittest.TestCase):
             "static/app.js": b"js",
             "static/app.css": b"css",
             "scripts/update_helper.py": b"helper",
+            "scripts/path_safety.ps1": b"safety",
             "scripts/install.ps1": b"install",
             "scripts/uninstall.ps1": b"uninstall",
         }
-        manifest = {"schema_version": 1, "files": [
+        manifest = {"schema_version": 2, "files": [
             {"path": path, "sha256": hashlib.sha256(content).hexdigest()}
             for path, content in sorted(members.items())
         ]}
@@ -223,7 +229,7 @@ class AppDockTests(unittest.TestCase):
         base = f"http://127.0.0.1:{server.server_port}"
         try:
             config_response = json.loads(urllib.request.urlopen(base + "/api/config").read())
-            self.assertEqual(config_response["version"], "0.1.0")
+            self.assertEqual(config_response["version"], "0.1.1")
             request = urllib.request.Request(base + "/api/apps/example/start", data=b"{}", method="POST", headers={"Content-Type": "application/json", "Origin": "http://evil.example"})
             with self.assertRaises(urllib.error.HTTPError) as cross_origin:
                 urllib.request.urlopen(request)

@@ -5,7 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
-from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
+from zipfile import ZIP_STORED, ZipFile, ZipInfo
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT = ROOT / "dist" / "appdock-windows.zip"
@@ -23,6 +23,8 @@ TOP_LEVEL_FILES = {
 TOP_LEVEL_DIRS = {"appdock", "appdock_core", "static", "docs", "scripts", "templates"}
 EXCLUDED_PARTS = {"__pycache__", ".pytest_cache", ".git", ".venv", "dist", "build", "runtime", "data"}
 EXCLUDED_SUFFIXES = {".pyc", ".pyo", ".log"}
+TEXT_SUFFIXES = {".css", ".html", ".js", ".json", ".md", ".ps1", ".py", ".toml", ".txt", ".yaml", ".yml"}
+TEXT_FILENAMES = {"LICENSE"}
 
 
 def release_files(root: Path = ROOT) -> list[Path]:
@@ -58,21 +60,33 @@ def safe_archive_name(path: Path, root: Path = ROOT) -> str:
 def build_archive(output: Path = DEFAULT_OUTPUT, root: Path = ROOT) -> str:
     output.parent.mkdir(parents=True, exist_ok=True)
     files = release_files(root)
-    payloads = {safe_archive_name(path, root): path.read_bytes() for path in files}
+    payloads: dict[str, bytes] = {}
+    for path in files:
+        content = path.read_bytes()
+        if path.suffix.lower() in TEXT_SUFFIXES or path.name in TEXT_FILENAMES:
+            content = content.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        payloads[safe_archive_name(path, root)] = content
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "files": [
             {"path": name, "sha256": hashlib.sha256(content).hexdigest()}
             for name, content in sorted(payloads.items())
         ],
     }
     manifest_bytes = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    with ZipFile(output, "w", compression=ZIP_DEFLATED, compresslevel=9) as archive:
+    with ZipFile(output, "w", compression=ZIP_STORED, allowZip64=True) as archive:
         for name, content in [*sorted(payloads.items()), (RELEASE_MANIFEST_NAME, manifest_bytes)]:
             info = ZipInfo(name, date_time=(2026, 1, 1, 0, 0, 0))
-            info.compress_type = ZIP_DEFLATED
-            info.external_attr = (0o644 & 0xFFFF) << 16
-            archive.writestr(info, content)
+            info.create_system = 0
+            info.create_version = 20
+            info.extract_version = 20
+            info.flag_bits = 0
+            info.compress_type = ZIP_STORED
+            info.internal_attr = 0
+            info.external_attr = 0o100644 << 16
+            info.extra = b""
+            info.comment = b""
+            archive.writestr(info, content, compress_type=ZIP_STORED)
     digest = hashlib.sha256(output.read_bytes()).hexdigest()
     checksum_path = output.parent / "SHA256SUMS.txt"
     checksum_path.write_text(f"{digest}  {output.name}\n", encoding="utf-8", newline="\n")

@@ -4,6 +4,22 @@ All notable changes to AppDock are documented here. The project follows Semantic
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-24
+
+### Fixed
+
+- Enforce the protected private package's exact root manifest, per-file size and SHA-256 values, exact member set, migration digest, duplicate-key rejection, caller-confirmed preview digest, and immediate pre-write re-verification.
+- Make private-state migration and updater replacement durable and crash-recoverable with explicit transaction phases, mandatory startup recovery, complete old/new state convergence, and abrupt-process-death tests.
+- Disable stale extension visibility, widgets, providers, and caches when replacement configuration is invalid; reject duplicate JSON keys and hidden IDs that do not resolve to current registrations.
+- Produce host-independent public ZIP bytes with explicit fixed ZIP metadata, build deterministic rootless private ZIPs, and remove the bootstrap uninstaller's `Get-FileHash` dependency.
+- Reject installer and uninstaller paths that are filesystem/volume roots or broad ancestors of system, program, users, public, profile, AppData, or standard personal-data roots; reject source/install and install/data overlap, lexical staging/update-root aliases, and symlink/reparse ancestors.
+- Build installs in a sibling staging directory and swap only after the complete program tree is ready; validate a release-inventory-backed install identity before replacement or recursive deletion; bootstrap-verify the uninstaller and path-safety module before loading safety code; and terminate only a Python process whose first script argument is the exact installed entry point.
+- Bound GitHub preview staging during clone by time, per-checkout and aggregate file/byte quotas; disable Git LFS smudging; run an independent stale-stage janitor; and clean abandoned, late, or superseded browser previews.
+- Serialize staged-update application before downloading so only one request can own a version stage; require the external helper to complete a token-bound startup handshake before the server shuts down; remove completed or failed stages; and require instance-specific restart readiness. Backup failure leaves installation files untouched; failed replacement rolls back and verifies a restart of the restored version.
+- Remove absolute local paths from routine status/config API responses.
+- Reject Unicode Windows device aliases and update downloads redirected outside GitHub-owned asset hosts.
+- Use release-inventory schema `2` as a fail-closed migration gate: v0.1.0 rejects the v0.1.1 archive and must be upgraded manually once; v0.1.1 and later launch the checksum-verified helper from the incoming stage.
+
 ## [0.1.0] - 2026-07-24
 
 ### Added
@@ -24,5 +40,6 @@ All notable changes to AppDock are documented here. The project follows Semantic
 - Shell command strings, unsafe app IDs, path escapes, unsafe GitHub URLs, arbitrary update URLs, ZIP traversal, symlink archive members, and protected system PIDs are rejected.
 - Newly registered apps never start automatically.
 
-[Unreleased]: https://github.com/eWOOD29/appdock/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/eWOOD29/appdock/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/eWOOD29/appdock/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/eWOOD29/appdock/releases/tag/v0.1.0
