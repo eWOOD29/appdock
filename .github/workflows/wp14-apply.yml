@@ -1,0 +1,30 @@
+name: Apply bounded WP14 implementation
+
+on:
+  push:
+    branches:
+      - work/appdock-0.1.2-windows-path-remediation
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.event.head_commit.message == 'chore: enable bounded WP14 implementation transport'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: work/appdock-0.1.2-windows-path-remediation
+          fetch-depth: 0
+      - name: Apply exact public-code correction
+        run: git apply --check .github/wp14-appdock.patch && git apply .github/wp14-appdock.patch
+      - name: Remove bounded transport files
+        run: rm .github/wp14-appdock.patch .github/workflows/wp14-apply.yml
+      - name: Commit corrected public core
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add appdock.py .github
+          git commit -m "fix: make Windows private paths host independent"
+          git push origin HEAD:work/appdock-0.1.2-windows-path-remediation
