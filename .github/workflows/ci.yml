@@ -213,22 +213,13 @@ jobs:
         with:
           ref: work/appdock-0.1.2-windows-path-remediation
           fetch-depth: 0
-      - name: Apply exact correction and remove transport
+      - name: Apply exact public-core correction
         run: |
           git apply --check .github/wp14-appdock.patch
           git apply .github/wp14-appdock.patch
-          rm .github/wp14-appdock.patch .github/workflows/wp14-apply.yml
-          python - <<'PY'
-          from pathlib import Path
-          path = Path('.github/workflows/ci.yml')
-          text = path.read_text(encoding='utf-8')
-          start = text.index('\n  # BEGIN WP14 BOUNDED TRANSPORT')
-          end = text.index('\n  # END WP14 BOUNDED TRANSPORT', start) + len('\n  # END WP14 BOUNDED TRANSPORT')
-          path.write_text(text[:start] + text[end:] + ('\n' if not text[end:].endswith('\n') else ''), encoding='utf-8')
-          PY
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add appdock.py .github
+          git add appdock.py
           git commit -m "fix: make Windows private paths host independent"
           git push origin HEAD:work/appdock-0.1.2-windows-path-remediation
   # END WP14 BOUNDED TRANSPORT
