@@ -1,0 +1,447 @@
+name: WP16 bounded remediation
+
+on:
+  push:
+    branches: [work/appdock-0.1.2-windows-path-remediation]
+
+permissions:
+  contents: write
+
+jobs:
+  remediate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+      - name: Guard exact append-only input
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "8ad7010b024f4b9ba69335c804749489327ba2da"
+          test "$(git diff --name-only HEAD^ HEAD)" = ".github/workflows/wp16-remediation.yml"
+          test "$(git rev-parse HEAD)" = "${{ github.sha }}"
+      - name: Apply bounded AppManager discovery correction
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path('appdock.py')
+          s = p.read_text(encoding='utf-8')
+          replacements = [
+          ('''@dataclass
+          class AppSpec:
+              app_id: str
+              name: str
+              manifest_dir: Path
+              directory: Path
+              command: list[str]
+              cwd: Path
+              description: str = ""
+              port: int | None = None
+              health_url: str = ""
+              local_url: str = ""
+              private_url: str = ""
+              env: dict[str, str | None] = field(default_factory=dict)
+              process_name: str = ""
+              stop_timeout: float = 3.0
+          ''', '''@dataclass
+          class AppSpec:
+              app_id: str
+              name: str
+              manifest_dir: Path
+              directory: Path | str
+              command: list[str]
+              cwd: Path | str
+              description: str = ""
+              port: int | None = None
+              health_url: str = ""
+              local_url: str = ""
+              private_url: str = ""
+              env: dict[str, str | None] = field(default_factory=dict)
+              process_name: str = ""
+              stop_timeout: float = 3.0
+              path_flavor: str = "native"
+
+
+          def _native_runtime_cwd(spec: AppSpec) -> Path:
+              if spec.path_flavor == "native":
+                  return Path(spec.cwd)
+              if spec.path_flavor == "windows":
+                  if os.name != "nt":
+                      raise AppDockError("application path flavor is unsupported on this host")
+                  return Path(str(spec.cwd))
+              if spec.path_flavor == "posix":
+                  if os.name == "nt":
+                      raise AppDockError("application path flavor is unsupported on this host")
+                  return Path(str(spec.cwd))
+              raise AppDockError("application path flavor is unsupported on this host")
+          '''),
+          ('''def _migration_targets(preview: dict[str, Any], config: AppDockConfig) -> dict[Path, bytes]:
+              normalized = preview["normalized"]
+              targets: dict[Path, bytes] = {}
+              for app_id, manifest in normalized["registrations"].items():
+                  targets[config.registry_root / app_id / MANIFEST_NAME] = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8") + b"\\n"
+              targets[config.order_path] = json.dumps(normalized["order"], indent=2).encode("utf-8") + b"\\n"
+              targets[config.extension_config_path] = json.dumps(normalized["extensions"], indent=2, sort_keys=True).encode("utf-8") + b"\\n"
+              return targets
+          ''', '''def _migration_targets(preview: dict[str, Any], config: AppDockConfig) -> dict[Path, bytes]:
+              normalized = preview["normalized"]
+              path_flavor = preview.get("path_flavor")
+              if path_flavor not in {"windows", "posix"}:
+                  raise AppDockError("private package path flavor is unsupported")
+              targets: dict[Path, bytes] = {}
+              for app_id, manifest in normalized["registrations"].items():
+                  persisted = dict(manifest)
+                  persisted["_appdock_private_import"] = True
+                  persisted["path_flavor"] = path_flavor
+                  targets[config.registry_root / app_id / MANIFEST_NAME] = json.dumps(persisted, indent=2, sort_keys=True).encode("utf-8") + b"\\n"
+              targets[config.order_path] = json.dumps(normalized["order"], indent=2).encode("utf-8") + b"\\n"
+              targets[config.extension_config_path] = json.dumps(normalized["extensions"], indent=2, sort_keys=True).encode("utf-8") + b"\\n"
+              return targets
+          '''),
+          ('''            try:
+                          raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+                          target_raw = raw.get("directory")
+                          if target_raw:
+                              target = Path(str(target_raw)).expanduser()
+                              if not target.is_absolute():
+                                  target = manifest_dir / target
+                          elif not self.legacy_direct_root:
+                              target = self.config.install_root / str(raw.get("id") or manifest_dir.name)
+                          else:
+                              target = manifest_dir
+                          normalized = normalize_manifest(raw, manifest_dir=manifest_dir, directory=target, allow_outside=not self.legacy_direct_root)
+                          app_id = normalized["id"]
+                          if app_id in specs:
+                              continue
+                          target_dir = Path(normalized["directory"]).resolve()
+                          cwd = (target_dir / normalized["cwd"]).resolve()
+                          specs[app_id] = AppSpec(app_id, normalized["name"], manifest_dir.resolve(), target_dir, normalized["command"], cwd, normalized["description"], normalized["port"], normalized["health_url"], normalized["local_url"], normalized["private_url"], normalized["env"], normalized["process_name"], normalized["stop_timeout"])
+                      except (OSError, ValueError, TypeError, json.JSONDecodeError, ManifestError):
+                          continue
+          ''', '''            try:
+                          raw = _loads_strict_json(manifest_path.read_text(encoding="utf-8"))
+                          if not isinstance(raw, dict):
+                              raise ManifestError("manifest must be a JSON object")
+                          provenance_present = "_appdock_private_import" in raw or "path_flavor" in raw
+                          if provenance_present:
+                              if self.legacy_direct_root or raw.get("_appdock_private_import") is not True or raw.get("external") is not True:
+                                  raise ManifestError("imported registration provenance is invalid")
+                              path_flavor = raw.get("path_flavor")
+                              if path_flavor not in {"windows", "posix"}:
+                                  raise ManifestError("imported registration path flavor is invalid")
+                              normalized = normalize_private_registration(raw, manifest_dir=manifest_dir, path_flavor=path_flavor)
+                              app_id = normalized["id"]
+                              if app_id in specs:
+                                  continue
+                              directory = normalized["directory"]
+                              relative_cwd = normalized["cwd"]
+                              if path_flavor == "windows":
+                                  cwd = directory if relative_cwd == "." else directory + "\\\\" + relative_cwd
+                              else:
+                                  cwd = directory if relative_cwd == "." else directory.rstrip("/") + "/" + relative_cwd
+                              specs[app_id] = AppSpec(
+                                  app_id=app_id,
+                                  name=normalized["name"],
+                                  manifest_dir=manifest_dir.resolve(),
+                                  directory=directory,
+                                  command=normalized["command"],
+                                  cwd=cwd,
+                                  description=normalized["description"],
+                                  port=normalized["port"],
+                                  health_url=normalized["health_url"],
+                                  local_url=normalized["local_url"],
+                                  private_url=normalized["private_url"],
+                                  env=normalized["env"],
+                                  process_name=normalized["process_name"],
+                                  stop_timeout=normalized["stop_timeout"],
+                                  path_flavor=path_flavor,
+                              )
+                              continue
+
+                          target_raw = raw.get("directory")
+                          if target_raw:
+                              target = Path(str(target_raw)).expanduser()
+                              if not target.is_absolute():
+                                  target = manifest_dir / target
+                          elif not self.legacy_direct_root:
+                              target = self.config.install_root / str(raw.get("id") or manifest_dir.name)
+                          else:
+                              target = manifest_dir
+                          normalized = normalize_manifest(raw, manifest_dir=manifest_dir, directory=target, allow_outside=not self.legacy_direct_root)
+                          app_id = normalized["id"]
+                          if app_id in specs:
+                              continue
+                          target_dir = Path(normalized["directory"]).resolve()
+                          cwd = (target_dir / normalized["cwd"]).resolve()
+                          specs[app_id] = AppSpec(app_id, normalized["name"], manifest_dir.resolve(), target_dir, normalized["command"], cwd, normalized["description"], normalized["port"], normalized["health_url"], normalized["local_url"], normalized["private_url"], normalized["env"], normalized["process_name"], normalized["stop_timeout"])
+                      except (OSError, ValueError, TypeError, json.JSONDecodeError, AppDockError):
+                          continue
+          '''),
+          ('''    def start(self, app_id: str) -> dict[str, Any]:
+                  spec = self.discover().get(app_id)
+                  if spec is None:
+                      raise KeyError(app_id)
+                  with self._lock:
+          ''', '''    def start(self, app_id: str) -> dict[str, Any]:
+                  spec = self.discover().get(app_id)
+                  if spec is None:
+                      raise KeyError(app_id)
+                  runtime_cwd = _native_runtime_cwd(spec)
+                  with self._lock:
+          '''),
+          ('''                        cwd=spec.cwd,
+          ''', '''                        cwd=runtime_cwd,
+          '''),
+          ('''    def stop(self, app_id: str) -> dict[str, Any]:
+                  spec = self.discover().get(app_id)
+                  if spec is None:
+                      raise KeyError(app_id)
+                  with self._lock:
+          ''', '''    def stop(self, app_id: str) -> dict[str, Any]:
+                  spec = self.discover().get(app_id)
+                  if spec is None:
+                      raise KeyError(app_id)
+                  _native_runtime_cwd(spec)
+                  with self._lock:
+          '''),
+          ]
+          for old, new in replacements:
+              if s.count(old) != 1:
+                  raise SystemExit(f'appdock replacement count was {s.count(old)}')
+              s = s.replace(old, new)
+          p.write_text(s, encoding='utf-8')
+
+          p = Path('scripts/emit_windows_path_fixture.py')
+          s = p.read_text(encoding='utf-8')
+          old = '            "cwd": ".",'
+          new = '            "cwd": r"runtime\\\\worker",'
+          if s.count(old) != 1:
+              raise SystemExit('fixture cwd replacement failed')
+          s = s.replace(old, new)
+          old = '''    archive = output / "AppDock-Private-Fixture.zip"
+              archive_sha256 = build_private_archive(source, archive)
+              print(json.dumps({
+          '''
+          new = '''    archive = output / "AppDock-Private-Fixture.zip"
+              archive_sha256 = build_private_archive(source, archive)
+              runtime_config = appdock.AppDockConfig.from_environment(data_dir=output / "runtime-data")
+              appdock.import_private_package(source, runtime_config, expected_digest=preview["digest"])
+              manager = appdock.AppManager(config=runtime_config)
+              specs = manager.discover()
+              discovery = {
+                  "schema_version": 1,
+                  "path_flavor": "windows",
+                  "registrations": [
+                      {
+                          "id": app_id,
+                          "directory": str(specs[app_id].directory),
+                          "cwd": str(specs[app_id].cwd),
+                          "path_flavor": specs[app_id].path_flavor,
+                      }
+                      for app_id in ids
+                  ],
+                  "visible_ids": [item["id"] for item in manager.all_status()],
+              }
+              write_json(output / "discovery.json", discovery)
+              print(json.dumps({
+          '''
+          if s.count(old) != 1:
+              raise SystemExit('fixture discovery replacement failed')
+          p.write_text(s.replace(old, new), encoding='utf-8')
+
+          p = Path('.github/workflows/ci.yml')
+          s = p.read_text(encoding='utf-8')
+          old = '''            private-fixture/preview.json
+                      private-fixture/AppDock-Private-Fixture.zip
+          '''
+          new = '''            private-fixture/preview.json
+                      private-fixture/discovery.json
+                      private-fixture/AppDock-Private-Fixture.zip
+          '''
+          if s.count(old) != 1:
+              raise SystemExit('CI artifact replacement failed')
+          s = s.replace(old, new)
+          old = '''              ('preview.json', 'normalized preview'),
+                          ('AppDock-Private-Fixture.zip', 'private ZIP'),
+          '''
+          new = '''              ('preview.json', 'normalized preview'),
+                          ('discovery.json', 'AppManager discovery'),
+                          ('AppDock-Private-Fixture.zip', 'private ZIP'),
+          '''
+          if s.count(old) != 1:
+              raise SystemExit('CI deterministic replacement failed')
+          p.write_text(s.replace(old, new), encoding='utf-8')
+          PY
+          cat > tests/test_wp16_discovery_contract.py <<'PY'
+          from __future__ import annotations
+
+          import json
+          import os
+          import tempfile
+          import unittest
+          from pathlib import Path
+          from unittest import mock
+
+          import appdock
+          from scripts.emit_windows_path_fixture import build_fixture
+
+
+          class AppManagerDiscoveryPathContractTests(unittest.TestCase):
+              def setUp(self) -> None:
+                  self.temp = tempfile.TemporaryDirectory()
+                  self.root = Path(self.temp.name)
+                  self.fixture = self.root / "fixture"
+                  self.preview = build_fixture(self.fixture)
+                  self.config = appdock.AppDockConfig.from_environment(data_dir=self.root / "data")
+                  self.receipt = appdock.import_private_package(
+                      self.fixture / "source",
+                      self.config,
+                      expected_digest=self.preview["digest"],
+                  )
+
+              def tearDown(self) -> None:
+                  self.temp.cleanup()
+
+              def assert_windows_discovery(self) -> dict[str, appdock.AppSpec]:
+                  manager = appdock.AppManager(config=self.config)
+                  with mock.patch("subprocess.Popen", side_effect=AssertionError("external application started")):
+                      specs = manager.discover()
+                  self.assertEqual(len(specs), 8)
+                  for index in range(7):
+                      app_id = f"synthetic-{index}"
+                      expected_directory = rf"C:\Synthetic\Application{index}"
+                      expected_cwd = expected_directory + r"\runtime\worker"
+                      spec = specs[app_id]
+                      self.assertEqual(spec.path_flavor, "windows")
+                      self.assertIsInstance(spec.directory, str)
+                      self.assertIsInstance(spec.cwd, str)
+                      self.assertEqual(spec.directory, expected_directory)
+                      self.assertEqual(spec.cwd, expected_cwd)
+                      self.assertNotIn(str(self.config.registry_root), spec.directory)
+                      self.assertNotIn(str(self.config.registry_root), spec.cwd)
+                  backend = specs["synthetic-backend"]
+                  self.assertEqual(backend.directory, r"C:\Synthetic\Application7")
+                  self.assertEqual(backend.cwd, r"C:\Synthetic\Application7\runtime\worker")
+                  self.assertEqual([item["id"] for item in manager.all_status()], [f"synthetic-{index}" for index in range(7)])
+                  return specs
+
+              def test_appmanager_discovery_preserves_windows_contract_for_all_eight_registrations(self) -> None:
+                  self.assert_windows_discovery()
+
+              def test_idempotence_rollback_reimport_and_startup_recovery_preserve_provenance(self) -> None:
+                  second = appdock.import_private_package(
+                      self.fixture / "source",
+                      self.config,
+                      expected_digest=self.preview["digest"],
+                  )
+                  self.assertFalse(second["changed"])
+                  self.assert_windows_discovery()
+                  rollback = appdock.rollback_private_package(self.receipt["receipt"], self.config)
+                  self.assertTrue(rollback["rolled_back"])
+                  third = appdock.import_private_package(
+                      self.fixture / "source",
+                      self.config,
+                      expected_digest=self.preview["digest"],
+                  )
+                  self.assertTrue(third["changed"])
+                  self.assert_windows_discovery()
+                  self.assert_windows_discovery()
+
+              def test_imported_manifest_persists_bounded_provenance(self) -> None:
+                  for index in range(7):
+                      raw = json.loads((self.config.registry_root / f"synthetic-{index}" / appdock.MANIFEST_NAME).read_text(encoding="utf-8"))
+                      self.assertIs(raw.get("_appdock_private_import"), True)
+                      self.assertEqual(raw.get("path_flavor"), "windows")
+                  backend = json.loads((self.config.registry_root / "synthetic-backend" / appdock.MANIFEST_NAME).read_text(encoding="utf-8"))
+                  self.assertIs(backend.get("_appdock_private_import"), True)
+                  self.assertEqual(backend.get("path_flavor"), "windows")
+
+              def test_missing_contradictory_or_unsupported_provenance_fails_closed(self) -> None:
+                  cases = {
+                      "synthetic-0": lambda raw: raw.pop("path_flavor"),
+                      "synthetic-1": lambda raw: raw.__setitem__("path_flavor", "native"),
+                      "synthetic-2": lambda raw: raw.__setitem__("_appdock_private_import", False),
+                      "synthetic-3": lambda raw: raw.__setitem__("external", False),
+                  }
+                  for app_id, mutate in cases.items():
+                      path = self.config.registry_root / app_id / appdock.MANIFEST_NAME
+                      raw = json.loads(path.read_text(encoding="utf-8"))
+                      mutate(raw)
+                      path.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                  specs = appdock.AppManager(config=self.config).discover()
+                  for app_id in cases:
+                      self.assertNotIn(app_id, specs)
+                  self.assertEqual(len(specs), 4)
+
+              def test_unsupported_host_operations_fail_before_subprocess_or_filesystem_use(self) -> None:
+                  if os.name == "nt":
+                      self.skipTest("unsupported-host guard is exercised on POSIX CI")
+                  manager = appdock.AppManager(config=self.config)
+                  with (
+                      mock.patch.object(manager, "log_path", side_effect=AssertionError("log path reached")) as log_path,
+                      mock.patch.object(manager, "_external_pids", side_effect=AssertionError("process inspection reached")) as external_pids,
+                      mock.patch("subprocess.Popen", side_effect=AssertionError("subprocess reached")) as popen,
+                  ):
+                      for operation in (manager.start, manager.stop, manager.restart):
+                          with self.subTest(operation=operation.__name__):
+                              with self.assertRaisesRegex(appdock.AppDockError, "unsupported on this host"):
+                                  operation("synthetic-0")
+                  log_path.assert_not_called()
+                  external_pids.assert_not_called()
+                  popen.assert_not_called()
+
+              def test_windows_launch_boundary_converts_only_on_supported_host(self) -> None:
+                  spec = self.assert_windows_discovery()["synthetic-0"]
+                  with mock.patch.object(appdock.os, "name", "nt"):
+                      native = appdock._native_runtime_cwd(spec)
+                  self.assertIsInstance(native, Path)
+                  self.assertEqual(str(native), str(spec.cwd))
+
+
+          if __name__ == "__main__":
+              unittest.main()
+          PY
+      - name: Remove bounded executor and validate
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/wp16-remediation.yml
+          python -m compileall -q appdock.py tests scripts
+          python -m unittest discover -s tests -v 2>&1 | tee /tmp/wp16-unit-tests.txt
+          node --check static/app.js
+          node --test tests/test_ui_preview_races.js
+          python scripts/privacy_scan.py
+          python scripts/check_docs.py
+          python scripts/emit_windows_path_fixture.py --output /tmp/wp16-private-fixture
+          test -f /tmp/wp16-private-fixture/discovery.json
+          git diff --check
+      - name: Commit exact remediation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add appdock.py scripts/emit_windows_path_fixture.py tests/test_wp16_discovery_contract.py .github/workflows/ci.yml .github/workflows/wp16-remediation.yml
+          git diff --cached --name-only | tee /tmp/wp16-changed-files.txt
+          test "$(git diff --cached --name-only | tr '\n' ' ')" = ".github/workflows/ci.yml .github/workflows/wp16-remediation.yml appdock.py scripts/emit_windows_path_fixture.py tests/test_wp16_discovery_contract.py "
+          git commit -m "fix: preserve imported path flavor through discovery"
+          git rev-parse HEAD | tee /tmp/wp16-candidate-sha.txt
+          git push origin HEAD:work/appdock-0.1.2-windows-path-remediation
+      - name: Upload bounded implementation evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wp16-remediation-evidence
+          path: |
+            /tmp/wp16-unit-tests.txt
+            /tmp/wp16-changed-files.txt
+            /tmp/wp16-candidate-sha.txt
+            /tmp/wp16-private-fixture/preview.json
+            /tmp/wp16-private-fixture/discovery.json
