@@ -536,6 +536,209 @@ class ReleaseHardeningTests(unittest.TestCase):
         with self.assertRaises(AppDockError):
             acquire_update_lock(data)
 
+    def test_real_helper_owned_lock_handoff_serves_health_and_blocks_ordinary_startup(self) -> None:
+        install = self.root / "replacement-install"
+        for relative in ("appdock.py", "static/app.js", "static/app.css"):
+            target = install / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(Path(__file__).parents[1] / relative, target)
+        port_probe = subprocess.run(
+            [sys.executable, "-c", "import socket; s=socket.socket(); s.bind(('127.0.0.1', 0)); print(s.getsockname()[1]); s.close()"],
+            capture_output=True, text=True, check=True,
+        )
+        port = int(port_probe.stdout.strip())
+        marker = self.root / "helper-ready.txt"
+        wrapper = textwrap.dedent(
+            f"""
+            import pathlib, sys, time
+            sys.path.insert(0, {str(Path(__file__).parents[1])!r})
+            from appdock import acquire_update_lock
+            from scripts.update_helper import _launch_and_wait
+            data = pathlib.Path({str(self.config.data_root)!r})
+            install = pathlib.Path({str(install)!r})
+            marker = pathlib.Path({str(marker)!r})
+            with acquire_update_lock(data):
+                child = _launch_and_wait(
+                    install / 'appdock.py', install,
+                    ['--host', '127.0.0.1', '--port', {str(port)!r}, '--data-dir', str(data)],
+                )
+                marker.write_text('ready', encoding='utf-8')
+                time.sleep(1)
+                child.terminate()
+                child.wait(timeout=3)
+            """
+        )
+        environment = os.environ.copy()
+        environment["APPDOCK_DATA_DIR"] = str(self.config.data_root)
+        helper_process = subprocess.Popen(
+            [sys.executable, "-B", "-c", wrapper],
+            cwd=Path(__file__).parents[1],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline and not marker.exists() and helper_process.poll() is None:
+                time.sleep(0.05)
+            self.assertTrue(marker.exists(), helper_process.stderr.read() if helper_process.poll() is not None else "helper did not become ready")
+            with self.assertRaises(AppDockError):
+                acquire_update_lock(self.config.data_root)
+            ordinary = subprocess.run(
+                [sys.executable, "-B", str(install / "appdock.py"), "--host", "127.0.0.1", "--port", str(port + 1), "--data-dir", str(self.config.data_root)],
+                env=environment, capture_output=True, text=True, timeout=5,
+            )
+            self.assertNotEqual(ordinary.returncode, 0)
+            self.assertIn("updater lock", ordinary.stderr)
+            forged_token = "forged-update-startup-token-123456"
+            forged = subprocess.run(
+                [
+                    sys.executable, "-B", str(install / "appdock.py"),
+                    "--host", "127.0.0.1", "--port", str(port + 2),
+                    "--data-dir", str(self.config.data_root),
+                    "--ready-token", forged_token,
+                    "--update-helper-startup", forged_token,
+                ],
+                env=environment, capture_output=True, text=True, timeout=5,
+            )
+            self.assertNotEqual(forged.returncode, 0)
+            self.assertIn("update startup", forged.stderr)
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=3) as response:
+                health = json.loads(response.read().decode("utf-8"))
+            self.assertTrue(health["ok"])
+            self.assertNotEqual(health.get("ready_token"), None)
+        finally:
+            try:
+                _stdout, helper_stderr = helper_process.communicate(timeout=8)
+            except subprocess.TimeoutExpired:
+                if os.name == "nt":
+                    subprocess.run(
+                        ["taskkill", "/PID", str(helper_process.pid), "/T", "/F"],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                else:
+                    helper_process.terminate()
+                _stdout, helper_stderr = helper_process.communicate(timeout=5)
+                self.fail(f"helper wrapper did not clean up its process tree: {helper_stderr}")
+            self.assertEqual(helper_process.returncode, 0, helper_stderr)
+
+    def test_fresh_coordinator_rehydrates_stage_after_staging_process_loss(self) -> None:
+        staged = self.config.updates_root / "0.2.1"
+        self.write_release_tree(staged)
+        digest = "a" * 64
+        stage_worker = textwrap.dedent(
+            f"""
+            import appdock, os
+            from pathlib import Path
+            config = appdock.AppDockConfig.from_environment(data_dir=Path({str(self.config.data_root)!r}))
+            config.ensure()
+            appdock._write_staged_receipt(config, {{
+                'staged': True,
+                'version': '0.2.1',
+                'path': str(Path({str(staged)!r})),
+                'digest': {digest!r},
+            }})
+            os._exit(0)
+            """
+        )
+        environment = os.environ.copy()
+        environment["APPDOCK_DATA_DIR"] = str(self.config.data_root)
+        staged_process = subprocess.run(
+            [sys.executable, "-B", "-c", stage_worker],
+            cwd=Path(__file__).parents[1], env=environment,
+            capture_output=True, text=True, timeout=5,
+        )
+        self.assertEqual(staged_process.returncode, 0, staged_process.stderr)
+        claim_worker = textwrap.dedent(
+            f"""
+            from pathlib import Path
+            import appdock
+            config = appdock.AppDockConfig.from_environment(data_dir=Path({str(self.config.data_root)!r}))
+            coordinator = appdock.UpdateCoordinator(config)
+            claimed = coordinator.claim({digest!r})
+            assert claimed['version'] == '0.2.1'
+            assert Path(claimed['path']).is_dir()
+            """
+        )
+        claimed_process = subprocess.run(
+            [sys.executable, "-B", "-c", claim_worker],
+            cwd=Path(__file__).parents[1], env=environment,
+            capture_output=True, text=True, timeout=5,
+        )
+        self.assertEqual(claimed_process.returncode, 0, claimed_process.stderr)
+
+    def test_same_version_stage_retries_after_crash_before_receipt_write(self) -> None:
+        zip_bytes = self.make_zip(self.release_members())
+        sums = f"{hashlib.sha256(zip_bytes).hexdigest()}  appdock-windows.zip\n".encode("utf-8")
+        base = "https://github.com/owner/repo/releases/download/v0.3.0/"
+        release = {
+            "version": "0.3.0",
+            "release_url": base,
+            "assets": [
+                {"name": "appdock-windows.zip", "url": base + "appdock-windows.zip"},
+                {"name": "SHA256SUMS.txt", "url": base + "SHA256SUMS.txt"},
+            ],
+        }
+
+        class Response:
+            headers: dict[str, str] = {}
+
+            def __init__(self, body: bytes, url: str):
+                self.body = body
+                self.url = url
+
+            def read(self, limit: int) -> bytes:
+                return self.body
+
+            def geturl(self) -> str:
+                return self.url
+
+        def opener(request, **_kwargs):
+            body = zip_bytes if request.full_url.endswith(".zip") else sums
+            return Response(body, request.full_url)
+
+        first = appdock.stage_update(release, self.config, opener=opener, repository="owner/repo")
+        appdock._clear_staged_receipt(self.config, first["path"])
+        retried = appdock.stage_update(release, self.config, opener=opener, repository="owner/repo")
+        self.assertEqual(Path(retried["path"]), Path(first["path"]))
+        self.assertTrue((Path(retried["path"]) / "RELEASE-MANIFEST.json").is_file())
+
+    def test_update_lock_rejects_reparse_data_alias_before_touching_target(self) -> None:
+        target = self.root / "lock-target"
+        target.mkdir()
+        alias = self.root / "lock-alias"
+        if os.name == "nt":
+            result = subprocess.run(["cmd", "/c", "mklink", "/J", str(alias), str(target)], capture_output=True, text=True)
+            if result.returncode != 0:
+                self.skipTest(f"junction creation unavailable: {result.stderr.strip()}")
+        else:
+            alias.symlink_to(target, target_is_directory=True)
+            original = appdock._is_link_or_reparse
+            with patch("appdock._is_link_or_reparse", side_effect=lambda path: Path(path) == alias or original(path)):
+                try:
+                    lock = acquire_update_lock(alias)
+                except AppDockError:
+                    pass
+                else:
+                    lock.release()
+                    self.fail("reparse alias was accepted")
+            self.assertFalse((target / "runtime" / "update.lock").exists())
+            return
+        try:
+            try:
+                lock = acquire_update_lock(alias)
+            except AppDockError:
+                pass
+            else:
+                lock.release()
+                self.fail("junction was accepted")
+            self.assertFalse((target / "runtime" / "update.lock").exists())
+        finally:
+            alias.rmdir()
+
     def test_update_entrypoints_lock_startup_recovery_and_helper_sequence(self) -> None:
         main_source = inspect.getsource(appdock.main)
         helper_source = inspect.getsource(update_helper.run)
@@ -856,6 +1059,12 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.write_release_tree(staged, {"appdock.py": b"new"})
 
         child = SimpleNamespace(poll=lambda: None)
+        appdock._write_staged_receipt(self.config, {
+            "staged": True,
+            "version": "0.2.2",
+            "path": str(staged),
+            "digest": "c" * 64,
+        })
 
         ready_token = "ready-token-1234567890"
 
@@ -889,6 +1098,7 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(installed_entry.read_text(encoding="utf-8"), "new")
         self.assertFalse(staged.exists())
+        self.assertFalse(appdock._staged_receipt_path(self.config).exists())
         self.assertIn("127.0.0.1:8876/health", health.call_args.args[0].full_url)
 
     def test_update_helper_rejects_health_from_an_unrelated_appdock_instance(self) -> None:

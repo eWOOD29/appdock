@@ -305,6 +305,18 @@ def _assert_no_link_or_reparse_ancestor(path: Path) -> None:
         current = parent
 
 
+def _assert_safe_directory_ancestors(path: Path) -> None:
+    current = path.expanduser().absolute()
+    while True:
+        if current.exists() or current.is_symlink():
+            if _is_link_or_reparse(current) or not current.is_dir():
+                raise AppDockError("updater path has an unsafe or non-directory ancestor")
+        parent = current.parent
+        if parent == current:
+            return
+        current = parent
+
+
 @dataclass
 class _UpdateLockState:
     path: Path
@@ -354,16 +366,20 @@ _UPDATE_LOCK_STATES: dict[str, _UpdateLockState] = {}
 
 
 def _update_lock_path(data_dir: str | Path) -> Path:
-    data = Path(data_dir).expanduser().resolve()
-    _assert_no_link_or_reparse_ancestor(data)
+    data = Path(data_dir).expanduser().absolute()
+    _assert_safe_directory_ancestors(data)
     runtime = data / "runtime"
-    _assert_no_link_or_reparse_ancestor(runtime)
+    _assert_safe_directory_ancestors(runtime)
     try:
         runtime.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise AppDockError("could not prepare updater runtime directory") from exc
-    if _is_link_or_reparse(runtime):
-        raise AppDockError("updater runtime directory is unsafe")
+    _assert_safe_directory_ancestors(data)
+    _assert_safe_directory_ancestors(runtime)
+    canonical_data = data.resolve()
+    canonical_runtime = runtime.resolve()
+    if not _inside(canonical_runtime, canonical_data):
+        raise AppDockError("updater runtime directory escapes the data root")
     lock_path = runtime / "update.lock"
     if _is_link_or_reparse(lock_path):
         raise AppDockError("updater lock path is unsafe")
@@ -447,11 +463,11 @@ def _assert_tree_safe(root: Path, containment_root: Path) -> None:
         raise AppDockError("staging path escapes data directory")
     for current, dirs, files in os.walk(root, followlinks=False):
         current_path = Path(current).resolve()
-        if not _inside(current_path, root):
+        if _is_link_or_reparse(Path(current)) or not _inside(current_path, root):
             raise AppDockError("staging path escapes its root")
         for name in [*dirs, *files]:
             path = Path(current) / name
-            if path.is_symlink() or not _inside(path.resolve(), root):
+            if path.is_symlink() or _is_link_or_reparse(path) or not _inside(path.resolve(), root):
                 raise AppDockError("staging contains an unsafe symlink or path")
 
 
@@ -1374,6 +1390,65 @@ def _read_bounded_json(path: Path, maximum: int = MAX_JSON_BYTES) -> Any:
         return _loads_strict_json(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError) as exc:
         raise AppDockError("JSON file is invalid") from exc
+
+
+def _update_startup_receipt_path(data: Path, token: str) -> Path:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{20,128}", token):
+        raise AppDockError("invalid update startup token")
+    data = data.expanduser().absolute()
+    runtime = data / "runtime"
+    _assert_safe_directory_ancestors(data)
+    _assert_safe_directory_ancestors(runtime)
+    runtime.mkdir(parents=True, exist_ok=True)
+    _assert_safe_directory_ancestors(runtime)
+    return runtime / f"update-startup-{token}.json"
+
+
+def _write_update_startup_handoff(data: str | Path, install: str | Path, token: str) -> Path:
+    data_path = Path(data)
+    receipt = _update_startup_receipt_path(data_path, token)
+    _durable_write_json(receipt, {
+        "schema_version": 1,
+        "token": token,
+        "owner_pid": os.getpid(),
+        "install": str(Path(install).expanduser().absolute().resolve()),
+        "data": str(data_path.expanduser().absolute().resolve()),
+    })
+    return receipt
+
+
+def _process_exists(pid: int) -> bool:
+    if pid <= 0 or pid == os.getpid():
+        return False
+    try:
+        os.kill(pid, 0)
+    except (OSError, ProcessLookupError):
+        return False
+    return True
+
+
+def _consume_update_startup_handoff(data: Path, install: Path, token: str) -> None:
+    receipt_path = _update_startup_receipt_path(data, token)
+    try:
+        receipt = _read_bounded_json(receipt_path)
+    except AppDockError as exc:
+        raise AppDockError("update startup authorization is invalid") from exc
+    if (
+        not isinstance(receipt, dict)
+        or set(receipt) != {"schema_version", "token", "owner_pid", "install", "data"}
+        or receipt.get("schema_version") != 1
+        or receipt.get("token") != token
+        or not isinstance(receipt.get("owner_pid"), int)
+        or not isinstance(receipt.get("install"), str)
+        or not isinstance(receipt.get("data"), str)
+        or not _process_exists(receipt["owner_pid"])
+    ):
+        raise AppDockError("update startup authorization is invalid")
+    if Path(receipt["install"]).expanduser().absolute().resolve() != install.expanduser().absolute().resolve():
+        raise AppDockError("update startup authorization is bound to another installation")
+    if Path(receipt["data"]).expanduser().absolute().resolve() != data.expanduser().absolute().resolve():
+        raise AppDockError("update startup authorization is bound to another data root")
+    receipt_path.unlink()
 
 
 def _private_package_files(root: Path) -> set[str]:
@@ -2638,6 +2713,88 @@ def validate_zip(data: bytes) -> list[str]:
     return names
 
 
+def _staged_receipt_path(config: AppDockConfig) -> Path:
+    _assert_safe_directory_ancestors(config.data_root)
+    _assert_safe_directory_ancestors(config.runtime_root)
+    config.runtime_root.mkdir(parents=True, exist_ok=True)
+    _assert_safe_directory_ancestors(config.runtime_root)
+    return config.runtime_root / "staged-update.json"
+
+
+def _validate_staged_path(config: AppDockConfig, version: str, raw_path: str) -> Path:
+    expected = _safe_version_child(config.updates_root, version)
+    staged_lexical = Path(raw_path).expanduser().absolute()
+    _assert_safe_directory_ancestors(staged_lexical)
+    if _is_link_or_reparse(staged_lexical):
+        raise AppDockError("staged update root is a symlink or reparse point")
+    staged = staged_lexical.resolve()
+    if staged != expected.resolve() or not staged.is_dir() or not _inside(staged, config.updates_root):
+        raise AppDockError("staged update receipt path is invalid")
+    _assert_tree_safe(staged_lexical, config.updates_root)
+    _load_release_inventory(staged, complete=True)
+    return staged
+
+
+def _read_staged_receipt(config: AppDockConfig) -> dict[str, Any] | None:
+    receipt_path = _staged_receipt_path(config)
+    if not receipt_path.exists():
+        return None
+    receipt = _read_bounded_json(receipt_path)
+    if (
+        not isinstance(receipt, dict)
+        or set(receipt) != {"schema_version", "version", "path", "digest"}
+        or receipt.get("schema_version") != 1
+        or not isinstance(receipt.get("version"), str)
+        or not SEMVER_RE.fullmatch(receipt["version"])
+        or not isinstance(receipt.get("path"), str)
+        or not isinstance(receipt.get("digest"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", receipt["digest"])
+    ):
+        raise AppDockError("staged update receipt is invalid")
+    staged = _validate_staged_path(config, receipt["version"], receipt["path"])
+    return {
+        "staged": True,
+        "version": receipt["version"],
+        "path": str(staged),
+        "digest": receipt["digest"],
+    }
+
+
+def _write_staged_receipt(config: AppDockConfig, staged: dict[str, Any]) -> None:
+    version = staged.get("version")
+    raw_path = staged.get("path")
+    digest = staged.get("digest")
+    if not isinstance(version, str) or not isinstance(raw_path, str) or not isinstance(digest, str):
+        raise AppDockError("staged update receipt data is invalid")
+    staged_path = _validate_staged_path(config, version, raw_path)
+    _durable_write_json(_staged_receipt_path(config), {
+        "schema_version": 1,
+        "version": version,
+        "path": str(staged_path),
+        "digest": digest,
+    })
+
+
+def _clear_staged_receipt(config: AppDockConfig | str | Path, expected_path: str | Path | None = None) -> None:
+    if not isinstance(config, AppDockConfig):
+        config = AppDockConfig.from_environment(data_dir=config)
+    receipt_path = _staged_receipt_path(config)
+    if not receipt_path.exists():
+        return
+    if expected_path is not None:
+        try:
+            receipt = _read_bounded_json(receipt_path)
+            actual = Path(str(receipt.get("path") or "")).expanduser().absolute().resolve()
+            expected = Path(expected_path).expanduser().absolute().resolve()
+        except (AppDockError, OSError):
+            return
+        if actual != expected:
+            return
+    if _is_link_or_reparse(receipt_path):
+        raise AppDockError("staged update receipt is unsafe")
+    receipt_path.unlink(missing_ok=True)
+
+
 def stage_update(release: dict[str, Any], config: AppDockConfig, *, opener: Callable[..., Any] | None = None, repository: str = DEFAULT_UPDATE_REPOSITORY) -> dict[str, Any]:
     version = str(release.get("version") or release.get("latest") or "")
     version = version[1:] if version.startswith("v") else version
@@ -2650,9 +2807,17 @@ def stage_update(release: dict[str, Any], config: AppDockConfig, *, opener: Call
     verify_sha256(zip_bytes, sums)
     validate_zip(zip_bytes)
     config.ensure()
+    if _staged_receipt_path(config).exists():
+        _read_staged_receipt(config)
+        raise AppDockError("an update is already staged")
     destination = _safe_version_child(config.updates_root, version)
     if destination.exists():
-        raise AppDockError("update version is already staged")
+        # A completed directory without its durable receipt can only remain after
+        # the staging owner exited between the atomic rename and receipt write.
+        # Validate the exact managed tree before deleting it, then make the same
+        # version safely retryable while the caller still owns the update lock.
+        _validate_staged_path(config, version, str(destination))
+        _remove_tree(destination)
     temporary = Path(tempfile.mkdtemp(prefix=f"{version}-", dir=config.updates_root))
     try:
         with zipfile.ZipFile(__import__("io").BytesIO(zip_bytes)) as archive:
@@ -2663,7 +2828,13 @@ def stage_update(release: dict[str, Any], config: AppDockConfig, *, opener: Call
     except Exception:
         _remove_tree(temporary, ignore_errors=True)
         raise
-    return {"staged": True, "version": version, "path": str(destination), "digest": _digest({"version": version, "release_url": release.get("release_url"), "assets": assets})}
+    result = {"staged": True, "version": version, "path": str(destination), "digest": _digest({"version": version, "release_url": release.get("release_url"), "assets": assets})}
+    try:
+        _write_staged_receipt(config, result)
+    except Exception:
+        _remove_tree(destination, ignore_errors=True)
+        raise
+    return result
 
 
 def _update_transactions_root(data: Path) -> Path:
@@ -3195,12 +3366,23 @@ HTML = r'''<!doctype html>
 
 
 class UpdateCoordinator:
-    def __init__(self) -> None:
+    def __init__(self, config: AppDockConfig | None = None) -> None:
         self._lock = threading.Lock()
         self._staged: dict[str, Any] | None = None
         self._staging = False
         self._applying = False
         self._update_lock: UpdateLock | None = None
+        self._config: AppDockConfig | None = None
+        if config is not None:
+            self.bind(config)
+
+    def bind(self, config: AppDockConfig) -> None:
+        with self._lock:
+            self._config = config
+            if self._staged is None:
+                staged = _read_staged_receipt(config)
+                if staged is not None:
+                    self._staged = staged
 
     def begin_stage(self) -> None:
         with self._lock:
@@ -3241,6 +3423,10 @@ class UpdateCoordinator:
                 raise AppDockError("an update is still staging")
             if not self._staged or confirmation != self._staged.get("digest"):
                 raise AppDockError("staged update confirmation is stale or invalid")
+            if self._config is not None and _staged_receipt_path(self._config).exists():
+                self._staged = _read_staged_receipt(self._config)
+                if not self._staged or confirmation != self._staged.get("digest"):
+                    raise AppDockError("staged update confirmation is stale or invalid")
             staged = self._staged
             self._staged = None
             self._applying = True
@@ -3273,6 +3459,7 @@ def stage_coordinated_update(
     repository: str,
     stager: Callable[..., dict[str, Any]] = stage_update,
 ) -> dict[str, Any]:
+    coordinator.bind(config)
     coordinator.begin_stage()
     update_lock: UpdateLock | None = None
     staged: dict[str, Any] | None = None
@@ -3289,6 +3476,7 @@ def stage_coordinated_update(
                 staged_path = Path(raw_path).resolve()
                 if staged_path != config.updates_root.resolve() and _inside(staged_path, config.updates_root):
                     _remove_tree(staged_path, ignore_errors=True)
+        _clear_staged_receipt(config)
         coordinator.cancel_stage()
         raise
     finally:
@@ -3483,16 +3671,25 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--data-dir", default=None)
     parser.add_argument("--ready-token", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--update-helper-startup", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
     validate_bind_host(args.host)
     if args.ready_token is not None and not re.fullmatch(r"[A-Za-z0-9_-]{20,128}", args.ready_token):
         parser.error("invalid readiness token")
+    if args.update_helper_startup is not None:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{20,128}", args.update_helper_startup) or args.ready_token is None or not secrets.compare_digest(args.update_helper_startup, args.ready_token):
+            parser.error("invalid update helper startup authorization")
     config = AppDockConfig.from_environment(data_dir=args.data_dir)
     config.ensure()
-    with acquire_update_lock(config.data_root):
-        recover_private_migrations(config)
-        recover_update_transactions(config.data_root, expected_install=Path(__file__).resolve().parent)
-    Handler.config = config; Handler.extensions = ExtensionManager(config); Handler.manager = AppManager(config=config, extensions=Handler.extensions); Handler.local = LocalFolderOnboarding(config); Handler.github = GitHubOnboarding(config); Handler.checker = ReleaseChecker(config.update_repository); Handler.coordinator = UpdateCoordinator(); Handler.lm_adapter = LMStudioAdapter(); Handler.lm_mutation_lock = threading.Lock(); Handler.ready_token = args.ready_token
+    if args.update_helper_startup is not None:
+        _consume_update_startup_handoff(config.data_root, Path(__file__).resolve().parent, args.update_helper_startup)
+        startup_coordinator = UpdateCoordinator()
+    else:
+        with acquire_update_lock(config.data_root):
+            recover_private_migrations(config)
+            recover_update_transactions(config.data_root, expected_install=Path(__file__).resolve().parent)
+            startup_coordinator = UpdateCoordinator(config)
+    Handler.config = config; Handler.extensions = ExtensionManager(config); Handler.manager = AppManager(config=config, extensions=Handler.extensions); Handler.local = LocalFolderOnboarding(config); Handler.github = GitHubOnboarding(config); Handler.checker = ReleaseChecker(config.update_repository); Handler.coordinator = startup_coordinator; Handler.lm_adapter = LMStudioAdapter(); Handler.lm_mutation_lock = threading.Lock(); Handler.ready_token = args.ready_token
     cleanup_stop = threading.Event()
     cleanup_thread = threading.Thread(target=_staging_cleanup_loop, args=(Handler.github, cleanup_stop), name="appdock-staging-cleanup", daemon=True)
     cleanup_thread.start()

@@ -17,7 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from appdock import _remove_tree, acquire_update_lock, apply_update, finalize_update, recover_update_transactions, rollback_update  # noqa: E402
+from appdock import _clear_staged_receipt, _remove_tree, _write_update_startup_handoff, acquire_update_lock, apply_update, finalize_update, recover_update_transactions, rollback_update  # noqa: E402
 
 RESTART_READY_TIMEOUT_SECONDS = 20.0
 
@@ -111,17 +111,52 @@ def _discard_stage(staged: Path, data: Path) -> None:
     if candidate.resolve() == updates_root:
         return
     _remove_tree(candidate, ignore_errors=True)
+    _clear_staged_receipt(data, candidate)
 
 
-def _launch_and_wait(restart_script: Path, install: Path, restart_args: list[str]) -> object:
-    ready_token = secrets.token_urlsafe(32)
-    command = [sys.executable, str(restart_script), *restart_args, "--ready-token", ready_token]
-    restarted = subprocess.Popen(command, shell=False, cwd=str(install), close_fds=True)
+def _restart_data_dir(restart_args: list[str]) -> Path | None:
+    for index, argument in enumerate(restart_args):
+        if argument == "--data-dir" and index + 1 < len(restart_args):
+            return Path(restart_args[index + 1])
+        if argument.startswith("--data-dir="):
+            return Path(argument.partition("=")[2])
+    return None
+
+
+def _launch_and_wait(
+    restart_script: Path,
+    install: Path,
+    restart_args: list[str],
+    *,
+    startup_data: Path | None = None,
+    ready_token: str | None = None,
+) -> object:
+    ready_token = ready_token or secrets.token_urlsafe(32)
+    data = startup_data or _restart_data_dir(restart_args)
+    startup_receipt = _write_update_startup_handoff(data, install, ready_token) if data is not None else None
+    command = [
+        sys.executable,
+        str(restart_script),
+        *restart_args,
+        "--ready-token",
+        ready_token,
+        "--update-helper-startup",
+        ready_token,
+    ]
+    try:
+        restarted = subprocess.Popen(command, shell=False, cwd=str(install), close_fds=True)
+    except OSError:
+        if startup_receipt is not None:
+            startup_receipt.unlink(missing_ok=True)
+        raise
     try:
         _wait_for_restart_ready(restarted, restart_args, ready_token)
     except Exception:
         _stop_restarted_process(restarted)
         raise
+    finally:
+        if startup_receipt is not None:
+            startup_receipt.unlink(missing_ok=True)
     return restarted
 
 
@@ -160,13 +195,13 @@ def run(
                 log(f"update applied: {result['files']}")
                 log("restarting AppDock with a fixed argument list")
                 try:
-                    _launch_and_wait(restart_script, install, restart_args)
+                    _launch_and_wait(restart_script, install, restart_args, startup_data=data)
                     finalize_update(result, install, data)
                 except Exception as restart_exc:
                     rollback_update(result, install, data)
                     log("restart readiness failed; previous program files restored")
                     try:
-                        _launch_and_wait(restart_script, install, restart_args)
+                        _launch_and_wait(restart_script, install, restart_args, startup_data=data)
                         service_restored = True
                         log("restored AppDock restarted successfully")
                     except Exception as restore_exc:
@@ -175,7 +210,7 @@ def run(
             except Exception as exc:  # copy failures and restart-launch failures roll back
                 if not service_restored:
                     try:
-                        _launch_and_wait(restart_script, install, restart_args)
+                        _launch_and_wait(restart_script, install, restart_args, startup_data=data)
                         log("existing AppDock restarted after update failure")
                     except Exception as restore_exc:
                         log(f"existing AppDock restart after update failure failed: {restore_exc}")
