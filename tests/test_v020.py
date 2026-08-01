@@ -177,12 +177,28 @@ class V020Tests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 build_lm_load_args(invalid, installed)
 
+    def test_lms_rejects_option_shaped_operands_before_building_argv(self) -> None:
+        for request in (
+            {"model": "--all"},
+            {"model": "--help"},
+            {"model_key": "-y"},
+            {"model": "org-a/shared", "identifier": "--all"},
+            {"model": "org-a/shared", "speculative_draft_simple": "enable", "speculative_draft_model": "--all"},
+        ):
+            with self.subTest(request=request), self.assertRaises(ValueError):
+                build_lm_load_args(request, [{"key": "org-a/shared"}, {"key": "--all"}])
+        with self.assertRaises(ValueError):
+            build_lm_load_args({"model": "org-a/shared"}, [{"key": "--all"}])
+
     def test_lms_unload_requires_exact_fresh_identifier_and_never_unloads_all(self) -> None:
         loaded = [{"identifier": "worker-1", "key": "org-a/shared"}]
         self.assertEqual(build_lm_unload_args({"identifier": "worker-1"}, loaded), ["unload", "worker-1"])
         for invalid in ({"identifier": "worker"}, {"identifier": "worker-1", "all": True}, {"identifier": "worker-1\n"}):
             with self.assertRaises(ValueError):
                 build_lm_unload_args(invalid, loaded)
+        for invalid in ("--all", "--help", "-y"):
+            with self.subTest(identifier=invalid), self.assertRaises(ValueError):
+                build_lm_unload_args({"identifier": invalid}, [{"identifier": invalid}])
 
     def test_lms_mutations_are_fake_only_locked_and_same_origin_protected(self) -> None:
         class FakeAdapter:

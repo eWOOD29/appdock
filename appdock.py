@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from functools import wraps
 import hashlib
 import http.client
 import json
@@ -24,6 +25,11 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 MANIFEST_NAME = "appdock.json"
 CURRENT_VERSION = "0.2.0"
@@ -297,6 +303,115 @@ def _assert_no_link_or_reparse_ancestor(path: Path) -> None:
         if parent == current:
             return
         current = parent
+
+
+@dataclass
+class _UpdateLockState:
+    path: Path
+    stream: Any
+    owner_thread: int
+    references: int = 1
+
+
+class UpdateLock:
+    def __init__(self, key: str, state: _UpdateLockState):
+        self._key = key
+        self._state = state
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        with _UPDATE_LOCK_GUARD:
+            if self._released:
+                return
+            self._released = True
+            state = _UPDATE_LOCK_STATES.get(self._key)
+            if state is None:
+                return
+            state.references -= 1
+            if state.references:
+                return
+            try:
+                if os.name == "nt":
+                    state.stream.seek(0)
+                    msvcrt.locking(state.stream.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(state.stream.fileno(), fcntl.LOCK_UN)
+            finally:
+                state.stream.close()
+                _UPDATE_LOCK_STATES.pop(self._key, None)
+
+    def __enter__(self) -> "UpdateLock":
+        return self
+
+    def __exit__(self, _exc_type: Any, _exc_value: Any, _traceback: Any) -> None:
+        self.release()
+
+
+_UPDATE_LOCK_GUARD = threading.Lock()
+_UPDATE_LOCK_STATES: dict[str, _UpdateLockState] = {}
+
+
+def _update_lock_path(data_dir: str | Path) -> Path:
+    data = Path(data_dir).expanduser().resolve()
+    _assert_no_link_or_reparse_ancestor(data)
+    runtime = data / "runtime"
+    _assert_no_link_or_reparse_ancestor(runtime)
+    try:
+        runtime.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise AppDockError("could not prepare updater runtime directory") from exc
+    if _is_link_or_reparse(runtime):
+        raise AppDockError("updater runtime directory is unsafe")
+    lock_path = runtime / "update.lock"
+    if _is_link_or_reparse(lock_path):
+        raise AppDockError("updater lock path is unsafe")
+    return lock_path
+
+
+def acquire_update_lock(data_dir: str | Path) -> UpdateLock:
+    lock_path = _update_lock_path(data_dir)
+    key = str(lock_path)
+    with _UPDATE_LOCK_GUARD:
+        existing = _UPDATE_LOCK_STATES.get(key)
+        if existing is not None:
+            if existing.owner_thread != threading.get_ident():
+                raise AppDockError("could not acquire updater lock; another update may be in progress")
+            existing.references += 1
+            return UpdateLock(key, existing)
+        stream = None
+        try:
+            stream = lock_path.open("a+b")
+            if os.name == "nt":
+                stream.seek(0, os.SEEK_END)
+                if stream.tell() == 0:
+                    stream.write(b"\0")
+                    stream.flush()
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if stream is not None:
+                stream.close()
+            raise AppDockError("could not acquire updater lock; another update may be in progress") from exc
+        state = _UpdateLockState(lock_path, stream, threading.get_ident())
+        _UPDATE_LOCK_STATES[key] = state
+        return UpdateLock(key, state)
+
+
+def _locked_transaction(data_index: int) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    def decorate(function: Callable[..., Any]) -> Callable[..., Any]:
+        @wraps(function)
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            data_dir = args[data_index] if len(args) > data_index else kwargs.get("data_dir")
+            if data_dir is None:
+                raise AppDockError("update data directory is required")
+            with acquire_update_lock(data_dir):
+                return function(*args, **kwargs)
+        return wrapped
+    return decorate
 
 
 def _safe_child(root: Path, name: str) -> Path:
@@ -582,6 +697,13 @@ def _validated_string(value: Any, field: str, maximum: int) -> str:
     return value
 
 
+def _validated_cli_operand(value: Any, field: str, maximum: int) -> str:
+    operand = _validated_string(value, field, maximum)
+    if operand.startswith("-"):
+        raise ValueError(f"{field} must not begin with '-'")
+    return operand
+
+
 def _validated_int(value: Any, field: str, minimum: int, maximum: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
         raise ValueError(f"{field} must be an integer from {minimum} to {maximum}")
@@ -597,7 +719,7 @@ def _validated_float(value: Any, field: str, minimum: float, maximum: float) -> 
 def _installed_model_key(model: Any) -> str | None:
     if not isinstance(model, dict) or not isinstance(model.get("key"), str) or not model["key"].strip():
         return None
-    return model["key"].strip()
+    return _validated_cli_operand(model["key"].strip(), "installed model key", 256)
 
 
 def build_lm_load_args(request: dict[str, Any], installed_models: list[dict[str, Any]]) -> list[str]:
@@ -608,7 +730,7 @@ def build_lm_load_args(request: dict[str, Any], installed_models: list[dict[str,
         raise ValueError("unknown load setting: " + sorted(unknown)[0])
     if "model" in request and "model_key" in request:
         raise ValueError("specify only one model key")
-    requested = _validated_string(request.get("model", request.get("model_key")), "model", 256)
+    requested = _validated_cli_operand(request.get("model", request.get("model_key")), "model", 256)
     canonical = next((key for item in installed_models if (key := _installed_model_key(item)) and key.lower().replace("\\", "/") == requested.lower().replace("\\", "/")), None)
     if canonical is None:
         raise ValueError("model must be one of the installed model keys")
@@ -627,7 +749,7 @@ def build_lm_load_args(request: dict[str, Any], installed_models: list[dict[str,
     if request.get("ttl") is not None:
         args += ["--ttl", str(_validated_int(request["ttl"], "ttl", 1, 604800))]
     if request.get("identifier") is not None:
-        args += ["--identifier", _validated_string(request["identifier"], "identifier", 128)]
+        args += ["--identifier", _validated_cli_operand(request["identifier"], "identifier", 128)]
     mtp = request.get("speculative_draft_mtp", "default")
     simple = request.get("speculative_draft_simple", "default")
     if mtp not in {"default", "enable", "disable"}:
@@ -651,7 +773,7 @@ def build_lm_load_args(request: dict[str, Any], installed_models: list[dict[str,
     if simple == "enable":
         args.append("--speculative-draft-simple")
     if request.get("speculative_draft_model") is not None:
-        args += ["--speculative-draft-model", _validated_string(request["speculative_draft_model"], "speculative_draft_model", 256)]
+        args += ["--speculative-draft-model", _validated_cli_operand(request["speculative_draft_model"], "speculative_draft_model", 256)]
     for field, option, minimum, maximum in (
         ("speculative_draft_max_tokens", "--speculative-draft-max-tokens", 1, 512),
         ("speculative_draft_min_tokens", "--speculative-draft-min-tokens", 0, 512),
@@ -669,7 +791,7 @@ def build_lm_load_args(request: dict[str, Any], installed_models: list[dict[str,
 def build_lm_unload_args(request: dict[str, Any], loaded_instances: list[dict[str, Any]]) -> list[str]:
     if not isinstance(request, dict) or set(request) != {"identifier"}:
         raise ValueError("unload requires only an identifier")
-    identifier = _validated_string(request.get("identifier"), "identifier", 128)
+    identifier = _validated_cli_operand(request.get("identifier"), "identifier", 128)
     loaded_identifiers = {
         item.get("identifier") for item in loaded_instances
         if isinstance(item, dict) and isinstance(item.get("identifier"), str)
@@ -2684,6 +2806,7 @@ def _recover_one_update(tx_root: Path, *, phase_hook: Callable[[str], None] | No
     return "rolled_back"
 
 
+@_locked_transaction(0)
 def recover_update_transactions(data_dir: str | Path, *, expected_install: str | Path | None = None, phase_hook: Callable[[str], None] | None = None) -> list[str]:
     data = Path(data_dir).expanduser().resolve()
     root = _update_transactions_root(data)
@@ -2700,6 +2823,7 @@ def recover_update_transactions(data_dir: str | Path, *, expected_install: str |
     return recovered
 
 
+@_locked_transaction(2)
 def apply_update(
     staged_dir: str | Path,
     install_dir: str | Path,
@@ -2807,6 +2931,7 @@ def apply_update(
     return result
 
 
+@_locked_transaction(2)
 def finalize_update(applied: dict[str, Any], install_dir: str | Path, data_dir: str | Path) -> None:
     install, data = Path(install_dir).resolve(), Path(data_dir).resolve()
     transaction = Path(str(applied.get("transaction") or "")).resolve()
@@ -2819,6 +2944,7 @@ def finalize_update(applied: dict[str, Any], install_dir: str | Path, data_dir: 
     _recover_one_update(tx_root)
 
 
+@_locked_transaction(2)
 def rollback_update(applied: dict[str, Any], install_dir: str | Path, data_dir: str | Path) -> None:
     install, data = Path(install_dir).resolve(), Path(data_dir).resolve()
     if _inside(install, data) or _inside(data, install):
@@ -2978,7 +3104,7 @@ HTML = r'''<!doctype html>
   </header>
 
   <div id="drawerBackdrop" class="drawer-backdrop" hidden></div>
-  <aside id="drawer" class="drawer" aria-label="AppDock navigation" aria-hidden="true">
+  <aside id="drawer" class="drawer" aria-label="AppDock navigation" aria-hidden="true" inert>
     <div class="drawer-heading"><strong>Navigate</strong><button id="closeDrawerButton" type="button" aria-label="Close navigation">×</button></div>
     <nav class="drawer-nav">
       <button id="dashboardLink" type="button" data-view="dashboard">Dashboard</button>
@@ -3074,6 +3200,7 @@ class UpdateCoordinator:
         self._staged: dict[str, Any] | None = None
         self._staging = False
         self._applying = False
+        self._update_lock: UpdateLock | None = None
 
     def begin_stage(self) -> None:
         with self._lock:
@@ -3124,6 +3251,19 @@ class UpdateCoordinator:
             self._applying = False
             self._staged = staged
 
+    def retain_update_lock(self, update_lock: UpdateLock) -> None:
+        with self._lock:
+            if self._update_lock is not None:
+                raise AppDockError("an updater lock is already retained")
+            self._update_lock = update_lock
+
+    def release_update_lock(self) -> None:
+        with self._lock:
+            update_lock = self._update_lock
+            self._update_lock = None
+        if update_lock is not None:
+            update_lock.release()
+
 
 def stage_coordinated_update(
     release: dict[str, Any],
@@ -3134,10 +3274,14 @@ def stage_coordinated_update(
     stager: Callable[..., dict[str, Any]] = stage_update,
 ) -> dict[str, Any]:
     coordinator.begin_stage()
+    update_lock: UpdateLock | None = None
     staged: dict[str, Any] | None = None
     try:
+        update_lock = acquire_update_lock(config.data_root)
         staged = stager(release, config, repository=repository)
         coordinator.finish_stage(staged)
+        coordinator.retain_update_lock(update_lock)
+        update_lock = None
     except Exception:
         if staged is not None:
             raw_path = staged.get("path")
@@ -3147,6 +3291,9 @@ def stage_coordinated_update(
                     _remove_tree(staged_path, ignore_errors=True)
         coordinator.cancel_stage()
         raise
+    finally:
+        if update_lock is not None:
+            update_lock.release()
     return staged
 
 
@@ -3292,6 +3439,7 @@ class Handler(BaseHTTPRequestHandler):
                     launch_update_helper(staged["path"], install_dir, self.config.data_root, current_pid=os.getpid(), restart_args=restart_args)
                 except Exception:
                     Handler.coordinator.restore(staged)
+                    Handler.coordinator.release_update_lock()
                     raise
                 self._json({"restart_pending": True, "version": staged.get("version")}, 202)
                 threading.Thread(target=self.server.shutdown, daemon=True).start(); return
@@ -3341,8 +3489,9 @@ def main() -> None:
         parser.error("invalid readiness token")
     config = AppDockConfig.from_environment(data_dir=args.data_dir)
     config.ensure()
-    recover_private_migrations(config)
-    recover_update_transactions(config.data_root, expected_install=Path(__file__).resolve().parent)
+    with acquire_update_lock(config.data_root):
+        recover_private_migrations(config)
+        recover_update_transactions(config.data_root, expected_install=Path(__file__).resolve().parent)
     Handler.config = config; Handler.extensions = ExtensionManager(config); Handler.manager = AppManager(config=config, extensions=Handler.extensions); Handler.local = LocalFolderOnboarding(config); Handler.github = GitHubOnboarding(config); Handler.checker = ReleaseChecker(config.update_repository); Handler.coordinator = UpdateCoordinator(); Handler.lm_adapter = LMStudioAdapter(); Handler.lm_mutation_lock = threading.Lock(); Handler.ready_token = args.ready_token
     cleanup_stop = threading.Event()
     cleanup_thread = threading.Thread(target=_staging_cleanup_loop, args=(Handler.github, cleanup_stop), name="appdock-staging-cleanup", daemon=True)
@@ -3353,6 +3502,7 @@ def main() -> None:
     except KeyboardInterrupt: pass
     finally:
         cleanup_stop.set()
+        Handler.coordinator.release_update_lock()
         server.server_close()
 
 

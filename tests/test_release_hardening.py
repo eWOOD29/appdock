@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import ast
 import io
 import hashlib
+import inspect
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -11,6 +14,7 @@ import sys
 import tempfile
 import threading
 import time
+import textwrap
 import unittest
 import urllib.request
 import zipfile
@@ -29,6 +33,7 @@ from appdock import (
     LocalFolderOnboarding,
     ThreadingHTTPServer,
     apply_update,
+    acquire_update_lock,
     compare_semver,
     launch_update_helper,
     normalize_manifest,
@@ -425,6 +430,175 @@ class ReleaseHardeningTests(unittest.TestCase):
     def test_updater_has_external_restart_helper_boundary(self) -> None:
         self.assertTrue(callable(getattr(appdock, "launch_update_helper", None)))
 
+    def test_update_lock_is_real_cross_process_contention_and_reusable_file(self) -> None:
+        marker = self.config.runtime_root / "contention-marker.txt"
+        marker.write_text("preserve", encoding="utf-8")
+        code = (
+            "import sys,time; import appdock; "
+            "lock=appdock.acquire_update_lock(sys.argv[1]); "
+            "print('ready', flush=True); time.sleep(2); lock.release()"
+        )
+        environment = os.environ.copy()
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        environment["PYTHONPATH"] = str(Path(__file__).parents[1])
+        holder = subprocess.Popen(
+            [sys.executable, "-c", code, str(self.config.data_root)],
+            cwd=str(Path(__file__).parents[1]),
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "ready")
+            contender = subprocess.run(
+                [sys.executable, "-c", (
+                    "import sys\nimport appdock\nfrom pathlib import Path\n"
+                    "try:\n    lock=appdock.acquire_update_lock(sys.argv[1])\n"
+                    "except Exception:\n    print('busy')\n    raise SystemExit(0)\n"
+                    "Path(sys.argv[2]).write_text('mutated')\nlock.release()\nprint('acquired')"
+                ), str(self.config.data_root), str(marker)],
+                cwd=str(Path(__file__).parents[1]), env=environment,
+                capture_output=True, text=True,
+            )
+            self.assertEqual(contender.returncode, 0, contender.stderr)
+            self.assertEqual(contender.stdout.strip(), "busy")
+            self.assertEqual(marker.read_text(encoding="utf-8"), "preserve")
+        finally:
+            stdout, stderr = holder.communicate(timeout=5)
+            self.assertEqual(holder.returncode, 0, stderr)
+        self.assertTrue(self.config.runtime_root.joinpath("update.lock").is_file())
+        acquired = subprocess.run(
+            [sys.executable, "-c", (
+                "import sys; import appdock; from pathlib import Path; "
+                "lock=appdock.acquire_update_lock(sys.argv[1]); "
+                "assert Path(sys.argv[2]).read_text() == 'preserve'; lock.release(); print('acquired')"
+            ), str(self.config.data_root), str(marker)],
+            cwd=str(Path(__file__).parents[1]), env=environment,
+            capture_output=True, text=True,
+        )
+        self.assertEqual(acquired.returncode, 0, acquired.stderr)
+        self.assertEqual(acquired.stdout.strip(), "acquired")
+        self.assertTrue(self.config.runtime_root.joinpath("update.lock").is_file())
+        self.assertEqual(marker.read_text(encoding="utf-8"), "preserve")
+
+    def test_update_lock_rejects_another_thread_in_the_same_process(self) -> None:
+        holder = acquire_update_lock(self.config.data_root)
+        outcomes: list[str] = []
+
+        def contend() -> None:
+            try:
+                contender = acquire_update_lock(self.config.data_root)
+            except AppDockError:
+                outcomes.append("busy")
+            else:
+                outcomes.append("acquired")
+                contender.release()
+
+        thread = threading.Thread(target=contend)
+        try:
+            thread.start()
+            thread.join(timeout=3)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(outcomes, ["busy"])
+        finally:
+            holder.release()
+
+        retry = threading.Thread(target=contend)
+        retry.start()
+        retry.join(timeout=3)
+        self.assertFalse(retry.is_alive())
+        self.assertEqual(outcomes, ["busy", "acquired"])
+
+    def test_startup_update_lock_is_scoped_to_recovery_not_server_lifetime(self) -> None:
+        source = textwrap.dedent(inspect.getsource(appdock.main))
+        tree = ast.parse(source)
+        lock_blocks = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.With)
+            and any(
+                isinstance(item.context_expr, ast.Call)
+                and isinstance(item.context_expr.func, ast.Name)
+                and item.context_expr.func.id == "acquire_update_lock"
+                for item in node.items
+            )
+        ]
+        self.assertEqual(len(lock_blocks), 1)
+        locked_source = "\n".join(ast.get_source_segment(source, node) or "" for node in lock_blocks[0].body)
+        self.assertIn("recover_update_transactions", locked_source)
+        self.assertNotIn("ThreadingHTTPServer", locked_source)
+        self.assertNotIn("serve_forever", locked_source)
+
+    def test_update_lock_runtime_creation_failure_is_user_facing_and_fail_closed(self) -> None:
+        data = self.root / "bad-lock-data"
+        data.mkdir()
+        (data / "runtime").write_text("not a directory", encoding="utf-8")
+        with self.assertRaises(AppDockError):
+            acquire_update_lock(data)
+
+    def test_update_entrypoints_lock_startup_recovery_and_helper_sequence(self) -> None:
+        main_source = inspect.getsource(appdock.main)
+        helper_source = inspect.getsource(update_helper.run)
+        stage_source = inspect.getsource(appdock.stage_coordinated_update)
+        self.assertLess(main_source.index("with acquire_update_lock(config.data_root)"), main_source.index("recover_update_transactions"))
+        self.assertLess(helper_source.index("temporary.replace(handshake)"), helper_source.index("while _alive(pid)"))
+        self.assertLess(helper_source.index("while _alive(pid)"), helper_source.index("with acquire_update_lock(data)"))
+        self.assertIn("coordinator.retain_update_lock(update_lock)", stage_source)
+        self.assertIn("Handler.coordinator.release_update_lock()", main_source)
+        self.assertIn("close_fds=True", inspect.getsource(appdock.launch_update_helper))
+        self.assertIn("close_fds=True", inspect.getsource(update_helper._launch_and_wait))
+
+    def test_stage_coordinator_releases_lock_on_staging_failure(self) -> None:
+        coordinator = appdock.UpdateCoordinator()
+        with patch("appdock.acquire_update_lock") as acquire:
+            lock = acquire.return_value
+            def failing_stager(*_args, **_kwargs):
+                raise AppDockError("stage failed")
+            with self.assertRaises(AppDockError):
+                appdock.stage_coordinated_update(
+                    {"version": "0.2.0"}, self.config, coordinator,
+                    repository="owner/repo", stager=failing_stager,
+                )
+        lock.release.assert_called_once()
+
+    def test_stage_coordinator_cancels_when_lock_acquisition_fails(self) -> None:
+        coordinator = appdock.UpdateCoordinator()
+        with patch("appdock.acquire_update_lock", side_effect=AppDockError("busy")):
+            with self.assertRaises(AppDockError):
+                appdock.stage_coordinated_update(
+                    {"version": "0.2.0"}, self.config, coordinator,
+                    repository="owner/repo", stager=lambda *_args, **_kwargs: {"digest": "unused"},
+                )
+        lock = SimpleNamespace(release=lambda: None)
+        with patch("appdock.acquire_update_lock", return_value=lock):
+            staged = appdock.stage_coordinated_update(
+                {"version": "0.2.0"}, self.config, coordinator,
+                repository="owner/repo", stager=lambda *_args, **_kwargs: {"digest": "recovered"},
+            )
+        self.assertEqual(staged["digest"], "recovered")
+        coordinator.release_update_lock()
+
+    def test_release_workflow_separates_read_only_build_artifacts_from_publish(self) -> None:
+        workflow = (Path(__file__).parents[1] / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+        self.assertRegex(workflow, r"(?m)^permissions:\s*\n\s+contents: read\s*$")
+        build = re.search(r"(?ms)^  build:\n(.*?)(?=^  publish:\n)", workflow)
+        publish = re.search(r"(?ms)^  publish:\n(.*)\Z", workflow)
+        self.assertIsNotNone(build)
+        self.assertIsNotNone(publish)
+        build_text = build.group(1)
+        publish_text = publish.group(1)
+        self.assertIn("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a", build_text)
+        self.assertIn("dist/appdock-windows.zip", build_text)
+        self.assertIn("dist/SHA256SUMS.txt", build_text)
+        self.assertRegex(publish_text, r"needs:\s+build")
+        self.assertRegex(publish_text, r"permissions:\s*\n\s+contents: write")
+        self.assertIn("actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093", publish_text)
+        self.assertIn("'release', 'create'", publish_text)
+        self.assertNotIn("actions/checkout@", publish_text)
+        self.assertNotIn("build_portable.py", publish_text)
+        self.assertNotIn("python -m unittest", publish_text)
+        self.assertIn("v0.1.1", publish_text)
+
     def test_update_coordinator_atomically_claims_one_apply(self) -> None:
         coordinator = appdock.UpdateCoordinator()
         coordinator.store({"digest": "confirmed", "version": "0.2.0"})
@@ -520,6 +694,7 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.assertTrue(staged_path.is_dir())
         claimed = coordinator.claim(str(results[0]["digest"]))
         self.assertTrue(Path(str(claimed["path"])).is_dir())
+        coordinator.release_update_lock()
 
     def test_update_helper_preserves_option_like_restart_arguments(self) -> None:
         install = self.root / "install"

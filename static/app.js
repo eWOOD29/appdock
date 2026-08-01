@@ -550,14 +550,14 @@ byId("lmLoaded").addEventListener("click", (event) => {
 });
 function closeDrawer() {
   const drawer = byId("drawer");
-  drawer.classList.remove("open"); drawer.setAttribute("aria-hidden", "true");
+  drawer.classList.remove("open"); drawer.setAttribute("aria-hidden", "true"); drawer.inert = true;
   byId("drawerBackdrop").hidden = true; byId("menuButton").setAttribute("aria-expanded", "false");
   if (drawerWasOpen) byId("menuButton").focus();
   drawerWasOpen = false;
 }
 function openDrawer() {
   const drawer = byId("drawer");
-  drawerWasOpen = true; drawer.classList.add("open"); drawer.setAttribute("aria-hidden", "false");
+  drawerWasOpen = true; drawer.inert = false; drawer.classList.add("open"); drawer.setAttribute("aria-hidden", "false");
   byId("drawerBackdrop").hidden = false; byId("menuButton").setAttribute("aria-expanded", "true");
   byId("dashboardLink").focus();
 }
