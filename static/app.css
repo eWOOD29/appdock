@@ -52,6 +52,7 @@ button, summary, a { -webkit-tap-highlight-color: transparent; }
 .drawer-nav button[aria-current="page"] { border-color: var(--accent); background: rgba(0, 150, 255, .15); }
 .nav-badge { min-width: 22px; padding: 1px 6px; border-radius: 999px; background: var(--warn); color: #201b0a; font-size: 12px; font-weight: 800; text-align: center; }
 .update-banner { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 18px; padding: 12px 14px; border: 1px solid rgba(255, 209, 102, .45); border-radius: 8px; background: rgba(255, 209, 102, .09); color: var(--text); }
+.update-banner[hidden] { display: none; }
 .update-banner span { margin-left: 5px; color: var(--muted); }
 .view[hidden], .drawer-backdrop[hidden] { display: none; }
 

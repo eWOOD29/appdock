@@ -258,6 +258,8 @@ class V020Tests(unittest.TestCase):
         self.assertNotRegex(script, r"\bon(?:click|change|submit|input)\s*=")
         self.assertNotIn("innerHTML", script)
         self.assertIn("textContent", script)
+        css = (Path(__file__).parents[1] / "static/app.css").read_text(encoding="utf-8")
+        self.assertIn(".update-banner[hidden]", css)
 
     def test_public_docs_describe_optional_lm_updates_and_separate_data(self) -> None:
         root = Path(__file__).parents[1]
