@@ -2643,35 +2643,147 @@ def _parse_release_manifest(data: bytes) -> dict[str, str]:
     return inventory
 
 
-def _release_path(root: Path, relative: str) -> Path:
-    target = (root / Path(*PurePosixPath(relative).parts)).resolve()
-    if not _inside(target, root):
+def _release_path(root: Path, relative: str, *, require_file: bool = True) -> Path:
+    root = root.expanduser().absolute()
+    _assert_safe_directory_ancestors(root)
+    target_lexical = root / Path(*PurePosixPath(relative).parts)
+    _assert_no_link_or_reparse_ancestor(target_lexical)
+    if _is_link_or_reparse(target_lexical):
+        raise AppDockError("release inventory member is a symlink or reparse point")
+    target = target_lexical.resolve()
+    if not _inside(target, root) or (require_file and not target.is_file()):
         raise AppDockError("release inventory path escapes its root")
     return target
 
 
 def _load_release_inventory(root: Path, *, complete: bool) -> dict[str, str]:
+    root = root.expanduser().absolute()
+    _assert_safe_directory_ancestors(root)
+    if _is_link_or_reparse(root):
+        raise AppDockError("release tree root is unsafe")
     manifest_path = root / RELEASE_MANIFEST_NAME
     if not manifest_path.is_file() or manifest_path.is_symlink():
         if complete:
             raise AppDockError("release inventory is missing")
         return {}
+    _assert_no_link_or_reparse_ancestor(manifest_path)
+    manifest_stat = manifest_path.stat()
+    if not stat.S_ISREG(manifest_stat.st_mode) or manifest_stat.st_nlink != 1:
+        raise AppDockError("release inventory is not a regular single-link file")
     inventory = _parse_release_manifest(manifest_path.read_bytes())
     if complete:
         actual: set[str] = set()
         for path in root.rglob("*"):
-            if path.is_symlink():
-                raise AppDockError("release tree contains a symlink")
+            if path.is_symlink() or _is_link_or_reparse(path):
+                raise AppDockError("release tree contains a symlink or reparse point")
             if path.is_file():
                 actual.add(path.relative_to(root).as_posix())
         expected = {*inventory, RELEASE_MANIFEST_NAME}
         if actual != expected:
             raise AppDockError("release tree does not match its inventory")
         for relative, expected_digest in inventory.items():
-            actual_digest = hashlib.sha256(_release_path(root, relative).read_bytes()).hexdigest()
+            target = _release_path(root, relative)
+            metadata = target.stat()
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise AppDockError("release tree contains an unsafe file")
+            actual_digest = hashlib.sha256(target.read_bytes()).hexdigest()
             if actual_digest != expected_digest:
                 raise AppDockError("release file checksum does not match its inventory")
     return inventory
+
+
+def _staged_inventory_records(staged: Path, inventory: dict[str, str]) -> list[dict[str, Any]]:
+    return [
+        {"path": relative, "sha256": digest, "size": _release_path(staged, relative).stat().st_size}
+        for relative, digest in sorted(inventory.items())
+    ]
+
+
+def _staged_identity(staged: Path, *, zip_sha256: str | None = None, complete: bool = True) -> dict[str, Any]:
+    inventory = _load_release_inventory(staged, complete=complete)
+    records = _staged_inventory_records(staged, inventory)
+    helper = _release_path(staged, "scripts/update_helper.py")
+    helper_digest = hashlib.sha256(helper.read_bytes()).hexdigest()
+    identity = {
+        "zip_sha256": zip_sha256,
+        "inventory_sha256": hashlib.sha256(_canonical_json(records)).hexdigest(),
+        "helper_sha256": helper_digest,
+        "inventory": records,
+    }
+    if zip_sha256 is not None and not re.fullmatch(r"[0-9a-f]{64}", zip_sha256):
+        raise AppDockError("staged update ZIP identity is invalid")
+    return identity
+
+
+def _verify_identity_tree(root: Path, identity: dict[str, Any], *, complete: bool) -> dict[str, Any]:
+    verified = _validate_staged_identity(identity, require_zip=identity.get("zip_sha256") is not None)
+    actual = _staged_identity(root, zip_sha256=verified["zip_sha256"], complete=complete)
+    if actual != verified:
+        raise AppDockError("staged update identity does not match staged bytes")
+    return actual
+
+
+def _validate_staged_identity(identity: Any, *, require_zip: bool = True) -> dict[str, Any]:
+    if not isinstance(identity, dict) or set(identity) != {"zip_sha256", "inventory_sha256", "helper_sha256", "inventory"}:
+        raise AppDockError("staged update identity is invalid")
+    zip_sha256 = identity["zip_sha256"]
+    if zip_sha256 is not None and (not isinstance(zip_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", zip_sha256)):
+        raise AppDockError("staged update ZIP identity is invalid")
+    if require_zip and zip_sha256 is None:
+        raise AppDockError("staged update ZIP identity is missing")
+    for field_name in ("inventory_sha256", "helper_sha256"):
+        if not isinstance(identity[field_name], str) or not re.fullmatch(r"[0-9a-f]{64}", identity[field_name]):
+            raise AppDockError("staged update identity checksum is invalid")
+    records = identity["inventory"]
+    if not isinstance(records, list) or not records:
+        raise AppDockError("staged update inventory identity is invalid")
+    previous = ""
+    normalized: list[dict[str, Any]] = []
+    for record in records:
+        if not isinstance(record, dict) or set(record) != {"path", "sha256", "size"}:
+            raise AppDockError("staged update inventory identity is invalid")
+        relative, digest, size = record["path"], record["sha256"], record["size"]
+        if not isinstance(relative, str) or relative <= previous or "\\" in relative or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise AppDockError("staged update inventory identity is invalid")
+        try:
+            _assert_zip_member(relative, zipfile.ZipInfo(relative))
+        except AppDockError as exc:
+            raise AppDockError("staged update inventory identity is invalid") from exc
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            raise AppDockError("staged update inventory identity is invalid")
+        previous = relative
+        normalized.append({"path": relative, "sha256": digest, "size": size})
+    if hashlib.sha256(_canonical_json(normalized)).hexdigest() != identity["inventory_sha256"]:
+        raise AppDockError("staged update inventory identity digest is invalid")
+    return {"zip_sha256": zip_sha256, "inventory_sha256": identity["inventory_sha256"], "helper_sha256": identity["helper_sha256"], "inventory": normalized}
+
+
+def _staged_record_digest(version: str, identity: dict[str, Any]) -> str:
+    return _digest({"version": version, "identity": identity})
+
+
+def _verify_staged_record(config: AppDockConfig, record: dict[str, Any], *, require_zip: bool = True) -> dict[str, Any]:
+    if not isinstance(record, dict):
+        raise AppDockError("staged update receipt is invalid")
+    allowed = {"version", "path", "digest", "identity"}
+    if set(record) == allowed:
+        pass
+    elif set(record) == {"staged", *allowed} and record.get("staged") is True:
+        pass
+    else:
+        raise AppDockError("staged update receipt is invalid")
+    version = record["version"]
+    raw_path = record["path"]
+    digest = record["digest"]
+    identity = record["identity"]
+    if not isinstance(version, str) or not SEMVER_RE.fullmatch(version) or not isinstance(raw_path, str) or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise AppDockError("staged update receipt is invalid")
+    normalized_identity = _validate_staged_identity(identity, require_zip=require_zip)
+    staged = _validate_staged_path(config, version, raw_path)
+    actual = _staged_identity(staged, zip_sha256=normalized_identity["zip_sha256"])
+    if actual != normalized_identity or _staged_record_digest(version, actual) != digest:
+        raise AppDockError("staged update identity does not match staged bytes")
+    return {"staged": True, "version": version, "path": str(staged), "digest": digest, "identity": actual}
 
 
 def validate_zip(data: bytes) -> list[str]:
@@ -2739,39 +2851,40 @@ def _read_staged_receipt(config: AppDockConfig) -> dict[str, Any] | None:
     receipt_path = _staged_receipt_path(config)
     if not receipt_path.exists():
         return None
+    _assert_no_link_or_reparse_ancestor(receipt_path)
+    receipt_stat = receipt_path.stat()
+    if _is_link_or_reparse(receipt_path) or not stat.S_ISREG(receipt_stat.st_mode) or receipt_stat.st_nlink != 1:
+        raise AppDockError("staged update receipt is unsafe")
     receipt = _read_bounded_json(receipt_path)
     if (
         not isinstance(receipt, dict)
-        or set(receipt) != {"schema_version", "version", "path", "digest"}
-        or receipt.get("schema_version") != 1
-        or not isinstance(receipt.get("version"), str)
-        or not SEMVER_RE.fullmatch(receipt["version"])
-        or not isinstance(receipt.get("path"), str)
-        or not isinstance(receipt.get("digest"), str)
-        or not re.fullmatch(r"[0-9a-f]{64}", receipt["digest"])
+        or set(receipt) != {"schema_version", "version", "path", "digest", "identity"}
+        or receipt.get("schema_version") != 2
     ):
         raise AppDockError("staged update receipt is invalid")
-    staged = _validate_staged_path(config, receipt["version"], receipt["path"])
-    return {
-        "staged": True,
+    return _verify_staged_record(config, {
         "version": receipt["version"],
-        "path": str(staged),
+        "path": receipt["path"],
         "digest": receipt["digest"],
-    }
+        "identity": receipt["identity"],
+    })
 
 
 def _write_staged_receipt(config: AppDockConfig, staged: dict[str, Any]) -> None:
-    version = staged.get("version")
-    raw_path = staged.get("path")
-    digest = staged.get("digest")
-    if not isinstance(version, str) or not isinstance(raw_path, str) or not isinstance(digest, str):
+    if not isinstance(staged, dict) or set(staged) != {"staged", "version", "path", "digest", "identity"} or staged.get("staged") is not True:
         raise AppDockError("staged update receipt data is invalid")
-    staged_path = _validate_staged_path(config, version, raw_path)
+    verified = _verify_staged_record(config, {
+        "version": staged["version"],
+        "path": staged["path"],
+        "digest": staged["digest"],
+        "identity": staged["identity"],
+    })
     _durable_write_json(_staged_receipt_path(config), {
-        "schema_version": 1,
-        "version": version,
-        "path": str(staged_path),
-        "digest": digest,
+        "schema_version": 2,
+        "version": verified["version"],
+        "path": verified["path"],
+        "digest": verified["digest"],
+        "identity": verified["identity"],
     })
 
 
@@ -2804,7 +2917,7 @@ def stage_update(release: dict[str, Any], config: AppDockConfig, *, opener: Call
     opener = opener or urllib.request.urlopen
     zip_bytes = _read_asset(opener, assets["appdock-windows.zip"]["url"], MAX_UPDATE_ASSET_BYTES)
     sums = _read_asset(opener, assets["SHA256SUMS.txt"]["url"], 1024 * 1024).decode("utf-8", "replace")
-    verify_sha256(zip_bytes, sums)
+    zip_sha256 = verify_sha256(zip_bytes, sums)
     validate_zip(zip_bytes)
     config.ensure()
     if _staged_receipt_path(config).exists():
@@ -2828,7 +2941,14 @@ def stage_update(release: dict[str, Any], config: AppDockConfig, *, opener: Call
     except Exception:
         _remove_tree(temporary, ignore_errors=True)
         raise
-    result = {"staged": True, "version": version, "path": str(destination), "digest": _digest({"version": version, "release_url": release.get("release_url"), "assets": assets})}
+    result_identity = _staged_identity(destination, zip_sha256=zip_sha256)
+    result = {
+        "staged": True,
+        "version": version,
+        "path": str(destination),
+        "identity": result_identity,
+        "digest": _staged_record_digest(version, result_identity),
+    }
     try:
         _write_staged_receipt(config, result)
     except Exception:
@@ -2847,7 +2967,7 @@ def _update_transactions_root(data: Path) -> Path:
 
 def _update_journal(tx_root: Path) -> dict[str, Any]:
     journal = _read_bounded_json(tx_root / "transaction.json")
-    required = {"schema_version", "operation_id", "install", "candidate", "backup", "old_exists", "phase", "recovery", "files", "preexisting"}
+    required = {"schema_version", "operation_id", "install", "candidate", "backup", "old_exists", "phase", "recovery", "files", "preexisting", "identity"}
     if (
         not isinstance(journal, dict)
         or set(journal) != required
@@ -2859,6 +2979,7 @@ def _update_journal(tx_root: Path) -> dict[str, Any]:
         or not isinstance(journal.get("preexisting"), list)
     ):
         raise AppDockError("update transaction is invalid")
+    _validate_staged_identity(journal["identity"], require_zip=journal["identity"].get("zip_sha256") is not None)
     return journal
 
 
@@ -2954,8 +3075,11 @@ def _recover_one_update(tx_root: Path, *, phase_hook: Callable[[str], None] | No
         phase_hook("recovery:finish-new" if finish_new else "recovery:restore-old")
     if finish_new:
         if not install.exists() and candidate.is_dir():
+            _verify_identity_tree(candidate, journal["identity"], complete=False)
             os.replace(candidate, install)
             _fsync_directory(install.parent)
+        if install.exists():
+            _verify_identity_tree(install, journal["identity"], complete=False)
         _validate_installed_tree(install)
         if backup.exists():
             _remove_tree(backup)
@@ -2976,6 +3100,7 @@ def _recover_one_update(tx_root: Path, *, phase_hook: Callable[[str], None] | No
     elif install.exists():
         _remove_tree(install)
     if candidate.exists():
+        _verify_identity_tree(candidate, journal["identity"], complete=False)
         _remove_tree(candidate)
     _remove_tree(tx_root.parent.parent / "backups" / journal["operation_id"], ignore_errors=True)
     _set_update_phase(tx_root, journal, "rolled_back", "restore-old")
@@ -3022,6 +3147,7 @@ def apply_update(
     *,
     restart: Callable[[], Any] | None = None,
     phase_hook: Callable[[str], None] | None = None,
+    expected_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     staged_lexical = Path(staged_dir).expanduser().absolute()
     install, data = _validated_update_roots(install_dir, data_dir)
@@ -3032,7 +3158,18 @@ def apply_update(
         raise AppDockError("staged update path is invalid")
     _assert_tree_safe(staged_lexical, data / "updates")
     recover_update_transactions(data, expected_install=install)
-    target_inventory = _load_release_inventory(staged, complete=True)
+    if expected_identity is None:
+        target_identity = _staged_identity(staged, complete=True)
+    elif isinstance(expected_identity, dict) and "identity" in expected_identity:
+        config = AppDockConfig.from_environment(data_dir=data)
+        verified_record = _verify_staged_record(config, expected_identity)
+        if Path(verified_record["path"]).resolve() != staged:
+            raise AppDockError("staged update identity path does not match apply path")
+        target_identity = verified_record["identity"]
+    else:
+        target_identity = _validate_staged_identity(expected_identity)
+        _verify_identity_tree(staged, target_identity, complete=True)
+    target_inventory = {record["path"]: record["sha256"] for record in target_identity["inventory"]}
     current_inventory, generated = _validate_installed_tree(install)
     target_files = {*target_inventory, RELEASE_MANIFEST_NAME}
     current_files = set(current_inventory)
@@ -3061,11 +3198,12 @@ def apply_update(
     try:
         _copy_release_tree(staged, candidate)
         for relative in generated:
-            _durable_copy(_release_path(install, relative), _release_path(candidate, relative))
+            _durable_copy(_release_path(install, relative), _release_path(candidate, relative, require_file=False))
         _load_release_inventory(candidate, complete=False)
         candidate_inventory, candidate_generated = _validate_installed_tree(candidate)
         if candidate_inventory != target_inventory or candidate_generated != generated:
             raise AppDockError("candidate program tree verification failed")
+        _verify_identity_tree(candidate, target_identity, complete=False)
     except Exception:
         _remove_tree(candidate, ignore_errors=True)
         _remove_tree(tx_root, ignore_errors=True)
@@ -3081,6 +3219,7 @@ def apply_update(
         "recovery": "restore-old",
         "files": affected,
         "preexisting": sorted(current_files),
+        "identity": target_identity,
     }
     _durable_write_json(tx_root / "transaction.json", journal)
     if phase_hook:
@@ -3090,6 +3229,7 @@ def apply_update(
         "backup": str(backup),
         "files": affected,
         "preexisting": sorted(current_files),
+        "identity": target_identity,
         "transaction": str(tx_root / "transaction.json"),
     }
     try:
@@ -3130,6 +3270,7 @@ def finalize_update(applied: dict[str, Any], install_dir: str | Path, data_dir: 
     journal = _update_journal(tx_root)
     if Path(journal["install"]).resolve() != install or journal["phase"] != "committed":
         raise AppDockError("update transaction is not ready to finalize")
+    _verify_identity_tree(install, journal["identity"], complete=False)
     _recover_one_update(tx_root)
 
 
@@ -3195,6 +3336,7 @@ def launch_update_helper(
     helper_path: str | Path | None = None,
     popen: Callable[..., Any] | None = None,
     restart_args: Iterable[str] = (),
+    expected_identity: dict[str, Any] | None = None,
 ) -> Any:
     """Start the stdlib updater outside the AppDock process.
 
@@ -3208,11 +3350,30 @@ def launch_update_helper(
         _assert_no_link_or_reparse_ancestor(root)
     if _is_development_checkout(install):
         raise AppDockError("one-click updates are disabled in a .git checkout; use git pull")
-    helper = Path(helper_path).expanduser().resolve() if helper_path else staged / "scripts" / "update_helper.py"
+    helper = Path(helper_path).expanduser().absolute() if helper_path else staged / "scripts" / "update_helper.py"
     if not _inside(staged, data / "updates"):
         raise AppDockError("staged update path is invalid")
     if not helper.is_file() or helper.is_symlink() or not _inside(helper, staged):
         raise AppDockError("verified staged update helper is not installed")
+    staged_config = AppDockConfig.from_environment(data_dir=data)
+    claimed_record = expected_identity if isinstance(expected_identity, dict) and "identity" in expected_identity else None
+    if claimed_record is not None:
+        verified_claim = _verify_staged_record(staged_config, claimed_record)
+        identity = verified_claim["identity"]
+    else:
+        identity = _staged_identity(staged)
+        if expected_identity is not None:
+            identity_claim = _validate_staged_identity(expected_identity)
+            if identity_claim["inventory_sha256"] != identity["inventory_sha256"] or identity_claim["helper_sha256"] != identity["helper_sha256"] or identity_claim["inventory"] != identity["inventory"]:
+                raise AppDockError("staged update identity does not match staged bytes")
+            identity = identity_claim
+    if hashlib.sha256(helper.read_bytes()).hexdigest() != identity["helper_sha256"]:
+        raise AppDockError("staged update helper checksum does not match its identity")
+    if claimed_record is not None:
+        # The stage is user-writable after staging. Revalidate the complete
+        # receipt/tree a second time immediately before constructing Popen.
+        verified_claim = _verify_staged_record(staged_config, claimed_record)
+        identity = verified_claim["identity"]
     command = [sys.executable, str(install / "appdock.py"), *list(restart_args)] if restart_command is None else restart_command
     if not isinstance(command, list) or not command or not all(isinstance(item, str) and item for item in command):
         raise AppDockError("restart command is invalid")
@@ -3231,6 +3392,14 @@ def launch_update_helper(
     handshake.parent.mkdir(parents=True, exist_ok=True)
     handshake.unlink(missing_ok=True)
     helper_command.extend(["--handshake", str(handshake), "--handshake-token", handshake_token])
+    if claimed_record is not None:
+        helper_command.extend([
+            "--expected-version", verified_claim["version"],
+            "--expected-digest", verified_claim["digest"],
+            "--expected-zip-sha256", identity["zip_sha256"],
+            "--expected-inventory-sha256", identity["inventory_sha256"],
+            "--expected-helper-sha256", identity["helper_sha256"],
+        ])
     if command and command[0] != sys.executable:
         raise AppDockError("restart command must use the configured Python executable")
     for argument in command[2:]:
@@ -3640,7 +3809,11 @@ class Handler(BaseHTTPRequestHandler):
                 install_dir = Path(__file__).resolve().parent
                 restart_args = ["--host", str(self.server.server_address[0]), "--port", str(self.server.server_address[1]), "--data-dir", str(self.config.data_root)]
                 try:
-                    launch_update_helper(staged["path"], install_dir, self.config.data_root, current_pid=os.getpid(), restart_args=restart_args)
+                    launch_update_helper(
+                        staged["path"], install_dir, self.config.data_root,
+                        current_pid=os.getpid(), restart_args=restart_args,
+                        expected_identity=staged,
+                    )
                 except Exception:
                     Handler.coordinator.restore(staged)
                     Handler.coordinator.release_update_lock()

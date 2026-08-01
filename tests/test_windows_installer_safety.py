@@ -125,16 +125,22 @@ Write-Output 'legacy marker accepted'
         with tempfile.TemporaryDirectory() as temp:
             install = (Path(temp).resolve() / "AppDock")
             exact = f'python.exe "{install / "appdock.py"}" --port 8765'
+            exact_unquoted = f'python.exe {install / "appdock.py"} --port 8765'
             prefix_collision = f'python.exe "{install}-dev\\appdock.py" --port 8765'
             relative = 'python.exe appdock.py --port 8765'
             config_collision = f'python.exe other.py --config "{install / "appdock.py"}"'
+            quoted_executable_collision = f'"{install / "notpython.exe"}" "{install / "appdock.py"}"'
+            unquoted_executable_collision = f'{install / "notpython.exe"} "{install / "appdock.py"}"'
             payload = json.dumps(
                 {
                     "install": str(install),
                     "exact": exact,
+                    "exact_unquoted": exact_unquoted,
                     "prefix": prefix_collision,
                     "relative": relative,
                     "config": config_collision,
+                    "quoted_executable_collision": quoted_executable_collision,
+                    "unquoted_executable_collision": unquoted_executable_collision,
                 }
             ).replace("'", "''")
             probe = rf"""
@@ -142,9 +148,12 @@ $ErrorActionPreference = 'Stop'
 . .\scripts\path_safety.ps1
 $case = ConvertFrom-Json '{payload}'
 if (-not (Test-AppDockOwnedProcessCommandLine -CommandLine $case.exact -InstallDir $case.install)) {{ throw 'exact entry point was not matched' }}
+if (-not (Test-AppDockOwnedProcessCommandLine -CommandLine $case.exact_unquoted -InstallDir $case.install)) {{ throw 'unquoted exact entry point was not matched' }}
 if (Test-AppDockOwnedProcessCommandLine -CommandLine $case.prefix -InstallDir $case.install) {{ throw 'prefix collision was matched' }}
 if (Test-AppDockOwnedProcessCommandLine -CommandLine $case.relative -InstallDir $case.install) {{ throw 'relative ambiguous entry point was matched' }}
 if (Test-AppDockOwnedProcessCommandLine -CommandLine $case.config -InstallDir $case.install) {{ throw 'non-entry-point config token was matched' }}
+if (Test-AppDockOwnedProcessCommandLine -CommandLine $case.quoted_executable_collision -InstallDir $case.install) {{ throw 'quoted executable suffix collision was matched' }}
+if (Test-AppDockOwnedProcessCommandLine -CommandLine $case.unquoted_executable_collision -InstallDir $case.install) {{ throw 'unquoted executable suffix collision was matched' }}
 Write-Output 'process ownership probe passed'
 """
             result = self.run_probe(probe)

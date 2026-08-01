@@ -5,6 +5,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import subprocess
 import sys
 import time
@@ -17,9 +18,52 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from appdock import _assert_no_link_or_reparse_ancestor, _clear_staged_receipt, _is_link_or_reparse, _remove_tree, _update_lock_path, _write_update_startup_handoff, acquire_update_lock, apply_update, finalize_update, recover_update_transactions, rollback_update  # noqa: E402
+from appdock import AppDockError, AppDockConfig, _assert_no_link_or_reparse_ancestor, _clear_staged_receipt, _is_link_or_reparse, _read_staged_receipt, _remove_tree, _update_lock_path, _write_update_startup_handoff, acquire_update_lock, apply_update, finalize_update, recover_update_transactions, rollback_update  # noqa: E402
 
 RESTART_READY_TIMEOUT_SECONDS = 20.0
+
+
+def _safe_append_update_log(path: Path, message: str) -> None:
+    """Append one line without following an unsafe or multiply-linked log file."""
+    path = path.expanduser().absolute()
+    _assert_no_link_or_reparse_ancestor(path.parent)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _assert_no_link_or_reparse_ancestor(path.parent)
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+    binary_flag = getattr(os, "O_BINARY", 0)
+    flags |= binary_flag
+    for attempt in range(2):
+        existed = path.exists()
+        before = path.stat() if existed else None
+        if existed:
+            if _is_link_or_reparse(path) or before is None or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                raise AppDockError("update log is not a regular single-link file")
+        else:
+            flags |= os.O_EXCL
+        try:
+            descriptor = os.open(path, flags, 0o600)
+        except FileExistsError:
+            flags &= ~os.O_EXCL
+            continue
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+                raise AppDockError("update log opened as an unsafe file")
+            if before is not None and (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+                raise AppDockError("update log changed while opening")
+            with os.fdopen(descriptor, "a", encoding="utf-8", newline="") as stream:
+                descriptor = -1
+                stream.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+                after = os.fstat(stream.fileno())
+                if not stat.S_ISREG(after.st_mode) or after.st_nlink != 1:
+                    raise AppDockError("update log changed link identity while writing")
+        finally:
+            if descriptor != -1:
+                os.close(descriptor)
+        return
+    raise AppDockError("update log could not be created safely")
 
 
 def _alive(pid: int) -> bool:
@@ -123,6 +167,36 @@ def _restart_data_dir(restart_args: list[str]) -> Path | None:
     return None
 
 
+def _verify_helper_identity(
+    staged: Path,
+    data: Path,
+    *,
+    expected_version: str | None,
+    expected_digest: str | None,
+    expected_zip_sha256: str | None,
+    expected_inventory_sha256: str | None,
+    expected_helper_sha256: str | None,
+) -> dict[str, object] | None:
+    config = AppDockConfig.from_environment(data_dir=data)
+    receipt = _read_staged_receipt(config)
+    expected = (expected_version, expected_digest, expected_zip_sha256, expected_inventory_sha256, expected_helper_sha256)
+    if any(value is not None for value in expected):
+        if receipt is None or any(not isinstance(value, str) for value in expected):
+            raise AppDockError("helper update identity arguments are incomplete")
+        if receipt["version"] != expected_version or receipt["digest"] != expected_digest:
+            raise AppDockError("helper update receipt claim does not match")
+        identity = receipt["identity"]
+        if (
+            identity["zip_sha256"] != expected_zip_sha256
+            or identity["inventory_sha256"] != expected_inventory_sha256
+            or identity["helper_sha256"] != expected_helper_sha256
+        ):
+            raise AppDockError("helper update identity claim does not match")
+    if receipt is not None and Path(receipt["path"]).expanduser().absolute() != staged.expanduser().absolute():
+        raise AppDockError("helper staged path does not match its receipt")
+    return receipt
+
+
 def _launch_and_wait(
     restart_script: Path,
     install: Path,
@@ -171,15 +245,18 @@ def run(
     handshake: Path | None = None,
     handshake_token: str | None = None,
     phase_hook: object | None = None,
+    expected_version: str | None = None,
+    expected_digest: str | None = None,
+    expected_zip_sha256: str | None = None,
+    expected_inventory_sha256: str | None = None,
+    expected_helper_sha256: str | None = None,
 ) -> int:
     data = data.expanduser().absolute()
     _update_lock_path(data)
     log_path = data / "runtime" / "update.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
 
     def log(message: str) -> None:
-        with log_path.open("a", encoding="utf-8") as stream:
-            stream.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+        _safe_append_update_log(log_path, message)
 
     log(f"update helper started for pid {pid}")
     if handshake is not None and handshake_token is not None:
@@ -189,11 +266,30 @@ def run(
     while _alive(pid):
         time.sleep(0.2)
     try:
+        claimed_identity = _verify_helper_identity(
+            staged,
+            data,
+            expected_version=expected_version,
+            expected_digest=expected_digest,
+            expected_zip_sha256=expected_zip_sha256,
+            expected_inventory_sha256=expected_inventory_sha256,
+            expected_helper_sha256=expected_helper_sha256,
+        )
+    except Exception as exc:
+        log(f"update helper identity verification failed: {exc}")
+        return 1
+    try:
         with acquire_update_lock(data):
             recover_update_transactions(data, expected_install=install)
             service_restored = False
             try:
-                result = apply_update(staged, install, data, phase_hook=phase_hook if callable(phase_hook) else None)
+                result = apply_update(
+                    staged,
+                    install,
+                    data,
+                    phase_hook=phase_hook if callable(phase_hook) else None,
+                    expected_identity=claimed_identity,
+                )
                 log(f"update applied: {result['files']}")
                 log("restarting AppDock with a fixed argument list")
                 try:
@@ -237,6 +333,11 @@ def main() -> int:
     parser.add_argument("--restart-arg", action="append", default=[])
     parser.add_argument("--handshake", type=Path, required=True)
     parser.add_argument("--handshake-token", required=True)
+    parser.add_argument("--expected-version", required=True)
+    parser.add_argument("--expected-digest", required=True)
+    parser.add_argument("--expected-zip-sha256", required=True)
+    parser.add_argument("--expected-inventory-sha256", required=True)
+    parser.add_argument("--expected-helper-sha256", required=True)
     args = parser.parse_args()
     data = args.data.expanduser().absolute()
     try:
@@ -263,6 +364,11 @@ def main() -> int:
         list(args.restart_arg),
         handshake=handshake,
         handshake_token=args.handshake_token,
+        expected_version=args.expected_version,
+        expected_digest=args.expected_digest,
+        expected_zip_sha256=args.expected_zip_sha256,
+        expected_inventory_sha256=args.expected_inventory_sha256,
+        expected_helper_sha256=args.expected_helper_sha256,
     )
 
 

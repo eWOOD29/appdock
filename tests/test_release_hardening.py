@@ -100,6 +100,16 @@ class ReleaseHardeningTests(unittest.TestCase):
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(content)
 
+    def staged_record(self, root: Path, version: str, *, zip_sha256: str = "a" * 64) -> dict[str, object]:
+        identity = appdock._staged_identity(root, zip_sha256=zip_sha256)
+        return {
+            "staged": True,
+            "version": version,
+            "path": str(root),
+            "digest": appdock._staged_record_digest(version, identity),
+            "identity": identity,
+        }
+
     def test_local_registration_preserves_cwd_and_private_env(self) -> None:
         source = self.root / "source"
         self.write_manifest(source, cwd="server", env={"APP_MODE": "local"})
@@ -650,18 +660,22 @@ class ReleaseHardeningTests(unittest.TestCase):
     def test_fresh_coordinator_rehydrates_stage_after_staging_process_loss(self) -> None:
         staged = self.config.updates_root / "0.2.1"
         self.write_release_tree(staged)
-        digest = "a" * 64
+        identity = appdock._staged_identity(staged, zip_sha256="a" * 64)
+        digest = appdock._staged_record_digest("0.2.1", identity)
         stage_worker = textwrap.dedent(
             f"""
             import appdock, os
             from pathlib import Path
             config = appdock.AppDockConfig.from_environment(data_dir=Path({str(self.config.data_root)!r}))
             config.ensure()
+            staged = Path({str(staged)!r})
+            identity = appdock._staged_identity(staged, zip_sha256={'a' * 64!r})
             appdock._write_staged_receipt(config, {{
                 'staged': True,
                 'version': '0.2.1',
-                'path': str(Path({str(staged)!r})),
+                'path': str(staged),
                 'digest': {digest!r},
+                'identity': identity,
             }})
             os._exit(0)
             """
@@ -966,6 +980,163 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.assertTrue(Path(str(claimed["path"])).is_dir())
         coordinator.release_update_lock()
 
+    def test_update_helper_rejects_hardlinked_log_without_mutating_external_sentinel(self) -> None:
+        runtime = self.config.runtime_root
+        sentinel = self.root / "outside-update-log-sentinel.txt"
+        sentinel.write_text("sentinel\n", encoding="utf-8")
+        log_path = runtime / "update.log"
+        try:
+            os.link(sentinel, log_path)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"hardlink creation unavailable: {exc}")
+        with self.assertRaises(AppDockError):
+            update_helper._safe_append_update_log(log_path, "must not be written")
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "sentinel\n")
+
+    def test_update_helper_creates_and_appends_a_regular_log(self) -> None:
+        log_path = self.config.runtime_root / "update.log"
+        update_helper._safe_append_update_log(log_path, "first")
+        update_helper._safe_append_update_log(log_path, "second")
+        contents = log_path.read_text(encoding="utf-8")
+        self.assertIn(" first\n", contents)
+        self.assertIn(" second\n", contents)
+
+    def test_staged_receipt_rejects_legacy_metadata_only_identity(self) -> None:
+        staged = self.config.updates_root / "0.3.2"
+        self.write_release_tree(staged)
+        receipt = {
+            "schema_version": 1,
+            "version": "0.3.2",
+            "path": str(staged),
+            "digest": "a" * 64,
+        }
+        (self.config.runtime_root / "staged-update.json").write_text(json.dumps(receipt), encoding="utf-8")
+        with self.assertRaises(AppDockError):
+            appdock._read_staged_receipt(self.config)
+
+    def test_launch_update_helper_rejects_tampered_helper_after_staging(self) -> None:
+        install = self.root / "install-tampered-helper"
+        install.mkdir()
+        (install / "appdock.py").write_text("print('ok')", encoding="utf-8")
+        staged = self.config.updates_root / "0.3.3"
+        staged.mkdir(parents=True)
+        self.write_release_tree(staged)
+        receipt = self.staged_record(staged, "0.3.3")
+        (staged / "scripts" / "update_helper.py").write_bytes(b"tampered helper")
+        popen_calls: list[list[str]] = []
+
+        def fake_popen(command, **kwargs):
+            popen_calls.append(command)
+            raise AssertionError("tampered helper must be rejected before Popen")
+
+        with self.assertRaises(AppDockError):
+            launch_update_helper(staged, install, self.config.data_root, expected_identity=receipt, popen=fake_popen)
+        self.assertEqual(popen_calls, [])
+
+    def test_launch_update_helper_rejects_valid_alternate_tree_at_immediate_prelaunch_seam(self) -> None:
+        install = self.root / "install-prelaunch-seam"
+        install.mkdir()
+        (install / "appdock.py").write_text("print('ok')", encoding="utf-8")
+        staged = self.config.updates_root / "0.3.4"
+        staged.mkdir(parents=True)
+        self.write_release_tree(staged)
+        receipt = self.staged_record(staged, "0.3.4")
+        real_identity = appdock._staged_identity
+        calls = 0
+
+        def identity_with_swap(root, *, zip_sha256=None):
+            nonlocal calls
+            value = real_identity(root, zip_sha256=zip_sha256)
+            calls += 1
+            if calls == 1:
+                self.write_release_tree(staged, {"appdock.py": b"alternate valid release"})
+            return value
+
+        popen_calls: list[list[str]] = []
+        with patch("appdock._staged_identity", side_effect=identity_with_swap):
+            with self.assertRaises(AppDockError):
+                launch_update_helper(staged, install, self.config.data_root, expected_identity=receipt, popen=lambda command, **kwargs: popen_calls.append(command))
+        self.assertEqual(popen_calls, [])
+        self.assertGreaterEqual(calls, 2)
+
+    def test_update_helper_rejects_tamper_after_parent_wait_before_apply(self) -> None:
+        install = self.root / "install-helper-identity"
+        install.mkdir()
+        self.write_release_tree(install, {"appdock.py": b"old"})
+        staged = self.config.updates_root / "0.3.5"
+        staged.mkdir(parents=True)
+        self.write_release_tree(staged, {"appdock.py": b"new"})
+        receipt = self.staged_record(staged, "0.3.5")
+        appdock._write_staged_receipt(self.config, receipt)
+        alive_calls = 0
+
+        def alive_then_tamper(_pid):
+            nonlocal alive_calls
+            alive_calls += 1
+            if alive_calls == 1:
+                return True
+            self.write_release_tree(staged, {"appdock.py": b"alternate valid release"})
+            return False
+
+        identity = receipt["identity"]
+        with patch("scripts.update_helper._alive", side_effect=alive_then_tamper), patch(
+            "scripts.update_helper.time.sleep", return_value=None
+        ):
+            result = update_helper.run(
+                staged, install, self.config.data_root, 123, install / "appdock.py", [],
+                expected_version="0.3.5",
+                expected_digest=receipt["digest"],
+                expected_zip_sha256=identity["zip_sha256"],
+                expected_inventory_sha256=identity["inventory_sha256"],
+                expected_helper_sha256=identity["helper_sha256"],
+            )
+        self.assertEqual(result, 1)
+        self.assertEqual((install / "appdock.py").read_bytes(), b"old")
+
+    def test_apply_update_rejects_identity_mismatch_before_backup(self) -> None:
+        install = self.root / "install-apply-identity"
+        install.mkdir()
+        self.write_release_tree(install, {"appdock.py": b"old"})
+        staged = self.config.updates_root / "0.3.6"
+        staged.mkdir(parents=True)
+        self.write_release_tree(staged, {"appdock.py": b"new"})
+        receipt = self.staged_record(staged, "0.3.6")
+        self.write_release_tree(staged, {"appdock.py": b"alternate valid release"})
+        with self.assertRaises(AppDockError):
+            apply_update(staged, install, self.config.data_root, expected_identity=receipt)
+        self.assertEqual((install / "appdock.py").read_bytes(), b"old")
+
+    def test_finalize_update_rejects_installed_identity_mismatch(self) -> None:
+        install = self.root / "install-finalize-identity"
+        install.mkdir()
+        self.write_release_tree(install, {"appdock.py": b"old"})
+        staged = self.config.updates_root / "0.3.7"
+        staged.mkdir(parents=True)
+        self.write_release_tree(staged, {"appdock.py": b"new"})
+        receipt = self.staged_record(staged, "0.3.7")
+        result = apply_update(staged, install, self.config.data_root, expected_identity=receipt)
+        self.write_release_tree(install, {"appdock.py": b"forged valid release"})
+        with self.assertRaises(AppDockError):
+            appdock.finalize_update(result, install, self.config.data_root)
+
+    def test_launch_update_helper_rejects_incomplete_staged_tree_before_popen(self) -> None:
+        install = self.root / "install-incomplete-stage"
+        install.mkdir()
+        (install / "appdock.py").write_text("print('ok')", encoding="utf-8")
+        staged = self.config.updates_root / "0.3.1"
+        staged.mkdir(parents=True)
+        (staged / "scripts").mkdir()
+        (staged / "scripts" / "update_helper.py").write_text("print('helper')", encoding="utf-8")
+        popen_calls: list[list[str]] = []
+
+        def fake_popen(command, **kwargs):
+            popen_calls.append(command)
+            raise AssertionError("Popen must not be reached for an incomplete stage")
+
+        with self.assertRaises(AppDockError):
+            launch_update_helper(staged, install, self.config.data_root, popen=fake_popen)
+        self.assertEqual(popen_calls, [])
+
     def test_update_helper_preserves_option_like_restart_arguments(self) -> None:
         install = self.root / "install"
         install.mkdir()
@@ -1126,12 +1297,8 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.write_release_tree(staged, {"appdock.py": b"new"})
 
         child = SimpleNamespace(poll=lambda: None)
-        appdock._write_staged_receipt(self.config, {
-            "staged": True,
-            "version": "0.2.2",
-            "path": str(staged),
-            "digest": "c" * 64,
-        })
+        receipt = self.staged_record(staged, "0.2.2", zip_sha256="c" * 64)
+        appdock._write_staged_receipt(self.config, receipt)
 
         ready_token = "ready-token-1234567890"
 
