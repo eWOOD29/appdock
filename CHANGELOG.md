@@ -4,6 +4,16 @@ All notable changes to AppDock are documented here. The project follows Semantic
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-01
+
+### Added
+
+- Quiet automatic GitHub Releases checks with a non-modal availability banner and Updates navigation badge.
+- Explicit, confirmation-digest-protected in-UI update progress with expected-version health polling.
+- An accessible mobile-friendly navigation drawer for Dashboard, LM Studio, and Updates.
+- Optional LM Studio model inspection and safe exact-instance load/unload controls through the local `lms` CLI.
+- Public documentation for connection metadata, mutable user-data separation, and development-clone update guidance.
+
 ## [0.1.2] - 2026-07-26
 
 ### Fixed

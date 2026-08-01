@@ -17,6 +17,7 @@ AppDock server (loopback by default)
         +-- bounded app log tails
         +-- GitHub release checks / explicit imports
         +-- external update helper for stop-replace-restart
+        +-- optional LM Studio CLI snapshots and explicitly confirmed mutations
 ```
 
 AppDock is not a sandbox. A child application runs as the current Windows user. The safety model prevents accidental shell/path confusion and requires explicit user approval; it does not make untrusted code safe.
@@ -95,6 +96,10 @@ The dashboard defaults to `127.0.0.1`. State-changing routes require:
 - explicit preview/update confirmation digests.
 
 Responses use no-store and browser hardening headers. User-controlled labels, descriptions, URLs, paths, logs, and release notes are rendered as text or escaped attributes, not executable markup.
+
+## Optional LM Studio boundary
+
+LM Studio is optional. Server-side discovery checks `APPDOCK_LMS_PATH`, standard per-user LM Studio bin locations, and `PATH`; the resolved executable path is never returned to the browser. `lms ls --json` and `lms ps --json` are bounded, timeout-limited snapshots. Load maps only a canonical key from a fresh installed snapshot; unload maps only an exact identifier from a fresh loaded snapshot. Fixed argument arrays, `shell=False`, `-y`, strict allowlists, and a server mutation lock keep model operations local and serialized. Malformed, partial, unavailable, timeout, and zero-model states remain non-fatal to the core dashboard.
 
 ## Update trust chain
 

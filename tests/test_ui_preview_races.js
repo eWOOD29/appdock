@@ -44,6 +44,7 @@ function makeHarness() {
       return elements.get(id);
     },
     createElement() { return makeElement(); },
+    querySelectorAll() { return []; },
     addEventListener() {},
   };
 
@@ -65,6 +66,7 @@ function makeHarness() {
     alert() {},
     open() {},
     location: { hostname: "127.0.0.1" },
+    setTimeout() { return 1; },
     setInterval() { return 1; },
   };
   const context = vm.createContext({ console, document, fetch, URL, window, setTimeout, clearTimeout });

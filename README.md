@@ -15,7 +15,9 @@ It discovers explicit `appdock.json` manifests, shows process and health state, 
 - **Preview before trust:** inspect the resolved directory, command, URLs, and manifest before registration.
 - **Safe process launch:** argument arrays with `shell=False`; no arbitrary shell-command field.
 - **Health-aware controls:** distinguish stopped, running, healthy, unhealthy, and crashed apps.
-- **One-click updates:** check GitHub-hosted releases, verify the release's published SHA-256 checksum, stage a backup, and preserve user data.
+- **Update notifications:** quietly check GitHub Releases after startup and show a non-blocking banner/badge when a newer release is available. Checks never download or apply updates.
+- **Explicit updates:** Update now uses a confirmation digest, trusted checksum-verified assets, safe staging, backup/restart/rollback, and expected-version health verification. Windows is the supported one-click update target.
+- **Optional LM Studio:** inspect installed/running models and manage exact instances through the local `lms` CLI when installed; AppDock itself has no network dependency for this integration.
 - **Windows-friendly:** guided installer, optional startup shortcut, portable ZIP releases, CI, and rollback-oriented updates.
 
 ## Requirements
@@ -122,7 +124,11 @@ A repository should also document its own prerequisites and setup. AppDock does 
 
 ## Updates
 
-Open **Settings → Updates → Check for updates**. If a newer GitHub release is available, AppDock shows the version and release notes. **Update now** downloads only the expected release asset, verifies `SHA256SUMS.txt`, checks the ZIP for unsafe paths, stages a backup, preserves your data directory, and restarts AppDock. See [Update design and recovery](docs/UPDATES.md).
+Open the navigation drawer and select **Updates**, or follow the non-blocking availability banner. AppDock contacts GitHub Releases and ordinary connection metadata (such as request IP and user agent) may be processed by GitHub. A check never downloads or applies anything. **Update now** is explicit and downloads only the expected release asset, verifies `SHA256SUMS.txt`, checks the ZIP for unsafe paths, stages a backup, preserves the separate mutable user-data directory, and restarts AppDock. Mutable user data is separate from versioned program files. Windows is supported for one-click application. A development clone should use Git (`git pull`) rather than one-click update. See [Update design and recovery](docs/UPDATES.md).
+
+## Optional LM Studio integration
+
+LM Studio is optional. If the local `lms` executable is installed, the **LM Studio** page can show models from `lms ls --json`, loaded instances from `lms ps --json`, and expose bounded load settings plus exact-instance unload. AppDock finds `APPDOCK_LMS_PATH`, standard per-user LM Studio bin locations, then `PATH`; it does not send model data or require a network connection. If LM Studio is absent, the page explains the optional integration and links to the public CLI documentation.
 
 ## Documentation
 

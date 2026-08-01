@@ -12,6 +12,7 @@ Depending on enabled features, the AppDock data directory can contain:
 - app ordering and settings;
 - process IDs, health results, and bounded logs;
 - update metadata, archives, backups, and update logs.
+- optional LM Studio status snapshots and local operation results. Model and executable filesystem paths are not sent to the browser.
 
 This data is not intended for source control. Default paths are excluded by the repository `.gitignore`.
 
@@ -23,8 +24,11 @@ AppDock makes network requests only for features the user invokes or configures:
 - **Update now:** the expected release archive and checksum assets from GitHub.
 - **Advanced GitHub import:** `git clone` of the public repository URL entered by the user.
 - **Health checks:** URLs explicitly declared in registered manifests.
+- **Optional LM Studio:** local `lms` CLI calls only; no network request is required for the integration.
 
 AppDock does not include analytics, advertising, or usage telemetry.
+
+GitHub may process ordinary connection metadata, including request IP and user agent, when AppDock checks GitHub Releases or downloads a confirmed release asset. AppDock does not add a separate analytics integration.
 
 ## Browser data
 

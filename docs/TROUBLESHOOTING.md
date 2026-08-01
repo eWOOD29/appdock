@@ -102,6 +102,14 @@ Possible causes:
 
 A source/development checkout should use `git pull` rather than one-click update.
 
+Automatic check failures are intentionally quiet on the dashboard. Open **Updates** and run **Check for updates** to see the actionable error. Checks contact GitHub Releases and may disclose ordinary connection metadata to GitHub; they do not download or apply updates.
+
+## LM Studio is unavailable
+
+LM Studio is optional. AppDock looks for `APPDOCK_LMS_PATH`, standard per-user LM Studio bin locations, then `PATH`. If no CLI is found, use the LM Studio page's public install/docs link. If the CLI is found but the application/server is unavailable, start LM Studio and refresh. Partial or malformed output and timeouts are shown as bounded status warnings; zero installed models is a valid empty state. AppDock does not require network access for this integration.
+
+Load and unload controls use fresh snapshots and reject stale or non-exact identifiers. AppDock does not expose unload-all, model paths, or executable paths. If a mutation is already running, retry after it finishes.
+
 ## Update staging fails
 
 AppDock requires both `appdock-windows.zip` and `SHA256SUMS.txt` from the same release. It rejects:

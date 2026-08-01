@@ -26,7 +26,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable
 
 MANIFEST_NAME = "appdock.json"
-CURRENT_VERSION = "0.1.2"
+CURRENT_VERSION = "0.2.0"
 DEFAULT_UPDATE_REPOSITORY = "eWOOD29/appdock"
 APP_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 SEMVER_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$")
@@ -57,6 +57,16 @@ REQUIRED_RELEASE_FILES = {
     "scripts/install.ps1",
     "scripts/uninstall.ps1",
 }
+LM_STUDIO_TIMEOUT = 8.0
+LM_STUDIO_MAX_ERROR = 240
+LM_STUDIO_DOCS_URL = "https://lmstudio.ai/docs/cli"
+LM_LOAD_FIELDS = {
+    "model", "model_key", "gpu", "context_length", "parallel", "ttl", "identifier",
+    "speculative_draft_mtp", "speculative_draft_simple", "speculative_draft_model",
+    "speculative_draft_max_tokens", "speculative_draft_min_tokens",
+    "speculative_draft_min_continue_probability",
+}
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
 class AppDockError(Exception):
@@ -355,6 +365,318 @@ def validate_bind_host(host: str) -> str:
     if not isinstance(host, str) or host not in {"127.0.0.1", "localhost", "::1"}:
         raise AppDockError("AppDock may bind only to a loopback host")
     return host
+
+
+def discover_lms(env: dict[str, str] | None = None) -> str | None:
+    """Find the optional LM Studio CLI without exposing its location to clients."""
+    environment = env if env is not None else os.environ
+    candidates: list[Path] = []
+    override = environment.get("APPDOCK_LMS_PATH", "").strip()
+    if override:
+        candidates.append(Path(override).expanduser())
+    profile = Path(environment.get("USERPROFILE") or str(Path.home())).expanduser()
+    local_app_data = Path(environment.get("LOCALAPPDATA") or (profile / "AppData" / "Local"))
+    for directory in (
+        profile / ".lmstudio" / "bin",
+        local_app_data / "LM Studio" / "bin",
+        profile / "AppData" / "Local" / "LM Studio" / "bin",
+    ):
+        for name in ("lms.exe", "lms.cmd", "lms"):
+            candidates.append(directory / name)
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return str(candidate.resolve())
+        except OSError:
+            continue
+    path_entries = [Path(entry) for entry in environment.get("PATH", "").split(os.pathsep) if entry]
+    for directory in path_entries:
+        for name in ("lms.exe", "lms.cmd", "lms"):
+            candidate = directory / name
+            try:
+                if candidate.is_file():
+                    return str(candidate.resolve())
+            except OSError:
+                continue
+    for name in ("lms.exe", "lms.cmd", "lms"):
+        found = shutil.which(name, path=environment.get("PATH"))
+        if found:
+            return found
+    return None
+
+
+def _bounded_cli_error(_text: str, fallback: str) -> str:
+    """Return a bounded generic CLI message; stderr may contain local paths."""
+    return fallback[:LM_STUDIO_MAX_ERROR]
+
+
+def _as_text(value: Any) -> str | None:
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _as_number(value: Any) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value != value or value in (float("inf"), float("-inf")):
+        return None
+    return value
+
+
+def _first_text(raw: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = _as_text(raw.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _safe_model_token(value: Any) -> str | None:
+    text = _as_text(value)
+    if text is None or len(text) > 256 or _CONTROL_RE.search(text):
+        return None
+    if text.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:[\\/]", text):
+        return None
+    return text
+
+
+def _normalize_model(raw: Any, *, loaded: bool = False) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    key = next((_safe_model_token(raw.get(name)) for name in ("modelKey", "model_key", "key", "model", "id") if _safe_model_token(raw.get(name)) is not None), None)
+    identifier = next((_safe_model_token(raw.get(name)) for name in ("identifier", "loadedIdentifier") if _safe_model_token(raw.get(name)) is not None), None)
+    if key is None and identifier is None:
+        return None
+    variants = raw.get("variants")
+    normalized_variants = [token for item in variants if (token := _safe_model_token(item)) is not None] if isinstance(variants, list) else []
+    quantization = raw.get("quantization")
+    if isinstance(quantization, dict):
+        quantization = _first_text(quantization, "name", "label")
+    else:
+        quantization = _as_text(quantization)
+    item: dict[str, Any] = {
+        "key": key or identifier,
+        "display_name": _first_text(raw, "displayName", "display_name", "name") or key or identifier or "Unknown model",
+        "type": _first_text(raw, "type", "modelType"),
+        "format": _first_text(raw, "format"),
+        "publisher": _first_text(raw, "publisher"),
+        "params": _first_text(raw, "paramsString", "params", "parameterCount"),
+        "architecture": _first_text(raw, "architecture", "architectureName"),
+        "quantization": quantization,
+        "size_bytes": _as_number(raw.get("sizeBytes", raw.get("size_bytes"))),
+        "vision": raw.get("vision") if isinstance(raw.get("vision"), bool) else None,
+        "tool_capability": raw.get("trainedForToolUse") if isinstance(raw.get("trainedForToolUse"), bool) else None,
+        "max_context": _as_number(raw.get("maxContextLength", raw.get("max_context"))),
+        "variants": normalized_variants,
+    }
+    if loaded:
+        ttl_ms = _as_number(raw.get("ttlMs"))
+        item.update({
+            "identifier": identifier or key,
+            "context_length": _as_number(raw.get("contextLength", raw.get("context_length"))),
+            "status": _first_text(raw, "status"),
+            "parallel": _as_number(raw.get("parallel")),
+            "ttl_seconds": ttl_ms / 1000 if ttl_ms is not None else _as_number(raw.get("ttl_seconds")),
+        })
+    return item
+
+
+def _identity_tokens(model: dict[str, Any]) -> set[str]:
+    values = [model.get("key"), *(model.get("variants") or [])]
+    return {
+        value.strip().replace("\\", "/").lower().rstrip("/")
+        for value in values
+        if isinstance(value, str) and value.strip()
+    }
+
+
+class LMStudioAdapter:
+    """Defensive, local-only adapter for the optional JSON-producing lms CLI."""
+
+    def __init__(self, executable: str | None = None, timeout: float = LM_STUDIO_TIMEOUT):
+        self.executable = executable if executable is not None else discover_lms()
+        self.timeout = max(0.1, min(float(timeout), LM_STUDIO_TIMEOUT))
+
+    def _json_command(self, args: list[str]) -> tuple[bool, Any, str, bool]:
+        if not self.executable:
+            return False, None, "LM Studio CLI was not found", False
+        try:
+            result = subprocess.run(
+                [self.executable, *args], shell=False, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=self.timeout, check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return False, None, "LM Studio CLI timed out", True
+        except (OSError, subprocess.SubprocessError):
+            return False, None, "LM Studio CLI could not be started", False
+        if result.returncode != 0:
+            return False, None, _bounded_cli_error(result.stderr, "LM Studio application/server is unavailable"), False
+        try:
+            value = json.loads(result.stdout)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False, None, f"lms {' '.join(args)} returned malformed JSON", False
+        if not isinstance(value, list):
+            return False, None, f"lms {' '.join(args)} returned an unexpected JSON shape", False
+        return True, value, "", False
+
+    def execute(self, args: list[str]) -> tuple[bool, bool, str]:
+        if not self.executable:
+            return False, False, "LM Studio CLI was not found"
+        try:
+            result = subprocess.run(
+                [self.executable, *args], shell=False, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=self.timeout, check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return False, True, "LM Studio CLI timed out"
+        except (OSError, subprocess.SubprocessError):
+            return False, False, "LM Studio CLI could not be started"
+        if result.returncode != 0:
+            return False, False, "LM Studio rejected the requested operation"
+        return True, False, ""
+
+    def snapshot(self) -> dict[str, Any]:
+        base = {
+            "available": bool(self.executable), "reachable": False, "running": False,
+            "status": "absent" if not self.executable else "unavailable",
+            "installed_models": [], "loaded_instances": [], "error": None, "warning": None,
+            "docs_url": LM_STUDIO_DOCS_URL,
+        }
+        if not self.executable:
+            base["error"] = "LM Studio is unavailable. This optional integration needs the lms CLI."
+            return base
+        ls_ok, ls_raw, ls_error, ls_timeout = self._json_command(["ls", "--json"])
+        ps_ok, ps_raw, ps_error, ps_timeout = self._json_command(["ps", "--json"])
+        installed = [model for raw in (ls_raw if ls_ok else []) if (model := _normalize_model(raw)) is not None]
+        loaded = [model for raw in (ps_raw if ps_ok else []) if (model := _normalize_model(raw, loaded=True)) is not None]
+        loaded_tokens = set().union(*(_identity_tokens(item) for item in loaded)) if loaded else set()
+        for model in installed:
+            model["loaded"] = bool(_identity_tokens(model) & loaded_tokens)
+        base.update({
+            "reachable": ls_ok or ps_ok,
+            "running": ps_ok,
+            "installed_models": installed,
+            "loaded_instances": loaded,
+        })
+        if ls_ok and ps_ok:
+            base["status"] = "empty" if not installed and not loaded else "running"
+        elif ls_timeout or ps_timeout:
+            base["status"] = "timeout"
+            base["warning"] = "LM Studio status check timed out."
+        elif ls_ok or ps_ok:
+            base["status"] = "partial"
+            failed = ls_error if not ls_ok else ps_error
+            base["warning"] = "LM Studio returned malformed status data." if "malformed" in failed or "unexpected JSON" in failed else ("Installed model list unavailable: lms ls failed." if not ls_ok else "Loaded model status unavailable: lms ps failed.")
+        else:
+            malformed = any("malformed" in error or "unexpected JSON" in error for error in (ls_error, ps_error))
+            if malformed:
+                base["status"] = "malformed"
+                base["error"] = "LM Studio returned malformed status data."
+            else:
+                base["error"] = "LM Studio CLI was found, but the application/server is unavailable."
+        return base
+
+
+def _validated_string(value: Any, field: str, maximum: int) -> str:
+    if not isinstance(value, str) or not value or len(value) > maximum or _CONTROL_RE.search(value):
+        raise ValueError(f"{field} must be a non-empty safe string of at most {maximum} characters")
+    return value
+
+
+def _validated_int(value: Any, field: str, minimum: int, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+        raise ValueError(f"{field} must be an integer from {minimum} to {maximum}")
+    return value
+
+
+def _validated_float(value: Any, field: str, minimum: float, maximum: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not minimum <= value <= maximum:
+        raise ValueError(f"{field} must be a number from {minimum} to {maximum}")
+    return float(value)
+
+
+def _installed_model_key(model: Any) -> str | None:
+    if not isinstance(model, dict) or not isinstance(model.get("key"), str) or not model["key"].strip():
+        return None
+    return model["key"].strip()
+
+
+def build_lm_load_args(request: dict[str, Any], installed_models: list[dict[str, Any]]) -> list[str]:
+    if not isinstance(request, dict):
+        raise ValueError("JSON body must be an object")
+    unknown = set(request) - LM_LOAD_FIELDS
+    if unknown:
+        raise ValueError("unknown load setting: " + sorted(unknown)[0])
+    if "model" in request and "model_key" in request:
+        raise ValueError("specify only one model key")
+    requested = _validated_string(request.get("model", request.get("model_key")), "model", 256)
+    canonical = next((key for item in installed_models if (key := _installed_model_key(item)) and key.lower().replace("\\", "/") == requested.lower().replace("\\", "/")), None)
+    if canonical is None:
+        raise ValueError("model must be one of the installed model keys")
+    args = ["load"]
+    gpu = request.get("gpu")
+    if gpu not in (None, "auto"):
+        if gpu in ("off", "max"):
+            args += ["--gpu", gpu]
+        else:
+            ratio = _validated_float(gpu, "gpu", 0.0, 1.0)
+            args += ["--gpu", str(int(ratio)) if ratio.is_integer() else str(ratio)]
+    if request.get("context_length") is not None:
+        args += ["--context-length", str(_validated_int(request["context_length"], "context_length", 1, 1_048_576))]
+    if request.get("parallel") is not None:
+        args += ["--parallel", str(_validated_int(request["parallel"], "parallel", 1, 128))]
+    if request.get("ttl") is not None:
+        args += ["--ttl", str(_validated_int(request["ttl"], "ttl", 1, 604800))]
+    if request.get("identifier") is not None:
+        args += ["--identifier", _validated_string(request["identifier"], "identifier", 128)]
+    mtp = request.get("speculative_draft_mtp", "default")
+    simple = request.get("speculative_draft_simple", "default")
+    if mtp not in {"default", "enable", "disable"}:
+        raise ValueError("speculative_draft_mtp must be enable, disable, or default")
+    if simple not in {"default", "enable", "disable"}:
+        raise ValueError("speculative_draft_simple must be enable, disable, or default")
+    if mtp == "enable" and simple == "enable":
+        raise ValueError("MTP and Simple speculative decoding cannot both be enabled")
+    draft_fields = ("speculative_draft_model", "speculative_draft_max_tokens", "speculative_draft_min_tokens", "speculative_draft_min_continue_probability")
+    draft_set = any(request.get(field) is not None for field in draft_fields)
+    if simple == "enable" and request.get("speculative_draft_model") is None:
+        raise ValueError("speculative_draft_model is required when Simple speculative decoding is enabled")
+    if simple != "enable" and request.get("speculative_draft_model") is not None:
+        raise ValueError("speculative_draft_model requires Simple speculative decoding")
+    if draft_set and simple != "enable" and mtp != "enable":
+        raise ValueError("draft settings require speculative decoding to be enabled")
+    if mtp == "enable":
+        args.append("--speculative-draft-mtp")
+    elif mtp == "disable":
+        args.append("--no-speculative-draft-mtp")
+    if simple == "enable":
+        args.append("--speculative-draft-simple")
+    if request.get("speculative_draft_model") is not None:
+        args += ["--speculative-draft-model", _validated_string(request["speculative_draft_model"], "speculative_draft_model", 256)]
+    for field, option, minimum, maximum in (
+        ("speculative_draft_max_tokens", "--speculative-draft-max-tokens", 1, 512),
+        ("speculative_draft_min_tokens", "--speculative-draft-min-tokens", 0, 512),
+    ):
+        if request.get(field) is not None:
+            args += [option, str(_validated_int(request[field], field, minimum, maximum))]
+    if request.get("speculative_draft_min_continue_probability") is not None:
+        probability = _validated_float(request["speculative_draft_min_continue_probability"], "speculative_draft_min_continue_probability", 0.0, 1.0)
+        args += ["--speculative-draft-min-continue-probability", str(probability)]
+    if request.get("speculative_draft_min_tokens") is not None and request.get("speculative_draft_max_tokens") is not None and request["speculative_draft_min_tokens"] > request["speculative_draft_max_tokens"]:
+        raise ValueError("speculative_draft_min_tokens cannot exceed speculative_draft_max_tokens")
+    return [*args, "-y", canonical]
+
+
+def build_lm_unload_args(request: dict[str, Any], loaded_instances: list[dict[str, Any]]) -> list[str]:
+    if not isinstance(request, dict) or set(request) != {"identifier"}:
+        raise ValueError("unload requires only an identifier")
+    identifier = _validated_string(request.get("identifier"), "identifier", 128)
+    loaded_identifiers = {
+        item.get("identifier") for item in loaded_instances
+        if isinstance(item, dict) and isinstance(item.get("identifier"), str)
+    }
+    if identifier not in loaded_identifiers:
+        raise ValueError("identifier is not currently loaded")
+    return ["unload", identifier]
 
 
 def _process_group_options(platform: str | None = None) -> dict[str, Any]:
@@ -2648,32 +2970,63 @@ HTML = r'''<!doctype html>
 </head>
 <body>
   <header class="topbar">
+    <button id="menuButton" class="menu-button" type="button" aria-expanded="false" aria-controls="drawer" aria-label="Open navigation">☰</button>
     <div class="brand">App<span>Dock</span></div>
-    <nav class="actions" aria-label="AppDock actions">
+    <div class="actions" aria-label="AppDock actions">
       <button id="addButton" type="button" class="primary">Add App</button>
-      <button id="settingsButton" type="button">Settings / Updates</button>
-    </nav>
+    </div>
   </header>
 
-  <main class="shell">
-    <div class="toolbar">
-      <div>
-        <h1>Your apps</h1>
-        <p class="muted">Register explicit manifests, then control each process locally.</p>
-      </div>
-      <button id="refreshButton" type="button">Refresh</button>
-    </div>
-    <section id="apps" class="apps" aria-live="polite"></section>
+  <div id="drawerBackdrop" class="drawer-backdrop" hidden></div>
+  <aside id="drawer" class="drawer" aria-label="AppDock navigation" aria-hidden="true">
+    <div class="drawer-heading"><strong>Navigate</strong><button id="closeDrawerButton" type="button" aria-label="Close navigation">×</button></div>
+    <nav class="drawer-nav">
+      <button id="dashboardLink" type="button" data-view="dashboard">Dashboard</button>
+      <button id="lmStudioLink" type="button" data-view="lm-studio">LM Studio</button>
+      <button id="updatesLink" type="button" data-view="updates">Updates <span id="updatesBadge" class="nav-badge" hidden aria-label="Updates available">!</span></button>
+    </nav>
+  </aside>
 
-    <section id="extensionsPanel" class="extensions" aria-labelledby="extensionsTitle" hidden>
-      <h2 id="extensionsTitle">Extensions</h2>
-      <p id="extensionsError" class="status warning" role="status" hidden></p>
-      <div id="widgets" class="widgets" aria-live="polite"></div>
+  <main class="shell">
+    <div id="updateBanner" class="update-banner" role="status" hidden>
+      <div><strong>AppDock update available.</strong><span id="updateBannerText"></span></div>
+      <button id="bannerUpdatesButton" type="button">Review updates</button>
+    </div>
+
+    <section id="dashboardView" class="view" data-view="dashboard">
+      <div class="toolbar">
+        <div>
+          <h1>Your apps</h1>
+          <p class="muted">Register explicit manifests, then control each process locally.</p>
+        </div>
+        <button id="refreshButton" type="button">Refresh</button>
+      </div>
+      <section id="apps" class="apps" aria-live="polite"></section>
+
+      <section id="extensionsPanel" class="extensions" aria-labelledby="extensionsTitle" hidden>
+        <h2 id="extensionsTitle">Extensions</h2>
+        <p id="extensionsError" class="status warning" role="status" hidden></p>
+        <div id="widgets" class="widgets" aria-live="polite"></div>
+      </section>
     </section>
 
-    <section id="updatesPanel" class="panel" hidden>
-      <h2>AppDock updates</h2>
-      <p class="muted">Release assets are downloaded from the configured GitHub repository, checksum-verified, staged, and applied with rollback.</p>
+    <section id="lmStudioView" class="view" data-view="lm-studio" hidden>
+      <div class="toolbar">
+        <div>
+          <h1>LM Studio</h1>
+          <p class="muted">Optional local model management through the LM Studio <code>lms</code> CLI.</p>
+        </div>
+        <button id="lmRefreshButton" type="button">Refresh</button>
+      </div>
+      <p id="lmStatus" class="status" role="status"></p>
+      <p id="lmHelp" class="muted">LM Studio is optional. <a href="https://lmstudio.ai/docs/cli" target="_blank" rel="noopener noreferrer">Install or read the lms CLI docs</a>.</p>
+      <section class="panel" aria-labelledby="lmLoadedTitle"><h2 id="lmLoadedTitle">Loaded instances</h2><div id="lmLoaded" class="lm-list" aria-live="polite"></div></section>
+      <section class="panel" aria-labelledby="lmModelsTitle"><h2 id="lmModelsTitle">Installed models</h2><div id="lmModels" class="lm-list" aria-live="polite"></div></section>
+    </section>
+
+    <section id="updatesPanel" class="view panel" data-view="updates" hidden>
+      <h1>AppDock updates</h1>
+      <p class="muted">Checks contact GitHub Releases. Downloads happen only after you explicitly confirm Update now; release assets are checksum-verified, staged, backed up, and rollback-safe.</p>
       <div class="actions">
         <button id="checkUpdateButton" type="button">Check for updates</button>
         <button id="updateButton" type="button" class="primary" hidden>Update now</button>
@@ -2805,6 +3158,8 @@ class Handler(BaseHTTPRequestHandler):
     github: GitHubOnboarding = GitHubOnboarding(config)
     checker: ReleaseChecker = ReleaseChecker(config.update_repository)
     coordinator: UpdateCoordinator = UpdateCoordinator()
+    lm_adapter: LMStudioAdapter = LMStudioAdapter()
+    lm_mutation_lock = threading.Lock()
     ready_token: str | None = None
     def _security_headers(self) -> None:
         self.send_header("X-Content-Type-Options", "nosniff")
@@ -2898,6 +3253,8 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/updates/check":
                 release = self.checker.check()
                 self._json({**release, "confirmation_digest": _digest(release)})
+            elif path == "/api/lm-studio":
+                self._json(self.lm_adapter.snapshot())
             elif path.startswith("/api/apps/") and path.endswith("/logs"):
                 app_id = urllib.parse.unquote(path.removeprefix("/api/apps/").removesuffix("/logs").strip("/")); spec = self.manager.discover().get(app_id)
                 if spec is None: self._json({"error": "app not found"}, 404)
@@ -2938,6 +3295,33 @@ class Handler(BaseHTTPRequestHandler):
                     raise
                 self._json({"restart_pending": True, "version": staged.get("version")}, 202)
                 threading.Thread(target=self.server.shutdown, daemon=True).start(); return
+            if path in {"/api/lm-studio/load", "/api/lm-studio/unload"}:
+                if not self.lm_mutation_lock.acquire(blocking=False):
+                    self._json({"error": "another LM Studio operation is already in progress; retry shortly"}, 409)
+                    return
+                try:
+                    snapshot = self.lm_adapter.snapshot()
+                    if not snapshot.get("available"):
+                        self._json({"error": snapshot.get("error") or "LM Studio is unavailable"}, 503)
+                        return
+                    if not snapshot.get("running"):
+                        self._json({"error": "LM Studio is not running; start LM Studio, then retry."}, 503)
+                        return
+                    if path.endswith("/load"):
+                        args = build_lm_load_args(body, snapshot.get("installed_models") or [])
+                    else:
+                        args = build_lm_unload_args(body, snapshot.get("loaded_instances") or [])
+                    ok, timed_out, detail = self.lm_adapter.execute(args)
+                    if not ok:
+                        self._json({"error": detail}, 504 if timed_out else 500)
+                    else:
+                        self._json({"ok": True, "message": "LM Studio operation requested"})
+                except ValueError as exc:
+                    status = 409 if "currently loaded" in str(exc) else 400
+                    self._json({"error": str(exc)}, status)
+                finally:
+                    self.lm_mutation_lock.release()
+                return
             self._json({"error": "not found"}, 404)
         except KeyError: self._json({"error": "app not found"}, 404)
         except (AppDockError, OSError, ValueError, TypeError) as exc: self._json({"error": str(exc)}, 400)
@@ -2959,7 +3343,7 @@ def main() -> None:
     config.ensure()
     recover_private_migrations(config)
     recover_update_transactions(config.data_root, expected_install=Path(__file__).resolve().parent)
-    Handler.config = config; Handler.extensions = ExtensionManager(config); Handler.manager = AppManager(config=config, extensions=Handler.extensions); Handler.local = LocalFolderOnboarding(config); Handler.github = GitHubOnboarding(config); Handler.checker = ReleaseChecker(config.update_repository); Handler.coordinator = UpdateCoordinator(); Handler.ready_token = args.ready_token
+    Handler.config = config; Handler.extensions = ExtensionManager(config); Handler.manager = AppManager(config=config, extensions=Handler.extensions); Handler.local = LocalFolderOnboarding(config); Handler.github = GitHubOnboarding(config); Handler.checker = ReleaseChecker(config.update_repository); Handler.coordinator = UpdateCoordinator(); Handler.lm_adapter = LMStudioAdapter(); Handler.lm_mutation_lock = threading.Lock(); Handler.ready_token = args.ready_token
     cleanup_stop = threading.Event()
     cleanup_thread = threading.Thread(target=_staging_cleanup_loop, args=(Handler.github, cleanup_stop), name="appdock-staging-cleanup", daemon=True)
     cleanup_thread.start()

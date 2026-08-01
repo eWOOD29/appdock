@@ -2,6 +2,12 @@
 
 AppDock's updater is designed around versioned GitHub release assets and a user-data directory that is separate from program files.
 
+## v0.2.0 notification behavior
+
+After the UI starts, AppDock performs a non-blocking check against GitHub Releases. It repeats no more than once every six hours, while the server-side `ReleaseChecker` cache remains authoritative. A newer stable release is shown in a non-modal dashboard banner and Updates navigation badge. Automatic failures are quiet during normal dashboard use; a manual check displays an actionable failure on the Updates page. Checks never download or apply an update.
+
+GitHub may receive ordinary connection metadata for the Releases request, such as the client IP and user agent. AppDock itself has no update telemetry or analytics.
+
 ## Check flow
 
 1. AppDock queries the configured repository's GitHub `releases/latest` API.
@@ -29,6 +35,8 @@ After the user chooses **Update now** and confirms:
 10. Activation uses directory-level replacement rather than per-file mutation. Before the durable commit marker, recovery deterministically restores the complete old program tree. After the commit marker, recovery deterministically completes and verifies the complete new program tree. The helper and AppDock startup both execute mandatory recovery before update state can be consumed; recovery is idempotent if interrupted.
 11. The helper gives the restarted process a fresh, instance-specific readiness token and accepts only an exact, non-redirected response from its local `/health` endpoint containing that token. Restart failure restores and verifies the previous complete tree. Successful readiness finalizes the transaction and removes the rollback tree.
 
+After the apply endpoint returns HTTP 202, the browser shows progress and polls same-origin `/health` for a bounded period. It reloads only after the response is healthy and its version exactly matches the expected release. A timeout reports that success was not confirmed and points the user to the local update log/manual restart recovery; it does not claim the update succeeded.
+
 The browser cannot supply an arbitrary download URL to the update endpoint. Update assets must come from the expected configured GitHub release.
 
 ## Data preservation
@@ -52,6 +60,8 @@ Normal crash recovery is automatic at helper or AppDock startup. If neither can 
 4. Extract the ZIP to a temporary folder and run `scripts\install.ps1` with the intended existing data directory.
 5. Leave the data directory unchanged.
 6. Start AppDock and check `/health` plus the displayed version.
+
+A development clone should use Git (`git pull`) and the normal test workflow rather than the one-click updater. One-click update application is explicit and Windows-supported.
 
 ## Release publisher checklist
 

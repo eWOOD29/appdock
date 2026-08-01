@@ -164,7 +164,7 @@ class AppDockTests(unittest.TestCase):
 
     def test_release_checker_caches_and_reports_update(self) -> None:
         calls = []
-        payload = json.dumps({"tag_name": "v0.2.0", "html_url": "https://github.com/owner/repo/releases/v0.2.0", "assets": []}).encode()
+        payload = json.dumps({"tag_name": "v0.3.0", "html_url": "https://github.com/owner/repo/releases/v0.3.0", "assets": []}).encode()
         checker = ReleaseChecker("owner/repo", opener=lambda *args, **kwargs: calls.append(1) or Response(payload), cache_ttl=60)
         self.assertTrue(checker.check()["update_available"])
         checker.check()
@@ -212,8 +212,8 @@ class AppDockTests(unittest.TestCase):
 
     def test_stage_update_uses_trusted_assets_checksum_and_preserves_data_on_apply(self) -> None:
         data = self.make_release_zip(b"new code"); sums = hashlib.sha256(data).hexdigest().encode() + b"  appdock-windows.zip\n"
-        base = "https://github.com/owner/repo/releases/download/v0.2.0/"
-        release = {"version": "0.2.0", "release_url": base, "assets": [{"name": "appdock-windows.zip", "url": base + "appdock-windows.zip"}, {"name": "SHA256SUMS.txt", "url": base + "SHA256SUMS.txt"}]}
+        base = "https://github.com/owner/repo/releases/download/v0.3.0/"
+        release = {"version": "0.3.0", "release_url": base, "assets": [{"name": "appdock-windows.zip", "url": base + "appdock-windows.zip"}, {"name": "SHA256SUMS.txt", "url": base + "SHA256SUMS.txt"}]}
         opener = lambda request, **kwargs: Response(data if request.full_url.endswith(".zip") else sums)
         staged = stage_update(release, self.config, opener=opener, repository="owner/repo")
         install = self.root / "install"; install.mkdir(); (install / "appdock.py").write_bytes(b"old"); (self.config.data_root / "keep.json").write_text("keep")
@@ -229,7 +229,7 @@ class AppDockTests(unittest.TestCase):
         base = f"http://127.0.0.1:{server.server_port}"
         try:
             config_response = json.loads(urllib.request.urlopen(base + "/api/config").read())
-            self.assertEqual(config_response["version"], "0.1.2")
+            self.assertEqual(config_response["version"], "0.2.0")
             request = urllib.request.Request(base + "/api/apps/example/start", data=b"{}", method="POST", headers={"Content-Type": "application/json", "Origin": "http://evil.example"})
             with self.assertRaises(urllib.error.HTTPError) as cross_origin:
                 urllib.request.urlopen(request)
