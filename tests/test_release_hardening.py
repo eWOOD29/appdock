@@ -388,6 +388,28 @@ class ReleaseHardeningTests(unittest.TestCase):
             with self.assertRaises(AppDockError):
                 apply_update(alias, self.root / "install-alias", self.config.data_root)
 
+    def test_apply_update_rejects_a_junctioned_install_root_before_mutation(self) -> None:
+        if os.name != "nt":
+            self.skipTest("real junction boundary is Windows-specific")
+        staged = self.config.updates_root / "0.3.1"
+        self.write_release_tree(staged, {"appdock.py": b"new"})
+        target = self.root / "install-target"
+        self.write_release_tree(target, {"appdock.py": b"old"})
+        alias = self.root / "install-alias"
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(alias), str(target)],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            self.skipTest(f"junction creation unavailable: {result.stderr.strip()}")
+        try:
+            with self.assertRaises(AppDockError):
+                apply_update(staged, alias, self.config.data_root)
+            self.assertEqual((target / "appdock.py").read_bytes(), b"old")
+        finally:
+            alias.rmdir()
+
     def test_apply_update_removes_obsolete_managed_files_and_rollback_restores_them(self) -> None:
         install = self.root / "install"
         install.mkdir()
@@ -736,6 +758,51 @@ class ReleaseHardeningTests(unittest.TestCase):
                 lock.release()
                 self.fail("junction was accepted")
             self.assertFalse((target / "runtime" / "update.lock").exists())
+        finally:
+            alias.rmdir()
+
+    def test_update_helper_cli_preserves_lexical_data_alias_until_validation(self) -> None:
+        if os.name != "nt":
+            self.skipTest("real junction boundary is Windows-specific")
+        target = self.root / "helper-data-target"
+        runtime = target / "runtime"
+        runtime.mkdir(parents=True)
+        alias = self.root / "helper-data-alias"
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(alias), str(target)],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            self.skipTest(f"junction creation unavailable: {result.stderr.strip()}")
+        install = self.root / "helper-install"
+        install.mkdir()
+        restart_script = install / "appdock.py"
+        restart_script.write_text("raise SystemExit(0)", encoding="utf-8")
+        staged = self.root / "helper-stage"
+        staged.mkdir()
+        handshake = alias / "runtime" / f"update-helper-{'a' * 32}.ready"
+        try:
+            helper = Path(__file__).parents[1] / "scripts" / "update_helper.py"
+            process = subprocess.run(
+                [
+                    sys.executable, "-B", str(helper),
+                    "--staged", str(staged),
+                    "--install", str(install),
+                    "--data", str(alias),
+                    "--pid", "0",
+                    "--restart-script", str(restart_script),
+                    "--handshake", str(handshake),
+                    "--handshake-token", "helper-token-1234567890123456",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertNotEqual(process.returncode, 0)
+            self.assertFalse((runtime / "update-helper-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.ready").exists())
+            self.assertFalse((runtime / "update.log").exists())
+            self.assertFalse((runtime / "update.lock").exists())
         finally:
             alias.rmdir()
 

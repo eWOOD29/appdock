@@ -2941,9 +2941,14 @@ def _recover_one_update(tx_root: Path, *, phase_hook: Callable[[str], None] | No
     journal = _update_journal(tx_root)
     if journal["phase"] in {"complete", "rolled_back"}:
         return journal["phase"]
-    install = Path(journal["install"]).resolve()
-    candidate = Path(journal["candidate"]).resolve()
-    backup = Path(journal["backup"]).resolve()
+    install_lexical = Path(journal["install"]).expanduser().absolute()
+    candidate_lexical = Path(journal["candidate"]).expanduser().absolute()
+    backup_lexical = Path(journal["backup"]).expanduser().absolute()
+    for root in (install_lexical, candidate_lexical, backup_lexical):
+        _assert_no_link_or_reparse_ancestor(root)
+    install = install_lexical.resolve()
+    candidate = candidate_lexical.resolve()
+    backup = backup_lexical.resolve()
     finish_new = journal["phase"] == "committed" or journal["recovery"] == "finish-new"
     if phase_hook:
         phase_hook("recovery:finish-new" if finish_new else "recovery:restore-old")
@@ -2994,6 +2999,21 @@ def recover_update_transactions(data_dir: str | Path, *, expected_install: str |
     return recovered
 
 
+def _validated_update_roots(install_dir: str | Path, data_dir: str | Path) -> tuple[Path, Path]:
+    install_lexical = Path(install_dir).expanduser().absolute()
+    data_lexical = Path(data_dir).expanduser().absolute()
+    for root in (install_lexical, data_lexical):
+        _assert_no_link_or_reparse_ancestor(root)
+    if install_lexical.exists() and not install_lexical.is_dir():
+        raise AppDockError("installation root is not a directory")
+    if data_lexical.exists() and not data_lexical.is_dir():
+        raise AppDockError("update data root is not a directory")
+    install, data = install_lexical.resolve(), data_lexical.resolve()
+    if _inside(install, data) or _inside(data, install):
+        raise AppDockError("installation and data roots must not overlap")
+    return install, data
+
+
 @_locked_transaction(2)
 def apply_update(
     staged_dir: str | Path,
@@ -3004,12 +3024,10 @@ def apply_update(
     phase_hook: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     staged_lexical = Path(staged_dir).expanduser().absolute()
-    install, data = Path(install_dir).resolve(), Path(data_dir).resolve()
+    install, data = _validated_update_roots(install_dir, data_dir)
     if _is_link_or_reparse(staged_lexical):
         raise AppDockError("staged update root is a symlink or reparse point")
     staged = staged_lexical.resolve()
-    if _inside(install, data) or _inside(data, install):
-        raise AppDockError("installation and data roots must not overlap")
     if not staged.is_dir() or not _inside(staged, data / "updates"):
         raise AppDockError("staged update path is invalid")
     _assert_tree_safe(staged_lexical, data / "updates")
@@ -3104,7 +3122,7 @@ def apply_update(
 
 @_locked_transaction(2)
 def finalize_update(applied: dict[str, Any], install_dir: str | Path, data_dir: str | Path) -> None:
-    install, data = Path(install_dir).resolve(), Path(data_dir).resolve()
+    install, data = _validated_update_roots(install_dir, data_dir)
     transaction = Path(str(applied.get("transaction") or "")).resolve()
     if not transaction.is_file() or not _inside(transaction, _update_transactions_root(data)):
         raise AppDockError("update transaction path is invalid")
@@ -3117,9 +3135,7 @@ def finalize_update(applied: dict[str, Any], install_dir: str | Path, data_dir: 
 
 @_locked_transaction(2)
 def rollback_update(applied: dict[str, Any], install_dir: str | Path, data_dir: str | Path) -> None:
-    install, data = Path(install_dir).resolve(), Path(data_dir).resolve()
-    if _inside(install, data) or _inside(data, install):
-        raise AppDockError("installation and data roots must not overlap")
+    install, data = _validated_update_roots(install_dir, data_dir)
     transaction_raw = applied.get("transaction")
     if isinstance(transaction_raw, str) and transaction_raw:
         transaction = Path(transaction_raw).resolve()

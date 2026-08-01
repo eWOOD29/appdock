@@ -17,7 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from appdock import _clear_staged_receipt, _remove_tree, _write_update_startup_handoff, acquire_update_lock, apply_update, finalize_update, recover_update_transactions, rollback_update  # noqa: E402
+from appdock import _assert_no_link_or_reparse_ancestor, _clear_staged_receipt, _is_link_or_reparse, _remove_tree, _update_lock_path, _write_update_startup_handoff, acquire_update_lock, apply_update, finalize_update, recover_update_transactions, rollback_update  # noqa: E402
 
 RESTART_READY_TIMEOUT_SECONDS = 20.0
 
@@ -172,6 +172,8 @@ def run(
     handshake_token: str | None = None,
     phase_hook: object | None = None,
 ) -> int:
+    data = data.expanduser().absolute()
+    _update_lock_path(data)
     log_path = data / "runtime" / "update.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -236,19 +238,28 @@ def main() -> int:
     parser.add_argument("--handshake", type=Path, required=True)
     parser.add_argument("--handshake-token", required=True)
     args = parser.parse_args()
+    data = args.data.expanduser().absolute()
+    try:
+        runtime_root = _update_lock_path(data).parent
+    except Exception as exc:
+        raise SystemExit(f"unsafe update data root: {exc}") from exc
     handshake = args.handshake.expanduser().absolute()
-    runtime_root = (args.data.resolve() / "runtime").resolve()
-    if handshake.parent.resolve() != runtime_root or not re.fullmatch(r"update-helper-[0-9a-f]{32}\.ready", handshake.name):
+    staged = args.staged.expanduser().absolute()
+    install = args.install.expanduser().absolute()
+    restart_script = args.restart_script.expanduser().absolute()
+    for path in (handshake, staged, install, restart_script):
+        _assert_no_link_or_reparse_ancestor(path)
+    if _is_link_or_reparse(handshake) or handshake.parent != runtime_root or not re.fullmatch(r"update-helper-[0-9a-f]{32}\.ready", handshake.name):
         raise SystemExit("invalid update helper handshake path")
     if not re.fullmatch(r"[A-Za-z0-9_-]{20,128}", args.handshake_token):
         raise SystemExit("invalid update helper handshake token")
     handshake.parent.mkdir(parents=True, exist_ok=True)
     return run(
-        args.staged.expanduser().absolute(),
-        args.install.resolve(),
-        args.data.resolve(),
+        staged,
+        install,
+        data,
         args.pid,
-        args.restart_script.resolve(),
+        restart_script,
         list(args.restart_arg),
         handshake=handshake,
         handshake_token=args.handshake_token,
