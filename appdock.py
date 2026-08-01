@@ -26,7 +26,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable
 
 MANIFEST_NAME = "appdock.json"
-CURRENT_VERSION = "0.1.1"
+CURRENT_VERSION = "0.1.2"
 DEFAULT_UPDATE_REPOSITORY = "eWOOD29/appdock"
 APP_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 SEMVER_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$")
@@ -140,9 +140,9 @@ class AppSpec:
     app_id: str
     name: str
     manifest_dir: Path
-    directory: Path
+    directory: Path | str
     command: list[str]
-    cwd: Path
+    cwd: Path | str
     description: str = ""
     port: int | None = None
     health_url: str = ""
@@ -151,6 +151,21 @@ class AppSpec:
     env: dict[str, str | None] = field(default_factory=dict)
     process_name: str = ""
     stop_timeout: float = 3.0
+    path_flavor: str = "native"
+
+
+def _native_runtime_cwd(spec: AppSpec) -> Path:
+    if spec.path_flavor == "native":
+        return Path(spec.cwd)
+    if spec.path_flavor == "windows":
+        if os.name != "nt":
+            raise AppDockError("application path flavor is unsupported on this host")
+        return Path(str(spec.cwd))
+    if spec.path_flavor == "posix":
+        if os.name == "nt":
+            raise AppDockError("application path flavor is unsupported on this host")
+        return Path(str(spec.cwd))
+    raise AppDockError("application path flavor is unsupported on this host")
 
 
 @dataclass
@@ -360,6 +375,130 @@ def _relative_path(raw: Any, base: Path, *, field_name: str) -> Path:
     if not _inside(result, base):
         raise ManifestError(f"{field_name} escapes the app directory")
     return result
+
+
+_WINDOWS_DRIVE_ABSOLUTE_RE = re.compile(r"^([A-Za-z]):\\(.+)$")
+_WINDOWS_RESERVED_COMPONENT_RE = re.compile(r"^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?$", re.IGNORECASE)
+
+
+def normalize_windows_external_directory(value: Any) -> str:
+    """Validate and canonicalize a Windows external directory without host pathlib semantics.
+
+    AppDock v0.1.2 intentionally supports drive-qualified paths only. UNC and device
+    namespaces are rejected until they have a separately reviewed package contract.
+    """
+    if not isinstance(value, str) or not value or len(value) > 32767 or "\x00" in value:
+        raise AppDockError("private registration must preserve an absolute external directory")
+    if "/" in value or value.startswith("\\\\"):
+        raise AppDockError("private registration must preserve an absolute external directory")
+    match = _WINDOWS_DRIVE_ABSOLUTE_RE.fullmatch(value)
+    if match is None:
+        raise AppDockError("private registration must preserve an absolute external directory")
+    drive, tail = match.groups()
+    tail = tail.rstrip("\\")
+    if not tail:
+        raise AppDockError("private registration must preserve an absolute external directory")
+    components = tail.split("\\")
+    if any(
+        not component
+        or component in {".", ".."}
+        or component[-1] in {" ", "."}
+        or any(ord(character) < 32 or character in '<>:"|?*' for character in component)
+        or _WINDOWS_RESERVED_COMPONENT_RE.fullmatch(component)
+        for component in components
+    ):
+        raise AppDockError("private registration must preserve an absolute external directory")
+    return f"{drive.upper()}:\\" + "\\".join(components)
+
+
+def _normalize_windows_relative_path(value: Any, *, field_name: str) -> str:
+    if value in (None, "", "."):
+        return "."
+    if not isinstance(value, str) or len(value) > 32767 or "\x00" in value or "/" in value:
+        raise ManifestError(f"{field_name} must be a safe relative Windows path")
+    if value.startswith("\\") or re.match(r"^[A-Za-z]:", value):
+        raise ManifestError(f"{field_name} must be a safe relative Windows path")
+    value = value.rstrip("\\")
+    components = value.split("\\")
+    if any(
+        not component
+        or component in {".", ".."}
+        or component[-1] in {" ", "."}
+        or any(ord(character) < 32 or character in '<>:"|?*' for character in component)
+        or _WINDOWS_RESERVED_COMPONENT_RE.fullmatch(component)
+        for component in components
+    ):
+        raise ManifestError(f"{field_name} must be a safe relative Windows path")
+    return "\\".join(components)
+
+
+def _normalize_posix_external_directory(value: Any) -> str:
+    if not isinstance(value, str) or not value or len(value) > 32767 or "\x00" in value:
+        raise AppDockError("private registration must preserve an absolute external directory")
+    if not value.startswith("/") or "\\" in value or ":" in value or value.startswith("//"):
+        raise AppDockError("private registration must preserve an absolute external directory")
+    components = value.split("/")[1:]
+    while components and components[-1] == "":
+        components.pop()
+    if not components or any(not component or component in {".", ".."} for component in components):
+        raise AppDockError("private registration must preserve an absolute external directory")
+    return "/" + "/".join(components)
+
+
+def _normalize_posix_relative_path(value: Any, *, field_name: str) -> str:
+    if value in (None, "", "."):
+        return "."
+    if not isinstance(value, str) or len(value) > 32767 or "\x00" in value or "\\" in value:
+        raise ManifestError(f"{field_name} must be a safe relative POSIX path")
+    if value.startswith("/"):
+        raise ManifestError(f"{field_name} must be a safe relative POSIX path")
+    value = value.rstrip("/")
+    components = value.split("/")
+    if any(not component or component in {".", ".."} for component in components):
+        raise ManifestError(f"{field_name} must be a safe relative POSIX path")
+    return "/".join(components)
+
+
+def _private_path_flavor(value: Any) -> str | None:
+    try:
+        normalize_windows_external_directory(value)
+        return "windows"
+    except AppDockError:
+        pass
+    try:
+        _normalize_posix_external_directory(value)
+        return "posix"
+    except AppDockError:
+        return None
+
+
+def normalize_private_registration(raw: dict[str, Any], *, manifest_dir: Path, path_flavor: str) -> dict[str, Any]:
+    if not isinstance(raw, dict) or raw.get("external") is not True:
+        raise AppDockError("private registration must preserve an absolute external directory")
+    if path_flavor == "windows":
+        directory = normalize_windows_external_directory(raw.get("directory"))
+        cwd = _normalize_windows_relative_path(raw.get("cwd", "."), field_name="cwd")
+    elif path_flavor == "posix":
+        directory = _normalize_posix_external_directory(raw.get("directory"))
+        cwd = _normalize_posix_relative_path(raw.get("cwd", "."), field_name="cwd")
+    else:
+        raise AppDockError("private package path flavor is unsupported")
+
+    # Reuse the ordinary manifest validator for every non-path field, but feed it a
+    # package-local placeholder so validation never resolves or probes the external source.
+    validation_raw = dict(raw)
+    validation_raw["directory"] = str(manifest_dir)
+    validation_raw["cwd"] = "."
+    normalized = normalize_manifest(
+        validation_raw,
+        manifest_dir=manifest_dir,
+        directory=manifest_dir,
+        external=True,
+        allow_outside=True,
+    )
+    normalized["directory"] = directory
+    normalized["cwd"] = cwd
+    return normalized
 
 
 def normalize_manifest(raw: dict[str, Any], *, manifest_dir: Path, directory: Path | None = None, external: bool = False, allow_outside: bool = False) -> dict[str, Any]:
@@ -861,31 +1000,57 @@ def preview_private_package(package_root: str | Path) -> dict[str, Any]:
     package_integrity = _verify_private_package_manifest(root)
     package_path = _safe_package_file(root, PRIVATE_PACKAGE_MANIFEST)
     package = _read_bounded_json(package_path)
-    required = {"schema_version", "registrations", "order_path", "extension_config_path"}
-    if not isinstance(package, dict) or set(package) != required or package.get("schema_version") != 1:
+    if not isinstance(package, dict):
         raise AppDockError("private package manifest is invalid")
+    schema_version = package.get("schema_version")
+    if schema_version == 1:
+        required = {"schema_version", "registrations", "order_path", "extension_config_path"}
+        if set(package) != required:
+            raise AppDockError("private package manifest is invalid")
+        declared_path_flavor: str | None = None
+    elif schema_version == 2:
+        required = {"schema_version", "path_flavor", "registrations", "order_path", "extension_config_path"}
+        if set(package) != required or package.get("path_flavor") != "windows":
+            raise AppDockError("private package manifest is invalid")
+        declared_path_flavor = "windows"
+    else:
+        raise AppDockError("private package manifest is invalid")
+
     registration_paths = package.get("registrations")
     if not isinstance(registration_paths, list) or not registration_paths or len(registration_paths) > 256:
         raise AppDockError("private package registrations are invalid")
-    if len(set(registration_paths)) != len(registration_paths):
+    if any(not isinstance(item, str) for item in registration_paths) or len(set(registration_paths)) != len(registration_paths):
         raise AppDockError("private package contains duplicate registration paths")
-    registrations: dict[str, dict[str, Any]] = {}
+
+    raw_registrations: list[tuple[Path, dict[str, Any]]] = []
+    inferred_flavors: set[str] = set()
     for relative in registration_paths:
         path = _safe_package_file(root, relative)
         raw = _read_bounded_json(path)
-        if not isinstance(raw, dict) or not isinstance(raw.get("directory"), str) or not Path(raw["directory"]).expanduser().is_absolute():
+        if not isinstance(raw, dict):
             raise AppDockError("private registration must preserve an absolute external directory")
-        normalized = normalize_manifest(
-            raw,
-            manifest_dir=path.parent,
-            directory=Path(raw["directory"]).expanduser(),
-            external=True,
-            allow_outside=True,
-        )
+        if declared_path_flavor is None:
+            flavor = _private_path_flavor(raw.get("directory"))
+            if flavor is None:
+                raise AppDockError("private registration must preserve an absolute external directory")
+            inferred_flavors.add(flavor)
+        raw_registrations.append((path, raw))
+
+    if declared_path_flavor is None:
+        if len(inferred_flavors) != 1:
+            raise AppDockError("private package contains mixed or ambiguous external path forms")
+        path_flavor = next(iter(inferred_flavors))
+    else:
+        path_flavor = declared_path_flavor
+
+    registrations: dict[str, dict[str, Any]] = {}
+    for path, raw in raw_registrations:
+        normalized = normalize_private_registration(raw, manifest_dir=path.parent, path_flavor=path_flavor)
         app_id = normalized["id"]
         if app_id in registrations:
             raise AppDockError("private package contains duplicate registrations")
         registrations[app_id] = normalized
+
     order_path = _safe_package_file(root, package.get("order_path"))
     order = _read_bounded_json(order_path)
     if (
@@ -901,17 +1066,29 @@ def preview_private_package(package_root: str | Path) -> dict[str, Any]:
     if not extension.hidden_app_ids.issubset(registrations):
         raise AppDockError("visibility configuration references an unknown registration")
     normalized_extensions = _normalized_extension_payload(extension)
-    normalized = {
-        "schema_version": 1,
+    normalized: dict[str, Any] = {
+        "schema_version": schema_version,
         "registrations": {app_id: registrations[app_id] for app_id in sorted(registrations)},
         "order": order,
         "extensions": normalized_extensions,
     }
+    if schema_version == 2:
+        normalized["path_flavor"] = path_flavor
+        # Preserve a single documented field order in human-readable evidence while
+        # canonical hashing remains key-sorted.
+        normalized = {
+            "schema_version": schema_version,
+            "path_flavor": path_flavor,
+            "registrations": normalized["registrations"],
+            "order": order,
+            "extensions": normalized_extensions,
+        }
     digest = _digest(normalized)
     if digest != package_integrity["manifest"]["migration_digest"]:
         raise AppDockError("private package migration digest does not match its hash manifest")
     return {
-        "schema_version": 1,
+        "schema_version": schema_version,
+        "path_flavor": path_flavor,
         "registration_count": len(registrations),
         "visible_count": len(registrations) - len(extension.hidden_app_ids),
         "order_count": len(order),
@@ -923,9 +1100,15 @@ def preview_private_package(package_root: str | Path) -> dict[str, Any]:
 
 def _migration_targets(preview: dict[str, Any], config: AppDockConfig) -> dict[Path, bytes]:
     normalized = preview["normalized"]
+    path_flavor = preview.get("path_flavor")
+    if path_flavor not in {"windows", "posix"}:
+        raise AppDockError("private package path flavor is unsupported")
     targets: dict[Path, bytes] = {}
     for app_id, manifest in normalized["registrations"].items():
-        targets[config.registry_root / app_id / MANIFEST_NAME] = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+        persisted = dict(manifest)
+        persisted["_appdock_private_import"] = True
+        persisted["path_flavor"] = path_flavor
+        targets[config.registry_root / app_id / MANIFEST_NAME] = json.dumps(persisted, indent=2, sort_keys=True).encode("utf-8") + b"\n"
     targets[config.order_path] = json.dumps(normalized["order"], indent=2).encode("utf-8") + b"\n"
     targets[config.extension_config_path] = json.dumps(normalized["extensions"], indent=2, sort_keys=True).encode("utf-8") + b"\n"
     return targets
@@ -1171,7 +1354,45 @@ class AppManager:
             if not manifest_path.is_file() or manifest_path.is_symlink():
                 continue
             try:
-                raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+                raw = _loads_strict_json(manifest_path.read_text(encoding="utf-8"))
+                if not isinstance(raw, dict):
+                    raise ManifestError("manifest must be a JSON object")
+                provenance_present = "_appdock_private_import" in raw or "path_flavor" in raw
+                if provenance_present:
+                    if self.legacy_direct_root or raw.get("_appdock_private_import") is not True or raw.get("external") is not True:
+                        raise ManifestError("imported registration provenance is invalid")
+                    path_flavor = raw.get("path_flavor")
+                    if path_flavor not in {"windows", "posix"}:
+                        raise ManifestError("imported registration path flavor is invalid")
+                    normalized = normalize_private_registration(raw, manifest_dir=manifest_dir, path_flavor=path_flavor)
+                    app_id = normalized["id"]
+                    if app_id in specs:
+                        continue
+                    directory = normalized["directory"]
+                    relative_cwd = normalized["cwd"]
+                    if path_flavor == "windows":
+                        cwd = directory if relative_cwd == "." else directory + "\\" + relative_cwd
+                    else:
+                        cwd = directory if relative_cwd == "." else directory.rstrip("/") + "/" + relative_cwd
+                    specs[app_id] = AppSpec(
+                        app_id=app_id,
+                        name=normalized["name"],
+                        manifest_dir=manifest_dir.resolve(),
+                        directory=directory,
+                        command=normalized["command"],
+                        cwd=cwd,
+                        description=normalized["description"],
+                        port=normalized["port"],
+                        health_url=normalized["health_url"],
+                        local_url=normalized["local_url"],
+                        private_url=normalized["private_url"],
+                        env=normalized["env"],
+                        process_name=normalized["process_name"],
+                        stop_timeout=normalized["stop_timeout"],
+                        path_flavor=path_flavor,
+                    )
+                    continue
+
                 target_raw = raw.get("directory")
                 if target_raw:
                     target = Path(str(target_raw)).expanduser()
@@ -1188,7 +1409,7 @@ class AppManager:
                 target_dir = Path(normalized["directory"]).resolve()
                 cwd = (target_dir / normalized["cwd"]).resolve()
                 specs[app_id] = AppSpec(app_id, normalized["name"], manifest_dir.resolve(), target_dir, normalized["command"], cwd, normalized["description"], normalized["port"], normalized["health_url"], normalized["local_url"], normalized["private_url"], normalized["env"], normalized["process_name"], normalized["stop_timeout"])
-            except (OSError, ValueError, TypeError, json.JSONDecodeError, ManifestError):
+            except (OSError, ValueError, TypeError, json.JSONDecodeError, AppDockError):
                 continue
         return specs
 
@@ -1334,6 +1555,7 @@ class AppManager:
         spec = self.discover().get(app_id)
         if spec is None:
             raise KeyError(app_id)
+        runtime_cwd = _native_runtime_cwd(spec)
         with self._lock:
             runtime = self._refresh_process(app_id)
             if runtime.process is None and self._external_pids(spec):
@@ -1344,7 +1566,7 @@ class AppManager:
                 try:
                     runtime.process = subprocess.Popen(
                         spec.command,
-                        cwd=spec.cwd,
+                        cwd=runtime_cwd,
                         stdout=log,
                         stderr=subprocess.STDOUT,
                         text=True,
@@ -1376,6 +1598,7 @@ class AppManager:
         spec = self.discover().get(app_id)
         if spec is None:
             raise KeyError(app_id)
+        _native_runtime_cwd(spec)
         with self._lock:
             runtime = self._refresh_process(app_id)
             process = runtime.process

@@ -1,6 +1,6 @@
 [project]
 name = "appdock"
-version = "0.1.1"
+version = "0.1.2"
 description = "A local-first dashboard for organizing and running local apps"
 readme = "README.md"
 requires-python = ">=3.11"

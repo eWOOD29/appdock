@@ -4,6 +4,15 @@ All notable changes to AppDock are documented here. The project follows Semantic
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-07-26
+
+### Fixed
+
+- Declare Windows external-path semantics explicitly in private-package descriptor schema 2.
+- Validate and normalize drive-qualified Windows external directories identically on Windows and Ubuntu, rejecting malformed, ambiguous, mixed, device-namespace, UNC, drive-relative, root-relative, and unsafe forms.
+- Make normalized private-package previews, migration digests, and deterministic protected ZIP bytes host-independent while retaining bounded compatibility for unambiguous schema-1 packages.
+- Require a newly reviewed private package and newly confirmed migration digest for the corrected Windows migration while preserving published v0.1.1 bytes.
+
 ## [0.1.1] - 2026-07-24
 
 ### Fixed
@@ -40,6 +49,7 @@ All notable changes to AppDock are documented here. The project follows Semantic
 - Shell command strings, unsafe app IDs, path escapes, unsafe GitHub URLs, arbitrary update URLs, ZIP traversal, symlink archive members, and protected system PIDs are rejected.
 - Newly registered apps never start automatically.
 
-[Unreleased]: https://github.com/eWOOD29/appdock/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/eWOOD29/appdock/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/eWOOD29/appdock/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/eWOOD29/appdock/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/eWOOD29/appdock/releases/tag/v0.1.0

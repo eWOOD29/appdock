@@ -229,7 +229,7 @@ class AppDockTests(unittest.TestCase):
         base = f"http://127.0.0.1:{server.server_port}"
         try:
             config_response = json.loads(urllib.request.urlopen(base + "/api/config").read())
-            self.assertEqual(config_response["version"], "0.1.1")
+            self.assertEqual(config_response["version"], "0.1.2")
             request = urllib.request.Request(base + "/api/apps/example/start", data=b"{}", method="POST", headers={"Content-Type": "application/json", "Origin": "http://evil.example"})
             with self.assertRaises(urllib.error.HTTPError) as cross_origin:
                 urllib.request.urlopen(request)
