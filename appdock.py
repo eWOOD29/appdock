@@ -51,6 +51,7 @@ MAX_EXTENSION_PROVIDERS = 8
 MAX_EXTENSION_WIDGETS = 16
 MAX_WIDGET_METRICS = 12
 MAX_WIDGET_PROGRESS = 6
+UPDATE_OPERATION_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 PRIVATE_PACKAGE_MANIFEST = "appdock-private-package.json"
 PRIVATE_PACKAGE_HASH_MANIFEST = "PACKAGE-MANIFEST.json"
 RELEASE_MANIFEST_NAME = "RELEASE-MANIFEST.json"
@@ -233,12 +234,26 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _durable_write_bytes(path: Path, payload: bytes) -> None:
+    path = Path(path).expanduser().absolute()
+    _assert_safe_directory_ancestors(path.parent)
+    if _is_link_or_reparse(path):
+        raise AppDockError("update output path is unsafe")
+    if path.exists():
+        metadata = path.stat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise AppDockError("update output is not a regular single-link file")
     path.parent.mkdir(parents=True, exist_ok=True)
+    _assert_safe_directory_ancestors(path.parent)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    _assert_safe_directory_ancestors(temporary.parent)
     with temporary.open("wb") as stream:
         stream.write(payload)
         stream.flush()
         os.fsync(stream.fileno())
+    _assert_safe_directory_ancestors(path.parent)
+    if _is_link_or_reparse(path) or (path.exists() and path.stat().st_nlink != 1):
+        temporary.unlink(missing_ok=True)
+        raise AppDockError("update output path changed while writing")
     os.replace(temporary, path)
     _fsync_directory(path.parent)
 
@@ -248,7 +263,7 @@ def _durable_write_json(path: Path, payload: Any) -> None:
 
 
 def _durable_copy(source: Path, destination: Path) -> None:
-    _durable_write_bytes(destination, source.read_bytes())
+    _durable_write_bytes(destination, _read_regular_single_link(source, MAX_UPDATE_UNCOMPRESSED_BYTES))
 
 
 def _inside(path: Path, root: Path) -> bool:
@@ -1383,11 +1398,75 @@ def _safe_package_file(root: Path, relative: Any) -> Path:
     return path
 
 
+def _read_regular_single_link(path: Path, maximum: int) -> bytes:
+    """Read an existing file while binding its bytes to one stable inode."""
+    path = Path(path).expanduser().absolute()
+    _assert_no_link_or_reparse_ancestor(path)
+    try:
+        observed = path.lstat()
+    except OSError as exc:
+        raise AppDockError("file is missing or unsafe") from exc
+    if _is_link_or_reparse(path) or not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+        raise AppDockError("file is not a regular single-link file")
+    if observed.st_size > maximum:
+        raise AppDockError("file is too large")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise AppDockError("file could not be opened safely") from exc
+    try:
+        opened = os.fstat(descriptor)
+        identity = (observed.st_dev, observed.st_ino)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != identity
+            or opened.st_size > maximum
+        ):
+            raise AppDockError("file changed while opening")
+        chunks: list[bytes] = []
+        total = 0
+        while total <= maximum:
+            chunk = os.read(descriptor, min(1024 * 1024, maximum - total + 1))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > maximum:
+                raise AppDockError("file is too large")
+        after = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(after.st_mode)
+            or after.st_nlink != 1
+            or (after.st_dev, after.st_ino) != identity
+            or after.st_size != total
+        ):
+            raise AppDockError("file changed while reading")
+        try:
+            final = path.lstat()
+        except OSError as exc:
+            raise AppDockError("file changed after reading") from exc
+        if (
+            _is_link_or_reparse(path)
+            or not stat.S_ISREG(final.st_mode)
+            or final.st_nlink != 1
+            or (final.st_dev, final.st_ino) != identity
+            or final.st_size != total
+        ):
+            raise AppDockError("file changed after reading")
+        return b"".join(chunks)
+    except OSError as exc:
+        if isinstance(exc, AppDockError):
+            raise
+        raise AppDockError("file could not be read safely") from exc
+    finally:
+        os.close(descriptor)
+
+
 def _read_bounded_json(path: Path, maximum: int = MAX_JSON_BYTES) -> Any:
     try:
-        if not path.is_file() or path.is_symlink() or _is_link_or_reparse(path) or path.stat().st_size > maximum:
-            raise AppDockError("JSON file is missing, unsafe, or too large")
-        return _loads_strict_json(path.read_text(encoding="utf-8"))
+        return _loads_strict_json(_read_regular_single_link(path, maximum).decode("utf-8"))
     except (OSError, UnicodeDecodeError) as exc:
         raise AppDockError("JSON file is invalid") from exc
 
@@ -2651,9 +2730,16 @@ def _release_path(root: Path, relative: str, *, require_file: bool = True) -> Pa
     if _is_link_or_reparse(target_lexical):
         raise AppDockError("release inventory member is a symlink or reparse point")
     target = target_lexical.resolve()
-    if not _inside(target, root) or (require_file and not target.is_file()):
+    if not _inside(target, root):
         raise AppDockError("release inventory path escapes its root")
-    return target
+    if not target_lexical.exists():
+        if require_file:
+            raise AppDockError("release inventory member is missing")
+        return target_lexical
+    metadata = target_lexical.lstat()
+    if _is_link_or_reparse(target_lexical) or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise AppDockError("release inventory member is not a regular single-link file")
+    return target_lexical
 
 
 def _load_release_inventory(root: Path, *, complete: bool) -> dict[str, str]:
@@ -2662,15 +2748,11 @@ def _load_release_inventory(root: Path, *, complete: bool) -> dict[str, str]:
     if _is_link_or_reparse(root):
         raise AppDockError("release tree root is unsafe")
     manifest_path = root / RELEASE_MANIFEST_NAME
-    if not manifest_path.is_file() or manifest_path.is_symlink():
+    if not manifest_path.exists():
         if complete:
             raise AppDockError("release inventory is missing")
         return {}
-    _assert_no_link_or_reparse_ancestor(manifest_path)
-    manifest_stat = manifest_path.stat()
-    if not stat.S_ISREG(manifest_stat.st_mode) or manifest_stat.st_nlink != 1:
-        raise AppDockError("release inventory is not a regular single-link file")
-    inventory = _parse_release_manifest(manifest_path.read_bytes())
+    inventory = _parse_release_manifest(_read_regular_single_link(manifest_path, MAX_JSON_BYTES))
     if complete:
         actual: set[str] = set()
         for path in root.rglob("*"):
@@ -2683,10 +2765,13 @@ def _load_release_inventory(root: Path, *, complete: bool) -> dict[str, str]:
             raise AppDockError("release tree does not match its inventory")
         for relative, expected_digest in inventory.items():
             target = _release_path(root, relative)
-            metadata = target.stat()
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-                raise AppDockError("release tree contains an unsafe file")
-            actual_digest = hashlib.sha256(target.read_bytes()).hexdigest()
+            actual_digest = hashlib.sha256(_read_regular_single_link(target, MAX_UPDATE_UNCOMPRESSED_BYTES)).hexdigest()
+            if actual_digest != expected_digest:
+                raise AppDockError("release file checksum does not match its inventory")
+    else:
+        for relative, expected_digest in inventory.items():
+            target = _release_path(root, relative)
+            actual_digest = hashlib.sha256(_read_regular_single_link(target, MAX_UPDATE_UNCOMPRESSED_BYTES)).hexdigest()
             if actual_digest != expected_digest:
                 raise AppDockError("release file checksum does not match its inventory")
     return inventory
@@ -2694,7 +2779,11 @@ def _load_release_inventory(root: Path, *, complete: bool) -> dict[str, str]:
 
 def _staged_inventory_records(staged: Path, inventory: dict[str, str]) -> list[dict[str, Any]]:
     return [
-        {"path": relative, "sha256": digest, "size": _release_path(staged, relative).stat().st_size}
+        {
+            "path": relative,
+            "sha256": digest,
+            "size": len(_read_regular_single_link(_release_path(staged, relative), MAX_UPDATE_UNCOMPRESSED_BYTES)),
+        }
         for relative, digest in sorted(inventory.items())
     ]
 
@@ -2703,7 +2792,7 @@ def _staged_identity(staged: Path, *, zip_sha256: str | None = None, complete: b
     inventory = _load_release_inventory(staged, complete=complete)
     records = _staged_inventory_records(staged, inventory)
     helper = _release_path(staged, "scripts/update_helper.py")
-    helper_digest = hashlib.sha256(helper.read_bytes()).hexdigest()
+    helper_digest = hashlib.sha256(_read_regular_single_link(helper, MAX_UPDATE_UNCOMPRESSED_BYTES)).hexdigest()
     identity = {
         "zip_sha256": zip_sha256,
         "inventory_sha256": hashlib.sha256(_canonical_json(records)).hexdigest(),
@@ -2958,11 +3047,17 @@ def stage_update(release: dict[str, Any], config: AppDockConfig, *, opener: Call
 
 
 def _update_transactions_root(data: Path) -> Path:
-    root = (data / "updates" / "transactions").resolve()
+    data = Path(data).expanduser().absolute()
+    _assert_safe_directory_ancestors(data)
+    root = data / "updates" / "transactions"
+    _assert_safe_directory_ancestors(root)
     if not _inside(root, data):
         raise AppDockError("update transaction root is unsafe")
     root.mkdir(parents=True, exist_ok=True)
-    return root
+    _assert_safe_directory_ancestors(root)
+    if _is_link_or_reparse(root) or not root.is_dir():
+        raise AppDockError("update transaction root is unsafe")
+    return root.resolve()
 
 
 def _update_journal(tx_root: Path) -> dict[str, Any]:
@@ -2977,10 +3072,78 @@ def _update_journal(tx_root: Path) -> dict[str, Any]:
         or not isinstance(journal.get("old_exists"), bool)
         or not isinstance(journal.get("files"), list)
         or not isinstance(journal.get("preexisting"), list)
+        or not all(isinstance(journal.get(field), str) and journal[field] for field in ("operation_id", "install", "candidate", "backup"))
     ):
         raise AppDockError("update transaction is invalid")
+    if not isinstance(journal["identity"], dict):
+        raise AppDockError("update transaction identity is invalid")
+    if journal["phase"] in {"prepared", "swapping", "rolled_back"} and journal["recovery"] != "restore-old":
+        raise AppDockError("update transaction recovery phase is invalid")
+    if journal["phase"] in {"committed", "complete"} and journal["recovery"] != "finish-new":
+        raise AppDockError("update transaction recovery phase is invalid")
+    for field in ("files", "preexisting"):
+        values = journal[field]
+        if not all(isinstance(item, str) and item and "\\" not in item and not Path(item).is_absolute() and all(part not in {"", ".", ".."} for part in PurePosixPath(item).parts) for item in values):
+            raise AppDockError("update transaction file list is invalid")
+        if len(values) != len(set(values)):
+            raise AppDockError("update transaction file list contains duplicates")
+    if not set(journal["preexisting"]).issubset(set(journal["files"])):
+        raise AppDockError("update transaction preexisting list is invalid")
     _validate_staged_identity(journal["identity"], require_zip=journal["identity"].get("zip_sha256") is not None)
     return journal
+
+
+def _lexical_path_key(path: str | Path) -> str:
+    return os.path.normcase(os.path.normpath(os.path.abspath(str(Path(path).expanduser()))))
+
+
+def _transaction_paths(install: Path, data: Path, operation_id: str) -> dict[str, Path]:
+    if not UPDATE_OPERATION_ID_RE.fullmatch(operation_id):
+        raise AppDockError("update transaction operation id is invalid")
+    install, data = _validated_update_roots(install, data)
+    transactions = _update_transactions_root(data)
+    tx_root = transactions / operation_id
+    candidate = install.parent / f".{install.name}.appdock-{operation_id}.candidate"
+    backup = install.parent / f".{install.name}.appdock-{operation_id}.backup"
+    evidence_backup = data / "updates" / "backups" / operation_id
+    for path in (tx_root, candidate, backup, evidence_backup):
+        _assert_no_link_or_reparse_ancestor(path)
+    return {
+        "tx_root": tx_root,
+        "journal": tx_root / "transaction.json",
+        "install": install,
+        "candidate": candidate,
+        "backup": backup,
+        "evidence_backup": evidence_backup,
+    }
+
+
+def _validated_transaction_context(tx_root: Path, install: Path, data: Path) -> dict[str, Any]:
+    """Validate all transaction paths before exposing any destructive operation."""
+    install, data = _validated_update_roots(install, data)
+    tx_lexical = Path(tx_root).expanduser().absolute()
+    _assert_no_link_or_reparse_ancestor(tx_lexical)
+    if _is_link_or_reparse(tx_lexical) or not tx_lexical.is_dir() or not UPDATE_OPERATION_ID_RE.fullmatch(tx_lexical.name):
+        raise AppDockError("update transaction root is unsafe")
+    derived = _transaction_paths(install, data, tx_lexical.name)
+    if _lexical_path_key(tx_lexical) != _lexical_path_key(derived["tx_root"]):
+        raise AppDockError("update transaction root does not match its operation")
+    journal = _update_journal(tx_lexical)
+    operation_id = journal["operation_id"]
+    if operation_id != tx_lexical.name:
+        raise AppDockError("update transaction operation does not match its root")
+    if _lexical_path_key(journal["install"]) != _lexical_path_key(derived["install"]):
+        raise AppDockError("update transaction installation path is invalid")
+    if _lexical_path_key(journal["candidate"]) != _lexical_path_key(derived["candidate"]):
+        raise AppDockError("update transaction candidate path is invalid")
+    if _lexical_path_key(journal["backup"]) != _lexical_path_key(derived["backup"]):
+        raise AppDockError("update transaction backup path is invalid")
+    for name in ("candidate", "backup"):
+        path = derived[name]
+        _assert_no_link_or_reparse_ancestor(path)
+        if path.exists() and (not path.is_dir() or _is_link_or_reparse(path)):
+            raise AppDockError("update transaction path is not a directory")
+    return {**derived, "journal_data": journal}
 
 
 def _set_update_phase(tx_root: Path, journal: dict[str, Any], phase: str, recovery: str) -> None:
@@ -2990,6 +3153,9 @@ def _set_update_phase(tx_root: Path, journal: dict[str, Any], phase: str, recove
 
 
 def _copy_release_tree(source: Path, destination: Path) -> None:
+    _assert_safe_directory_ancestors(destination.parent)
+    if _is_link_or_reparse(destination):
+        raise AppDockError("release tree destination is unsafe")
     destination.mkdir(parents=True, exist_ok=False)
     for path in sorted(source.rglob("*")):
         relative = path.relative_to(source)
@@ -3003,6 +3169,20 @@ def _copy_release_tree(source: Path, destination: Path) -> None:
         else:
             raise AppDockError("release tree contains a non-file member")
     _fsync_directory(destination)
+
+
+def _safe_backup_copy(source: Path, destination: Path) -> None:
+    """Snapshot a managed source before copying it into the transaction backup."""
+    payload = _read_regular_single_link(source, MAX_UPDATE_UNCOMPRESSED_BYTES)
+    _assert_safe_directory_ancestors(destination.parent)
+    probe = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.backup-tmp")
+    try:
+        # Keep the existing copy2 failure seam while publishing only the
+        # opened-handle-verified snapshot through the durable writer.
+        shutil.copy2(source, probe)
+    finally:
+        probe.unlink(missing_ok=True)
+    _durable_write_bytes(destination, payload)
 
 
 LEGACY_RELEASE_TOP_LEVEL = {
@@ -3034,6 +3214,8 @@ def _validate_installed_tree(install: Path) -> tuple[dict[str, str], list[str]]:
         if path.is_symlink() or _is_link_or_reparse(path):
             raise AppDockError("managed installation contains a symlink or reparse point")
         if path.is_file():
+            relative = path.relative_to(install).as_posix()
+            _release_path(install, relative)
             actual.add(path.relative_to(install).as_posix())
     allowed_generated = {"run-appdock.cmd"}
     if not inventory:
@@ -3043,7 +3225,7 @@ def _validate_installed_tree(install: Path) -> tuple[dict[str, str], list[str]]:
         if "appdock.py" not in managed or not all(_legacy_release_path(relative) for relative in managed):
             raise AppDockError("managed installation has no trusted release inventory")
         inventory = {
-            relative: hashlib.sha256(_release_path(install, relative).read_bytes()).hexdigest()
+            relative: hashlib.sha256(_read_regular_single_link(_release_path(install, relative), MAX_UPDATE_UNCOMPRESSED_BYTES)).hexdigest()
             for relative in sorted(managed)
         }
         return inventory, sorted(actual - managed)
@@ -3053,23 +3235,19 @@ def _validate_installed_tree(install: Path) -> tuple[dict[str, str], list[str]]:
         raise AppDockError("managed installation contains unexpected unowned files")
     for relative, digest in inventory.items():
         target = _release_path(install, relative)
-        if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
+        if hashlib.sha256(_read_regular_single_link(target, MAX_UPDATE_UNCOMPRESSED_BYTES)).hexdigest() != digest:
             raise AppDockError("managed installation file does not match its release inventory")
     return inventory, sorted(extras)
 
 
-def _recover_one_update(tx_root: Path, *, phase_hook: Callable[[str], None] | None = None) -> str:
-    journal = _update_journal(tx_root)
+def _recover_one_update(tx_root: Path, *, install: Path, data: Path, phase_hook: Callable[[str], None] | None = None) -> str:
+    context = _validated_transaction_context(tx_root, install, data)
+    journal = context["journal_data"]
     if journal["phase"] in {"complete", "rolled_back"}:
         return journal["phase"]
-    install_lexical = Path(journal["install"]).expanduser().absolute()
-    candidate_lexical = Path(journal["candidate"]).expanduser().absolute()
-    backup_lexical = Path(journal["backup"]).expanduser().absolute()
-    for root in (install_lexical, candidate_lexical, backup_lexical):
-        _assert_no_link_or_reparse_ancestor(root)
-    install = install_lexical.resolve()
-    candidate = candidate_lexical.resolve()
-    backup = backup_lexical.resolve()
+    install = context["install"]
+    candidate = context["candidate"]
+    backup = context["backup"]
     finish_new = journal["phase"] == "committed" or journal["recovery"] == "finish-new"
     if phase_hook:
         phase_hook("recovery:finish-new" if finish_new else "recovery:restore-old")
@@ -3085,8 +3263,8 @@ def _recover_one_update(tx_root: Path, *, phase_hook: Callable[[str], None] | No
             _remove_tree(backup)
         if candidate.exists():
             _remove_tree(candidate)
-        _remove_tree(tx_root.parent.parent / "backups" / journal["operation_id"], ignore_errors=True)
-        _set_update_phase(tx_root, journal, "complete", "finish-new")
+        _remove_tree(context["evidence_backup"], ignore_errors=True)
+        _set_update_phase(context["tx_root"], journal, "complete", "finish-new")
         return "complete"
     if journal["old_exists"]:
         if backup.is_dir():
@@ -3102,25 +3280,25 @@ def _recover_one_update(tx_root: Path, *, phase_hook: Callable[[str], None] | No
     if candidate.exists():
         _verify_identity_tree(candidate, journal["identity"], complete=False)
         _remove_tree(candidate)
-    _remove_tree(tx_root.parent.parent / "backups" / journal["operation_id"], ignore_errors=True)
-    _set_update_phase(tx_root, journal, "rolled_back", "restore-old")
+    _remove_tree(context["evidence_backup"], ignore_errors=True)
+    _set_update_phase(context["tx_root"], journal, "rolled_back", "restore-old")
     return "rolled_back"
 
 
 @_locked_transaction(0)
 def recover_update_transactions(data_dir: str | Path, *, expected_install: str | Path | None = None, phase_hook: Callable[[str], None] | None = None) -> list[str]:
-    data = Path(data_dir).expanduser().resolve()
+    if expected_install is None:
+        raise AppDockError("expected installation root is required for update recovery")
+    expected, data = _validated_update_roots(expected_install, data_dir)
     root = _update_transactions_root(data)
-    expected = Path(expected_install).expanduser().resolve() if expected_install is not None else None
     recovered: list[str] = []
     for tx_root in sorted(root.iterdir(), key=lambda item: item.name):
         if not tx_root.is_dir() or tx_root.is_symlink() or _is_link_or_reparse(tx_root):
             raise AppDockError("update transaction root is unsafe")
-        journal = _update_journal(tx_root)
-        if expected is not None and Path(journal["install"]).resolve() != expected:
-            continue
+        context = _validated_transaction_context(tx_root, expected, data)
+        journal = context["journal_data"]
         if journal["phase"] not in {"complete", "rolled_back"}:
-            recovered.append(_recover_one_update(tx_root, phase_hook=phase_hook))
+            recovered.append(_recover_one_update(tx_root, install=expected, data=data, phase_hook=phase_hook))
     return recovered
 
 
@@ -3173,26 +3351,29 @@ def apply_update(
     current_inventory, generated = _validate_installed_tree(install)
     target_files = {*target_inventory, RELEASE_MANIFEST_NAME}
     current_files = set(current_inventory)
-    if (install / RELEASE_MANIFEST_NAME).is_file():
+    if (install / RELEASE_MANIFEST_NAME).exists():
+        _release_path(install, RELEASE_MANIFEST_NAME)
         current_files.add(RELEASE_MANIFEST_NAME)
     affected = sorted(target_files | current_files)
     operation_id = uuid.uuid4().hex
-    tx_root = _update_transactions_root(data) / operation_id
+    paths = _transaction_paths(install, data, operation_id)
+    tx_root = paths["tx_root"]
     tx_root.mkdir(parents=True, exist_ok=False)
-    evidence_backup = data / "updates" / "backups" / operation_id
+    _assert_no_link_or_reparse_ancestor(tx_root)
+    evidence_backup = paths["evidence_backup"]
     try:
         if install.exists():
             for path in sorted(install.rglob("*")):
                 if path.is_file():
                     destination = evidence_backup / path.relative_to(install)
                     destination.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(path, destination)
+                    _safe_backup_copy(path, destination)
     except Exception as exc:
         _remove_tree(evidence_backup, ignore_errors=True)
         _remove_tree(tx_root, ignore_errors=True)
         raise AppDockError("update backup failed; installation was not changed") from exc
-    candidate = install.parent / f".{install.name}.appdock-{operation_id}.candidate"
-    backup = install.parent / f".{install.name}.appdock-{operation_id}.backup"
+    candidate = paths["candidate"]
+    backup = paths["backup"]
     if candidate.exists() or backup.exists():
         raise AppDockError("update transaction paths already exist")
     try:
@@ -3253,7 +3434,7 @@ def apply_update(
             restart()
             finalize_update(result, install, data)
     except BaseException as exc:
-        _recover_one_update(tx_root)
+        _recover_one_update(tx_root, install=install, data=data)
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise
         raise AppDockError("update failed and was rolled back") from exc
@@ -3263,15 +3444,16 @@ def apply_update(
 @_locked_transaction(2)
 def finalize_update(applied: dict[str, Any], install_dir: str | Path, data_dir: str | Path) -> None:
     install, data = _validated_update_roots(install_dir, data_dir)
-    transaction = Path(str(applied.get("transaction") or "")).resolve()
-    if not transaction.is_file() or not _inside(transaction, _update_transactions_root(data)):
+    transaction = Path(str(applied.get("transaction") or "")).expanduser().absolute()
+    _assert_no_link_or_reparse_ancestor(transaction)
+    if transaction.name != "transaction.json":
         raise AppDockError("update transaction path is invalid")
     tx_root = transaction.parent
-    journal = _update_journal(tx_root)
-    if Path(journal["install"]).resolve() != install or journal["phase"] != "committed":
+    context = _validated_transaction_context(tx_root, install, data)
+    if _lexical_path_key(transaction) != _lexical_path_key(context["journal"]) or context["journal_data"]["phase"] != "committed":
         raise AppDockError("update transaction is not ready to finalize")
-    _verify_identity_tree(install, journal["identity"], complete=False)
-    _recover_one_update(tx_root)
+    _verify_identity_tree(install, context["journal_data"]["identity"], complete=False)
+    _recover_one_update(tx_root, install=install, data=data)
 
 
 @_locked_transaction(2)
@@ -3279,24 +3461,28 @@ def rollback_update(applied: dict[str, Any], install_dir: str | Path, data_dir: 
     install, data = _validated_update_roots(install_dir, data_dir)
     transaction_raw = applied.get("transaction")
     if isinstance(transaction_raw, str) and transaction_raw:
-        transaction = Path(transaction_raw).resolve()
-        if not transaction.is_file() or not _inside(transaction, _update_transactions_root(data)):
+        transaction = Path(transaction_raw).expanduser().absolute()
+        _assert_no_link_or_reparse_ancestor(transaction)
+        if transaction.name != "transaction.json":
             raise AppDockError("update transaction path is invalid")
         tx_root = transaction.parent
-        journal = _update_journal(tx_root)
-        if Path(journal["install"]).resolve() != install:
-            raise AppDockError("update transaction installation path is invalid")
+        context = _validated_transaction_context(tx_root, install, data)
+        if _lexical_path_key(transaction) != _lexical_path_key(context["journal"]):
+            raise AppDockError("update transaction path is invalid")
+        journal = context["journal_data"]
         if journal["phase"] == "complete":
             raise AppDockError("finalized update can no longer be rolled back automatically")
         journal["phase"] = "swapping"
         journal["recovery"] = "restore-old"
-        _durable_write_json(transaction, journal)
-        _recover_one_update(tx_root)
+        _durable_write_json(context["journal"], journal)
+        _recover_one_update(tx_root, install=install, data=data)
         return
     # Compatibility for pre-v0.1.1 in-memory results retained for focused rollback tests.
-    backup = Path(str(applied.get("backup") or "")).resolve()
-    backup_root = (data / "updates" / "backups").resolve()
-    if not backup.is_dir() or not _inside(backup, backup_root):
+    backup = Path(str(applied.get("backup") or "")).expanduser().absolute()
+    backup_root = data / "updates" / "backups"
+    _assert_no_link_or_reparse_ancestor(backup_root)
+    _assert_no_link_or_reparse_ancestor(backup)
+    if not backup.is_dir() or _is_link_or_reparse(backup) or not _inside(backup, backup_root):
         raise AppDockError("update backup path is invalid")
     files = applied.get("files")
     preexisting = applied.get("preexisting")
@@ -3309,16 +3495,14 @@ def rollback_update(applied: dict[str, Any], install_dir: str | Path, data_dir: 
         relative = Path(raw_relative)
         if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
             raise AppDockError("update rollback path is invalid")
-        target = (install / relative).resolve()
-        saved = (backup / relative).resolve()
-        if not _inside(target, install) or not _inside(saved, backup):
-            raise AppDockError("update rollback path escapes its root")
+        target = _release_path(install, raw_relative, require_file=False)
+        saved = _release_path(backup, raw_relative)
         if raw_relative in preexisting_set:
-            if not saved.is_file():
-                raise AppDockError("update rollback backup is incomplete")
             _durable_copy(saved, target)
         else:
-            target.unlink(missing_ok=True)
+            if target.exists():
+                _release_path(install, raw_relative)
+                target.unlink()
 
 
 def _is_development_checkout(install_dir: Path) -> bool:
@@ -3350,11 +3534,9 @@ def launch_update_helper(
         _assert_no_link_or_reparse_ancestor(root)
     if _is_development_checkout(install):
         raise AppDockError("one-click updates are disabled in a .git checkout; use git pull")
-    helper = Path(helper_path).expanduser().absolute() if helper_path else staged / "scripts" / "update_helper.py"
     if not _inside(staged, data / "updates"):
         raise AppDockError("staged update path is invalid")
-    if not helper.is_file() or helper.is_symlink() or not _inside(helper, staged):
-        raise AppDockError("verified staged update helper is not installed")
+    helper = _release_path(staged, "scripts/update_helper.py")
     staged_config = AppDockConfig.from_environment(data_dir=data)
     claimed_record = expected_identity if isinstance(expected_identity, dict) and "identity" in expected_identity else None
     if claimed_record is not None:
@@ -3367,7 +3549,7 @@ def launch_update_helper(
             if identity_claim["inventory_sha256"] != identity["inventory_sha256"] or identity_claim["helper_sha256"] != identity["helper_sha256"] or identity_claim["inventory"] != identity["inventory"]:
                 raise AppDockError("staged update identity does not match staged bytes")
             identity = identity_claim
-    if hashlib.sha256(helper.read_bytes()).hexdigest() != identity["helper_sha256"]:
+    if hashlib.sha256(_read_regular_single_link(helper, MAX_UPDATE_UNCOMPRESSED_BYTES)).hexdigest() != identity["helper_sha256"]:
         raise AppDockError("staged update helper checksum does not match its identity")
     if claimed_record is not None:
         # The stage is user-writable after staging. Revalidate the complete

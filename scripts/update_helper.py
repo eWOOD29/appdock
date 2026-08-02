@@ -12,6 +12,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import Callable
 
 # The helper is deliberately stdlib-only and imports the update primitive before
 # waiting. The parent AppDock process can therefore exit and replace its files.
@@ -197,6 +198,23 @@ def _verify_helper_identity(
     return receipt
 
 
+def _restore_existing_service_after_preapply_failure(
+    restart_script: Path,
+    install: Path,
+    data: Path,
+    restart_args: list[str],
+    log: Callable[[str], None],
+) -> bool:
+    """Restore the old serving process after the parent has handed off."""
+    try:
+        _launch_and_wait(restart_script, install, restart_args, startup_data=data)
+    except Exception as exc:
+        log(f"existing AppDock could not be restored before apply: {exc}")
+        return False
+    log("existing AppDock restored and readiness verified before apply")
+    return True
+
+
 def _launch_and_wait(
     restart_script: Path,
     install: Path,
@@ -277,10 +295,16 @@ def run(
         )
     except Exception as exc:
         log(f"update helper identity verification failed: {exc}")
+        _restore_existing_service_after_preapply_failure(restart_script, install, data, restart_args, log)
         return 1
     try:
         with acquire_update_lock(data):
-            recover_update_transactions(data, expected_install=install)
+            try:
+                recover_update_transactions(data, expected_install=install)
+            except Exception as exc:
+                _restore_existing_service_after_preapply_failure(restart_script, install, data, restart_args, log)
+                log(f"update recovery failed before apply: {exc}")
+                return 1
             service_restored = False
             try:
                 result = apply_update(
