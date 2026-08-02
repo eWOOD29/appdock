@@ -17,7 +17,7 @@ GitHub may receive ordinary connection metadata for the Releases request, such a
 
 ## Updating from v0.1.0
 
-The v0.1.0 one-click updater intentionally cannot apply v0.1.1's release-inventory schema. Install v0.1.1 manually once using the verified ZIP and Windows installer; see [Migrating an existing AppDock setup](MIGRATING.md#v010--v011-safety-migration). This fail-closed transition prevents the older helper from bypassing v0.1.1's instance-specific readiness and durable replacement behavior.
+The v0.1.0 one-click updater intentionally cannot apply v0.1.1's release-inventory schema. Install v0.1.1 manually once using the verified ZIP and Windows installer; see [Migrating an existing AppDock setup](MIGRATING.md#v010-v011-safety-migration). This fail-closed transition prevents the older helper from bypassing v0.1.1's instance-specific readiness and durable replacement behavior.
 
 ## Apply flow
 

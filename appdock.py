@@ -2689,9 +2689,9 @@ def _assert_zip_member(name: str, info: zipfile.ZipInfo) -> None:
     reserved = {"data", "registry", "apps", "runtime", "staging", "updates", "user-data"}
     if any(part.lower() in reserved for part in parts):
         raise AppDockError("update ZIP contains a reserved or escaping path")
-    mode = (info.external_attr >> 16) & 0o170000
-    if mode == stat.S_IFLNK:
-        raise AppDockError("update ZIP contains a symlink")
+    mode = stat.S_IFMT(info.external_attr >> 16)
+    if not info.is_dir() and mode not in {0, stat.S_IFREG}:
+        raise AppDockError("update ZIP contains a nonregular member")
 
 
 def _parse_release_manifest(data: bytes) -> dict[str, str]:

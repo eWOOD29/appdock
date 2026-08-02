@@ -127,7 +127,7 @@ Do not bypass these checks; download and verify the release manually if diagnosi
 
 1. Read `%LOCALAPPDATA%\AppDock\runtime\update.log`.
 2. Confirm the old process exited.
-3. Follow [manual rollback](UPDATES.md#manual-rollback).
+3. Follow [manual rollback](UPDATES.md#manual-recovery).
 4. Preserve the data directory.
 5. Report a sanitized bug if the helper failed after checksum/archive validation.
 
