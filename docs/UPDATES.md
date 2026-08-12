@@ -84,7 +84,7 @@ A development clone should use Git (`git pull`) and the normal test workflow rat
 
 Every release must:
 
-- use a semantic version tag such as `v0.2.1` for Stable or `v0.2.1-beta.1` for Beta;
+- use a semantic version tag such as `v0.2.1` for Stable or `v0.2.2-beta.1` for Beta;
 - run the test suite on Windows and Linux;
 - build `appdock-windows.zip` from tracked release files on Windows and Ubuntu and prove the exact ZIP bytes are identical;
 - publish `SHA256SUMS.txt` containing the archive digest;

@@ -4,6 +4,8 @@ All notable changes to AppDock are documented here. The project follows Semantic
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-12
+
 ### Added
 
 - Opt-in **Beta** update channel with Stable as the fail-safe default.
