@@ -24,6 +24,13 @@ from appdock import AppDockError, AppDockConfig, _assert_no_link_or_reparse_ance
 RESTART_READY_TIMEOUT_SECONDS = 20.0
 
 
+def _process_group_options() -> dict[str, object]:
+    """Keep the restarted service out of the helper/test console process group."""
+    if os.name == "nt":
+        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+    return {"start_new_session": True}
+
+
 def _safe_append_update_log(path: Path, message: str) -> None:
     """Append one line without following an unsafe or multiply-linked log file."""
     path = path.expanduser().absolute()
@@ -230,13 +237,17 @@ def _launch_and_wait(
         sys.executable,
         str(restart_script),
         *restart_args,
-        "--ready-token",
-        ready_token,
-        "--update-helper-startup",
-        ready_token,
+        f"--ready-token={ready_token}",
+        f"--update-helper-startup={ready_token}",
     ]
     try:
-        restarted = subprocess.Popen(command, shell=False, cwd=str(install), close_fds=True)
+        restarted = subprocess.Popen(
+            command,
+            shell=False,
+            cwd=str(install),
+            close_fds=True,
+            **_process_group_options(),
+        )
     except OSError:
         if startup_receipt is not None:
             startup_receipt.unlink(missing_ok=True)

@@ -593,6 +593,7 @@ class ReleaseHardeningTests(unittest.TestCase):
                 child = _launch_and_wait(
                     install / 'appdock.py', install,
                     ['--host', '127.0.0.1', '--port', {str(port)!r}, '--data-dir', str(data)],
+                    ready_token='-option-shaped-ready-token-1234567890',
                 )
                 marker.write_text('ready', encoding='utf-8')
                 time.sleep(1)
@@ -656,6 +657,8 @@ class ReleaseHardeningTests(unittest.TestCase):
                 _stdout, helper_stderr = helper_process.communicate(timeout=5)
                 self.fail(f"helper wrapper did not clean up its process tree: {helper_stderr}")
             self.assertEqual(helper_process.returncode, 0, helper_stderr)
+            lock = acquire_update_lock(self.config.data_root)
+            lock.release()
 
     def test_fresh_coordinator_rehydrates_stage_after_staging_process_loss(self) -> None:
         staged = self.config.updates_root / "0.2.1"
@@ -1226,6 +1229,55 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.assertEqual(captured[0][1], "-B")
         self.assertEqual(Path(captured[0][2]), staged / "scripts" / "update_helper.py")
         self.assertIn("--restart-arg=--port", captured[0])
+
+    def test_restart_readiness_token_is_bound_to_its_option(self) -> None:
+        install = self.root / "install-ready-token"
+        install.mkdir()
+        (install / "appdock.py").write_text("print('ok')", encoding="utf-8")
+        staged = self.config.updates_root / "0.3.5"
+        staged.mkdir(parents=True)
+        self.write_release_tree(staged)
+        captured: list[list[str]] = []
+
+        def ready_popen(command, **kwargs):
+            captured.append(command)
+            return SimpleNamespace(pid=123, poll=lambda: None)
+
+        with patch("scripts.update_helper.subprocess.Popen", side_effect=ready_popen), patch(
+            "scripts.update_helper._wait_for_restart_ready"
+        ):
+            update_helper._launch_and_wait(
+                install / "appdock.py",
+                install,
+                [],
+                ready_token="-option-shaped-ready-token-1234567890",
+            )
+
+        self.assertIn("--ready-token=-option-shaped-ready-token-1234567890", captured[0])
+        self.assertIn("--update-helper-startup=-option-shaped-ready-token-1234567890", captured[0])
+
+    @unittest.skipUnless(os.name == "nt", "Windows process-group regression")
+    def test_restart_child_isolated_and_tree_cleanup_does_not_signal_parent(self) -> None:
+        install = self.root / "install-process-group"
+        install.mkdir()
+        (install / "appdock.py").write_text("print('ok')", encoding="utf-8")
+        staged = self.config.updates_root / "0.3.6"
+        staged.mkdir(parents=True)
+        self.write_release_tree(staged)
+        captured: dict[str, object] = {}
+
+        def ready_popen(command, **kwargs):
+            captured["command"] = command
+            captured["kwargs"] = kwargs
+            return SimpleNamespace(pid=123, poll=lambda: None)
+
+        with patch("scripts.update_helper.subprocess.Popen", side_effect=ready_popen), patch(
+            "scripts.update_helper._wait_for_restart_ready"
+        ):
+            update_helper._launch_and_wait(install / "appdock.py", install, [], ready_token="ready-token-1234567890")
+
+        self.assertEqual(captured["kwargs"].get("creationflags"), subprocess.CREATE_NEW_PROCESS_GROUP)
+        self.assertNotIn("start_new_session", captured["kwargs"])
 
     def test_update_helper_launch_requires_transaction_handshake(self) -> None:
         install = self.root / "install-helper-handshake"
