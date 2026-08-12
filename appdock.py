@@ -403,7 +403,7 @@ def _update_lock_path(data_dir: str | Path) -> Path:
 
 def acquire_update_lock(data_dir: str | Path) -> UpdateLock:
     lock_path = _update_lock_path(data_dir)
-    key = str(lock_path)
+    key = os.path.normcase(str(lock_path.resolve()))
     with _UPDATE_LOCK_GUARD:
         existing = _UPDATE_LOCK_STATES.get(key)
         if existing is not None:
