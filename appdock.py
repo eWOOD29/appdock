@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from functools import wraps
 import hashlib
 import http.client
 import json
@@ -25,8 +26,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable
 
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
 MANIFEST_NAME = "appdock.json"
-CURRENT_VERSION = "0.1.2"
+CURRENT_VERSION = "0.2.0"
 DEFAULT_UPDATE_REPOSITORY = "eWOOD29/appdock"
 APP_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 SEMVER_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$")
@@ -45,6 +51,7 @@ MAX_EXTENSION_PROVIDERS = 8
 MAX_EXTENSION_WIDGETS = 16
 MAX_WIDGET_METRICS = 12
 MAX_WIDGET_PROGRESS = 6
+UPDATE_OPERATION_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 PRIVATE_PACKAGE_MANIFEST = "appdock-private-package.json"
 PRIVATE_PACKAGE_HASH_MANIFEST = "PACKAGE-MANIFEST.json"
 RELEASE_MANIFEST_NAME = "RELEASE-MANIFEST.json"
@@ -57,6 +64,16 @@ REQUIRED_RELEASE_FILES = {
     "scripts/install.ps1",
     "scripts/uninstall.ps1",
 }
+LM_STUDIO_TIMEOUT = 8.0
+LM_STUDIO_MAX_ERROR = 240
+LM_STUDIO_DOCS_URL = "https://lmstudio.ai/docs/cli"
+LM_LOAD_FIELDS = {
+    "model", "model_key", "gpu", "context_length", "parallel", "ttl", "identifier",
+    "speculative_draft_mtp", "speculative_draft_simple", "speculative_draft_model",
+    "speculative_draft_max_tokens", "speculative_draft_min_tokens",
+    "speculative_draft_min_continue_probability",
+}
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
 class AppDockError(Exception):
@@ -217,12 +234,26 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _durable_write_bytes(path: Path, payload: bytes) -> None:
+    path = Path(path).expanduser().absolute()
+    _assert_safe_directory_ancestors(path.parent)
+    if _is_link_or_reparse(path):
+        raise AppDockError("update output path is unsafe")
+    if path.exists():
+        metadata = path.stat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise AppDockError("update output is not a regular single-link file")
     path.parent.mkdir(parents=True, exist_ok=True)
+    _assert_safe_directory_ancestors(path.parent)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    _assert_safe_directory_ancestors(temporary.parent)
     with temporary.open("wb") as stream:
         stream.write(payload)
         stream.flush()
         os.fsync(stream.fileno())
+    _assert_safe_directory_ancestors(path.parent)
+    if _is_link_or_reparse(path) or (path.exists() and path.stat().st_nlink != 1):
+        temporary.unlink(missing_ok=True)
+        raise AppDockError("update output path changed while writing")
     os.replace(temporary, path)
     _fsync_directory(path.parent)
 
@@ -232,7 +263,7 @@ def _durable_write_json(path: Path, payload: Any) -> None:
 
 
 def _durable_copy(source: Path, destination: Path) -> None:
-    _durable_write_bytes(destination, source.read_bytes())
+    _durable_write_bytes(destination, _read_regular_single_link(source, MAX_UPDATE_UNCOMPRESSED_BYTES))
 
 
 def _inside(path: Path, root: Path) -> bool:
@@ -289,6 +320,131 @@ def _assert_no_link_or_reparse_ancestor(path: Path) -> None:
         current = parent
 
 
+def _assert_safe_directory_ancestors(path: Path) -> None:
+    current = path.expanduser().absolute()
+    while True:
+        if current.exists() or current.is_symlink():
+            if _is_link_or_reparse(current) or not current.is_dir():
+                raise AppDockError("updater path has an unsafe or non-directory ancestor")
+        parent = current.parent
+        if parent == current:
+            return
+        current = parent
+
+
+@dataclass
+class _UpdateLockState:
+    path: Path
+    stream: Any
+    owner_thread: int
+    references: int = 1
+
+
+class UpdateLock:
+    def __init__(self, key: str, state: _UpdateLockState):
+        self._key = key
+        self._state = state
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        with _UPDATE_LOCK_GUARD:
+            if self._released:
+                return
+            self._released = True
+            state = _UPDATE_LOCK_STATES.get(self._key)
+            if state is None:
+                return
+            state.references -= 1
+            if state.references:
+                return
+            try:
+                if os.name == "nt":
+                    state.stream.seek(0)
+                    msvcrt.locking(state.stream.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(state.stream.fileno(), fcntl.LOCK_UN)
+            finally:
+                state.stream.close()
+                _UPDATE_LOCK_STATES.pop(self._key, None)
+
+    def __enter__(self) -> "UpdateLock":
+        return self
+
+    def __exit__(self, _exc_type: Any, _exc_value: Any, _traceback: Any) -> None:
+        self.release()
+
+
+_UPDATE_LOCK_GUARD = threading.Lock()
+_UPDATE_LOCK_STATES: dict[str, _UpdateLockState] = {}
+
+
+def _update_lock_path(data_dir: str | Path) -> Path:
+    data = Path(data_dir).expanduser().absolute()
+    _assert_safe_directory_ancestors(data)
+    runtime = data / "runtime"
+    _assert_safe_directory_ancestors(runtime)
+    try:
+        runtime.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise AppDockError("could not prepare updater runtime directory") from exc
+    _assert_safe_directory_ancestors(data)
+    _assert_safe_directory_ancestors(runtime)
+    canonical_data = data.resolve()
+    canonical_runtime = runtime.resolve()
+    if not _inside(canonical_runtime, canonical_data):
+        raise AppDockError("updater runtime directory escapes the data root")
+    lock_path = runtime / "update.lock"
+    if _is_link_or_reparse(lock_path):
+        raise AppDockError("updater lock path is unsafe")
+    return lock_path
+
+
+def acquire_update_lock(data_dir: str | Path) -> UpdateLock:
+    lock_path = _update_lock_path(data_dir)
+    key = os.path.normcase(str(lock_path.resolve()))
+    with _UPDATE_LOCK_GUARD:
+        existing = _UPDATE_LOCK_STATES.get(key)
+        if existing is not None:
+            if existing.owner_thread != threading.get_ident():
+                raise AppDockError("could not acquire updater lock; another update may be in progress")
+            existing.references += 1
+            return UpdateLock(key, existing)
+        stream = None
+        try:
+            stream = lock_path.open("a+b")
+            if os.name == "nt":
+                stream.seek(0, os.SEEK_END)
+                if stream.tell() == 0:
+                    stream.write(b"\0")
+                    stream.flush()
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if stream is not None:
+                stream.close()
+            raise AppDockError("could not acquire updater lock; another update may be in progress") from exc
+        state = _UpdateLockState(lock_path, stream, threading.get_ident())
+        _UPDATE_LOCK_STATES[key] = state
+        return UpdateLock(key, state)
+
+
+def _locked_transaction(data_index: int) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    def decorate(function: Callable[..., Any]) -> Callable[..., Any]:
+        @wraps(function)
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            data_dir = args[data_index] if len(args) > data_index else kwargs.get("data_dir")
+            if data_dir is None:
+                raise AppDockError("update data directory is required")
+            with acquire_update_lock(data_dir):
+                return function(*args, **kwargs)
+        return wrapped
+    return decorate
+
+
 def _safe_child(root: Path, name: str) -> Path:
     if not isinstance(name, str) or not name or name in {".", ".."} or "/" in name or "\\" in name or not APP_ID_RE.fullmatch(name):
         raise ManifestError("unsafe app id")
@@ -322,11 +478,11 @@ def _assert_tree_safe(root: Path, containment_root: Path) -> None:
         raise AppDockError("staging path escapes data directory")
     for current, dirs, files in os.walk(root, followlinks=False):
         current_path = Path(current).resolve()
-        if not _inside(current_path, root):
+        if _is_link_or_reparse(Path(current)) or not _inside(current_path, root):
             raise AppDockError("staging path escapes its root")
         for name in [*dirs, *files]:
             path = Path(current) / name
-            if path.is_symlink() or not _inside(path.resolve(), root):
+            if path.is_symlink() or _is_link_or_reparse(path) or not _inside(path.resolve(), root):
                 raise AppDockError("staging contains an unsafe symlink or path")
 
 
@@ -355,6 +511,325 @@ def validate_bind_host(host: str) -> str:
     if not isinstance(host, str) or host not in {"127.0.0.1", "localhost", "::1"}:
         raise AppDockError("AppDock may bind only to a loopback host")
     return host
+
+
+def discover_lms(env: dict[str, str] | None = None) -> str | None:
+    """Find the optional LM Studio CLI without exposing its location to clients."""
+    environment = env if env is not None else os.environ
+    candidates: list[Path] = []
+    override = environment.get("APPDOCK_LMS_PATH", "").strip()
+    if override:
+        candidates.append(Path(override).expanduser())
+    profile = Path(environment.get("USERPROFILE") or str(Path.home())).expanduser()
+    local_app_data = Path(environment.get("LOCALAPPDATA") or (profile / "AppData" / "Local"))
+    for directory in (
+        profile / ".lmstudio" / "bin",
+        local_app_data / "LM Studio" / "bin",
+        profile / "AppData" / "Local" / "LM Studio" / "bin",
+    ):
+        for name in ("lms.exe", "lms.cmd", "lms"):
+            candidates.append(directory / name)
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return str(candidate.resolve())
+        except OSError:
+            continue
+    path_entries = [Path(entry) for entry in environment.get("PATH", "").split(os.pathsep) if entry]
+    for directory in path_entries:
+        for name in ("lms.exe", "lms.cmd", "lms"):
+            candidate = directory / name
+            try:
+                if candidate.is_file():
+                    return str(candidate.resolve())
+            except OSError:
+                continue
+    for name in ("lms.exe", "lms.cmd", "lms"):
+        found = shutil.which(name, path=environment.get("PATH"))
+        if found:
+            return found
+    return None
+
+
+def _bounded_cli_error(_text: str, fallback: str) -> str:
+    """Return a bounded generic CLI message; stderr may contain local paths."""
+    return fallback[:LM_STUDIO_MAX_ERROR]
+
+
+def _as_text(value: Any) -> str | None:
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _as_number(value: Any) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value != value or value in (float("inf"), float("-inf")):
+        return None
+    return value
+
+
+def _first_text(raw: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = _as_text(raw.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _safe_model_token(value: Any) -> str | None:
+    text = _as_text(value)
+    if text is None or len(text) > 256 or _CONTROL_RE.search(text):
+        return None
+    if text.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:[\\/]", text):
+        return None
+    return text
+
+
+def _normalize_model(raw: Any, *, loaded: bool = False) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    key = next((_safe_model_token(raw.get(name)) for name in ("modelKey", "model_key", "key", "model", "id") if _safe_model_token(raw.get(name)) is not None), None)
+    identifier = next((_safe_model_token(raw.get(name)) for name in ("identifier", "loadedIdentifier") if _safe_model_token(raw.get(name)) is not None), None)
+    if key is None and identifier is None:
+        return None
+    variants = raw.get("variants")
+    normalized_variants = [token for item in variants if (token := _safe_model_token(item)) is not None] if isinstance(variants, list) else []
+    quantization = raw.get("quantization")
+    if isinstance(quantization, dict):
+        quantization = _first_text(quantization, "name", "label")
+    else:
+        quantization = _as_text(quantization)
+    item: dict[str, Any] = {
+        "key": key or identifier,
+        "display_name": _first_text(raw, "displayName", "display_name", "name") or key or identifier or "Unknown model",
+        "type": _first_text(raw, "type", "modelType"),
+        "format": _first_text(raw, "format"),
+        "publisher": _first_text(raw, "publisher"),
+        "params": _first_text(raw, "paramsString", "params", "parameterCount"),
+        "architecture": _first_text(raw, "architecture", "architectureName"),
+        "quantization": quantization,
+        "size_bytes": _as_number(raw.get("sizeBytes", raw.get("size_bytes"))),
+        "vision": raw.get("vision") if isinstance(raw.get("vision"), bool) else None,
+        "tool_capability": raw.get("trainedForToolUse") if isinstance(raw.get("trainedForToolUse"), bool) else None,
+        "max_context": _as_number(raw.get("maxContextLength", raw.get("max_context"))),
+        "variants": normalized_variants,
+    }
+    if loaded:
+        ttl_ms = _as_number(raw.get("ttlMs"))
+        item.update({
+            "identifier": identifier or key,
+            "context_length": _as_number(raw.get("contextLength", raw.get("context_length"))),
+            "status": _first_text(raw, "status"),
+            "parallel": _as_number(raw.get("parallel")),
+            "ttl_seconds": ttl_ms / 1000 if ttl_ms is not None else _as_number(raw.get("ttl_seconds")),
+        })
+    return item
+
+
+def _identity_tokens(model: dict[str, Any]) -> set[str]:
+    values = [model.get("key"), *(model.get("variants") or [])]
+    return {
+        value.strip().replace("\\", "/").lower().rstrip("/")
+        for value in values
+        if isinstance(value, str) and value.strip()
+    }
+
+
+class LMStudioAdapter:
+    """Defensive, local-only adapter for the optional JSON-producing lms CLI."""
+
+    def __init__(self, executable: str | None = None, timeout: float = LM_STUDIO_TIMEOUT):
+        self.executable = executable if executable is not None else discover_lms()
+        self.timeout = max(0.1, min(float(timeout), LM_STUDIO_TIMEOUT))
+
+    def _json_command(self, args: list[str]) -> tuple[bool, Any, str, bool]:
+        if not self.executable:
+            return False, None, "LM Studio CLI was not found", False
+        try:
+            result = subprocess.run(
+                [self.executable, *args], shell=False, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=self.timeout, check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return False, None, "LM Studio CLI timed out", True
+        except (OSError, subprocess.SubprocessError):
+            return False, None, "LM Studio CLI could not be started", False
+        if result.returncode != 0:
+            return False, None, _bounded_cli_error(result.stderr, "LM Studio application/server is unavailable"), False
+        try:
+            value = json.loads(result.stdout)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False, None, f"lms {' '.join(args)} returned malformed JSON", False
+        if not isinstance(value, list):
+            return False, None, f"lms {' '.join(args)} returned an unexpected JSON shape", False
+        return True, value, "", False
+
+    def execute(self, args: list[str]) -> tuple[bool, bool, str]:
+        if not self.executable:
+            return False, False, "LM Studio CLI was not found"
+        try:
+            result = subprocess.run(
+                [self.executable, *args], shell=False, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=self.timeout, check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return False, True, "LM Studio CLI timed out"
+        except (OSError, subprocess.SubprocessError):
+            return False, False, "LM Studio CLI could not be started"
+        if result.returncode != 0:
+            return False, False, "LM Studio rejected the requested operation"
+        return True, False, ""
+
+    def snapshot(self) -> dict[str, Any]:
+        base = {
+            "available": bool(self.executable), "reachable": False, "running": False,
+            "status": "absent" if not self.executable else "unavailable",
+            "installed_models": [], "loaded_instances": [], "error": None, "warning": None,
+            "docs_url": LM_STUDIO_DOCS_URL,
+        }
+        if not self.executable:
+            base["error"] = "LM Studio is unavailable. This optional integration needs the lms CLI."
+            return base
+        ls_ok, ls_raw, ls_error, ls_timeout = self._json_command(["ls", "--json"])
+        ps_ok, ps_raw, ps_error, ps_timeout = self._json_command(["ps", "--json"])
+        installed = [model for raw in (ls_raw if ls_ok else []) if (model := _normalize_model(raw)) is not None]
+        loaded = [model for raw in (ps_raw if ps_ok else []) if (model := _normalize_model(raw, loaded=True)) is not None]
+        loaded_tokens = set().union(*(_identity_tokens(item) for item in loaded)) if loaded else set()
+        for model in installed:
+            model["loaded"] = bool(_identity_tokens(model) & loaded_tokens)
+        base.update({
+            "reachable": ls_ok or ps_ok,
+            "running": ps_ok,
+            "installed_models": installed,
+            "loaded_instances": loaded,
+        })
+        if ls_ok and ps_ok:
+            base["status"] = "empty" if not installed and not loaded else "running"
+        elif ls_timeout or ps_timeout:
+            base["status"] = "timeout"
+            base["warning"] = "LM Studio status check timed out."
+        elif ls_ok or ps_ok:
+            base["status"] = "partial"
+            failed = ls_error if not ls_ok else ps_error
+            base["warning"] = "LM Studio returned malformed status data." if "malformed" in failed or "unexpected JSON" in failed else ("Installed model list unavailable: lms ls failed." if not ls_ok else "Loaded model status unavailable: lms ps failed.")
+        else:
+            malformed = any("malformed" in error or "unexpected JSON" in error for error in (ls_error, ps_error))
+            if malformed:
+                base["status"] = "malformed"
+                base["error"] = "LM Studio returned malformed status data."
+            else:
+                base["error"] = "LM Studio CLI was found, but the application/server is unavailable."
+        return base
+
+
+def _validated_string(value: Any, field: str, maximum: int) -> str:
+    if not isinstance(value, str) or not value or len(value) > maximum or _CONTROL_RE.search(value):
+        raise ValueError(f"{field} must be a non-empty safe string of at most {maximum} characters")
+    return value
+
+
+def _validated_cli_operand(value: Any, field: str, maximum: int) -> str:
+    operand = _validated_string(value, field, maximum)
+    if operand.startswith("-"):
+        raise ValueError(f"{field} must not begin with '-'")
+    return operand
+
+
+def _validated_int(value: Any, field: str, minimum: int, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+        raise ValueError(f"{field} must be an integer from {minimum} to {maximum}")
+    return value
+
+
+def _validated_float(value: Any, field: str, minimum: float, maximum: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not minimum <= value <= maximum:
+        raise ValueError(f"{field} must be a number from {minimum} to {maximum}")
+    return float(value)
+
+
+def _installed_model_key(model: Any) -> str | None:
+    if not isinstance(model, dict) or not isinstance(model.get("key"), str) or not model["key"].strip():
+        return None
+    return _validated_cli_operand(model["key"].strip(), "installed model key", 256)
+
+
+def build_lm_load_args(request: dict[str, Any], installed_models: list[dict[str, Any]]) -> list[str]:
+    if not isinstance(request, dict):
+        raise ValueError("JSON body must be an object")
+    unknown = set(request) - LM_LOAD_FIELDS
+    if unknown:
+        raise ValueError("unknown load setting: " + sorted(unknown)[0])
+    if "model" in request and "model_key" in request:
+        raise ValueError("specify only one model key")
+    requested = _validated_cli_operand(request.get("model", request.get("model_key")), "model", 256)
+    canonical = next((key for item in installed_models if (key := _installed_model_key(item)) and key.lower().replace("\\", "/") == requested.lower().replace("\\", "/")), None)
+    if canonical is None:
+        raise ValueError("model must be one of the installed model keys")
+    args = ["load"]
+    gpu = request.get("gpu")
+    if gpu not in (None, "auto"):
+        if gpu in ("off", "max"):
+            args += ["--gpu", gpu]
+        else:
+            ratio = _validated_float(gpu, "gpu", 0.0, 1.0)
+            args += ["--gpu", str(int(ratio)) if ratio.is_integer() else str(ratio)]
+    if request.get("context_length") is not None:
+        args += ["--context-length", str(_validated_int(request["context_length"], "context_length", 1, 1_048_576))]
+    if request.get("parallel") is not None:
+        args += ["--parallel", str(_validated_int(request["parallel"], "parallel", 1, 128))]
+    if request.get("ttl") is not None:
+        args += ["--ttl", str(_validated_int(request["ttl"], "ttl", 1, 604800))]
+    if request.get("identifier") is not None:
+        args += ["--identifier", _validated_cli_operand(request["identifier"], "identifier", 128)]
+    mtp = request.get("speculative_draft_mtp", "default")
+    simple = request.get("speculative_draft_simple", "default")
+    if mtp not in {"default", "enable", "disable"}:
+        raise ValueError("speculative_draft_mtp must be enable, disable, or default")
+    if simple not in {"default", "enable", "disable"}:
+        raise ValueError("speculative_draft_simple must be enable, disable, or default")
+    if mtp == "enable" and simple == "enable":
+        raise ValueError("MTP and Simple speculative decoding cannot both be enabled")
+    draft_fields = ("speculative_draft_model", "speculative_draft_max_tokens", "speculative_draft_min_tokens", "speculative_draft_min_continue_probability")
+    draft_set = any(request.get(field) is not None for field in draft_fields)
+    if simple == "enable" and request.get("speculative_draft_model") is None:
+        raise ValueError("speculative_draft_model is required when Simple speculative decoding is enabled")
+    if simple != "enable" and request.get("speculative_draft_model") is not None:
+        raise ValueError("speculative_draft_model requires Simple speculative decoding")
+    if draft_set and simple != "enable" and mtp != "enable":
+        raise ValueError("draft settings require speculative decoding to be enabled")
+    if mtp == "enable":
+        args.append("--speculative-draft-mtp")
+    elif mtp == "disable":
+        args.append("--no-speculative-draft-mtp")
+    if simple == "enable":
+        args.append("--speculative-draft-simple")
+    if request.get("speculative_draft_model") is not None:
+        args += ["--speculative-draft-model", _validated_cli_operand(request["speculative_draft_model"], "speculative_draft_model", 256)]
+    for field, option, minimum, maximum in (
+        ("speculative_draft_max_tokens", "--speculative-draft-max-tokens", 1, 512),
+        ("speculative_draft_min_tokens", "--speculative-draft-min-tokens", 0, 512),
+    ):
+        if request.get(field) is not None:
+            args += [option, str(_validated_int(request[field], field, minimum, maximum))]
+    if request.get("speculative_draft_min_continue_probability") is not None:
+        probability = _validated_float(request["speculative_draft_min_continue_probability"], "speculative_draft_min_continue_probability", 0.0, 1.0)
+        args += ["--speculative-draft-min-continue-probability", str(probability)]
+    if request.get("speculative_draft_min_tokens") is not None and request.get("speculative_draft_max_tokens") is not None and request["speculative_draft_min_tokens"] > request["speculative_draft_max_tokens"]:
+        raise ValueError("speculative_draft_min_tokens cannot exceed speculative_draft_max_tokens")
+    return [*args, "-y", canonical]
+
+
+def build_lm_unload_args(request: dict[str, Any], loaded_instances: list[dict[str, Any]]) -> list[str]:
+    if not isinstance(request, dict) or set(request) != {"identifier"}:
+        raise ValueError("unload requires only an identifier")
+    identifier = _validated_cli_operand(request.get("identifier"), "identifier", 128)
+    loaded_identifiers = {
+        item.get("identifier") for item in loaded_instances
+        if isinstance(item, dict) and isinstance(item.get("identifier"), str)
+    }
+    if identifier not in loaded_identifiers:
+        raise ValueError("identifier is not currently loaded")
+    return ["unload", identifier]
 
 
 def _process_group_options(platform: str | None = None) -> dict[str, Any]:
@@ -923,13 +1398,136 @@ def _safe_package_file(root: Path, relative: Any) -> Path:
     return path
 
 
+def _read_regular_single_link(path: Path, maximum: int) -> bytes:
+    """Read an existing file while binding its bytes to one stable inode."""
+    path = Path(path).expanduser().absolute()
+    _assert_no_link_or_reparse_ancestor(path)
+    try:
+        observed = path.lstat()
+    except OSError as exc:
+        raise AppDockError("file is missing or unsafe") from exc
+    if _is_link_or_reparse(path) or not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+        raise AppDockError("file is not a regular single-link file")
+    if observed.st_size > maximum:
+        raise AppDockError("file is too large")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise AppDockError("file could not be opened safely") from exc
+    try:
+        opened = os.fstat(descriptor)
+        identity = (observed.st_dev, observed.st_ino)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != identity
+            or opened.st_size > maximum
+        ):
+            raise AppDockError("file changed while opening")
+        chunks: list[bytes] = []
+        total = 0
+        while total <= maximum:
+            chunk = os.read(descriptor, min(1024 * 1024, maximum - total + 1))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > maximum:
+                raise AppDockError("file is too large")
+        after = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(after.st_mode)
+            or after.st_nlink != 1
+            or (after.st_dev, after.st_ino) != identity
+            or after.st_size != total
+        ):
+            raise AppDockError("file changed while reading")
+        try:
+            final = path.lstat()
+        except OSError as exc:
+            raise AppDockError("file changed after reading") from exc
+        if (
+            _is_link_or_reparse(path)
+            or not stat.S_ISREG(final.st_mode)
+            or final.st_nlink != 1
+            or (final.st_dev, final.st_ino) != identity
+            or final.st_size != total
+        ):
+            raise AppDockError("file changed after reading")
+        return b"".join(chunks)
+    except OSError as exc:
+        if isinstance(exc, AppDockError):
+            raise
+        raise AppDockError("file could not be read safely") from exc
+    finally:
+        os.close(descriptor)
+
+
 def _read_bounded_json(path: Path, maximum: int = MAX_JSON_BYTES) -> Any:
     try:
-        if not path.is_file() or path.is_symlink() or _is_link_or_reparse(path) or path.stat().st_size > maximum:
-            raise AppDockError("JSON file is missing, unsafe, or too large")
-        return _loads_strict_json(path.read_text(encoding="utf-8"))
+        return _loads_strict_json(_read_regular_single_link(path, maximum).decode("utf-8"))
     except (OSError, UnicodeDecodeError) as exc:
         raise AppDockError("JSON file is invalid") from exc
+
+
+def _update_startup_receipt_path(data: Path, token: str) -> Path:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{20,128}", token):
+        raise AppDockError("invalid update startup token")
+    data = data.expanduser().absolute()
+    runtime = data / "runtime"
+    _assert_safe_directory_ancestors(data)
+    _assert_safe_directory_ancestors(runtime)
+    runtime.mkdir(parents=True, exist_ok=True)
+    _assert_safe_directory_ancestors(runtime)
+    return runtime / f"update-startup-{token}.json"
+
+
+def _write_update_startup_handoff(data: str | Path, install: str | Path, token: str) -> Path:
+    data_path = Path(data)
+    receipt = _update_startup_receipt_path(data_path, token)
+    _durable_write_json(receipt, {
+        "schema_version": 1,
+        "token": token,
+        "owner_pid": os.getpid(),
+        "install": str(Path(install).expanduser().absolute().resolve()),
+        "data": str(data_path.expanduser().absolute().resolve()),
+    })
+    return receipt
+
+
+def _process_exists(pid: int) -> bool:
+    if pid <= 0 or pid == os.getpid():
+        return False
+    try:
+        os.kill(pid, 0)
+    except (OSError, ProcessLookupError):
+        return False
+    return True
+
+
+def _consume_update_startup_handoff(data: Path, install: Path, token: str) -> None:
+    receipt_path = _update_startup_receipt_path(data, token)
+    try:
+        receipt = _read_bounded_json(receipt_path)
+    except AppDockError as exc:
+        raise AppDockError("update startup authorization is invalid") from exc
+    if (
+        not isinstance(receipt, dict)
+        or set(receipt) != {"schema_version", "token", "owner_pid", "install", "data"}
+        or receipt.get("schema_version") != 1
+        or receipt.get("token") != token
+        or not isinstance(receipt.get("owner_pid"), int)
+        or not isinstance(receipt.get("install"), str)
+        or not isinstance(receipt.get("data"), str)
+        or not _process_exists(receipt["owner_pid"])
+    ):
+        raise AppDockError("update startup authorization is invalid")
+    if Path(receipt["install"]).expanduser().absolute().resolve() != install.expanduser().absolute().resolve():
+        raise AppDockError("update startup authorization is bound to another installation")
+    if Path(receipt["data"]).expanduser().absolute().resolve() != data.expanduser().absolute().resolve():
+        raise AppDockError("update startup authorization is bound to another data root")
+    receipt_path.unlink()
 
 
 def _private_package_files(root: Path) -> set[str]:
@@ -2073,6 +2671,8 @@ def verify_sha256(data: bytes, sums_text: str, filename: str = "appdock-windows.
 
 def _assert_zip_member(name: str, info: zipfile.ZipInfo) -> None:
     normalized = name.replace("\\", "/")
+    if info.is_dir() or normalized.endswith("/"):
+        raise AppDockError("update ZIP contains an explicit directory entry")
     if not normalized or normalized.startswith("/") or normalized.startswith("//") or re.match(r"^[A-Za-z]:", normalized):
         raise AppDockError("update ZIP contains an absolute path")
     if ":" in normalized:
@@ -2091,9 +2691,9 @@ def _assert_zip_member(name: str, info: zipfile.ZipInfo) -> None:
     reserved = {"data", "registry", "apps", "runtime", "staging", "updates", "user-data"}
     if any(part.lower() in reserved for part in parts):
         raise AppDockError("update ZIP contains a reserved or escaping path")
-    mode = (info.external_attr >> 16) & 0o170000
-    if mode == stat.S_IFLNK:
-        raise AppDockError("update ZIP contains a symlink")
+    mode = stat.S_IFMT(info.external_attr >> 16)
+    if not info.is_dir() and mode not in {0, stat.S_IFREG}:
+        raise AppDockError("update ZIP contains a nonregular member")
 
 
 def _parse_release_manifest(data: bytes) -> dict[str, str]:
@@ -2124,35 +2724,157 @@ def _parse_release_manifest(data: bytes) -> dict[str, str]:
     return inventory
 
 
-def _release_path(root: Path, relative: str) -> Path:
-    target = (root / Path(*PurePosixPath(relative).parts)).resolve()
+def _release_path(root: Path, relative: str, *, require_file: bool = True) -> Path:
+    root = root.expanduser().absolute()
+    _assert_safe_directory_ancestors(root)
+    target_lexical = root / Path(*PurePosixPath(relative).parts)
+    _assert_no_link_or_reparse_ancestor(target_lexical)
+    if _is_link_or_reparse(target_lexical):
+        raise AppDockError("release inventory member is a symlink or reparse point")
+    target = target_lexical.resolve()
     if not _inside(target, root):
         raise AppDockError("release inventory path escapes its root")
-    return target
+    if not target_lexical.exists():
+        if require_file:
+            raise AppDockError("release inventory member is missing")
+        return target_lexical
+    metadata = target_lexical.lstat()
+    if _is_link_or_reparse(target_lexical) or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise AppDockError("release inventory member is not a regular single-link file")
+    return target_lexical
 
 
 def _load_release_inventory(root: Path, *, complete: bool) -> dict[str, str]:
+    root = root.expanduser().absolute()
+    _assert_safe_directory_ancestors(root)
+    if _is_link_or_reparse(root):
+        raise AppDockError("release tree root is unsafe")
     manifest_path = root / RELEASE_MANIFEST_NAME
-    if not manifest_path.is_file() or manifest_path.is_symlink():
+    if not manifest_path.exists():
         if complete:
             raise AppDockError("release inventory is missing")
         return {}
-    inventory = _parse_release_manifest(manifest_path.read_bytes())
+    inventory = _parse_release_manifest(_read_regular_single_link(manifest_path, MAX_JSON_BYTES))
     if complete:
         actual: set[str] = set()
         for path in root.rglob("*"):
-            if path.is_symlink():
-                raise AppDockError("release tree contains a symlink")
+            if path.is_symlink() or _is_link_or_reparse(path):
+                raise AppDockError("release tree contains a symlink or reparse point")
             if path.is_file():
                 actual.add(path.relative_to(root).as_posix())
         expected = {*inventory, RELEASE_MANIFEST_NAME}
         if actual != expected:
             raise AppDockError("release tree does not match its inventory")
         for relative, expected_digest in inventory.items():
-            actual_digest = hashlib.sha256(_release_path(root, relative).read_bytes()).hexdigest()
+            target = _release_path(root, relative)
+            actual_digest = hashlib.sha256(_read_regular_single_link(target, MAX_UPDATE_UNCOMPRESSED_BYTES)).hexdigest()
+            if actual_digest != expected_digest:
+                raise AppDockError("release file checksum does not match its inventory")
+    else:
+        for relative, expected_digest in inventory.items():
+            target = _release_path(root, relative)
+            actual_digest = hashlib.sha256(_read_regular_single_link(target, MAX_UPDATE_UNCOMPRESSED_BYTES)).hexdigest()
             if actual_digest != expected_digest:
                 raise AppDockError("release file checksum does not match its inventory")
     return inventory
+
+
+def _staged_inventory_records(staged: Path, inventory: dict[str, str]) -> list[dict[str, Any]]:
+    return [
+        {
+            "path": relative,
+            "sha256": digest,
+            "size": len(_read_regular_single_link(_release_path(staged, relative), MAX_UPDATE_UNCOMPRESSED_BYTES)),
+        }
+        for relative, digest in sorted(inventory.items())
+    ]
+
+
+def _staged_identity(staged: Path, *, zip_sha256: str | None = None, complete: bool = True) -> dict[str, Any]:
+    inventory = _load_release_inventory(staged, complete=complete)
+    records = _staged_inventory_records(staged, inventory)
+    helper = _release_path(staged, "scripts/update_helper.py")
+    helper_digest = hashlib.sha256(_read_regular_single_link(helper, MAX_UPDATE_UNCOMPRESSED_BYTES)).hexdigest()
+    identity = {
+        "zip_sha256": zip_sha256,
+        "inventory_sha256": hashlib.sha256(_canonical_json(records)).hexdigest(),
+        "helper_sha256": helper_digest,
+        "inventory": records,
+    }
+    if zip_sha256 is not None and not re.fullmatch(r"[0-9a-f]{64}", zip_sha256):
+        raise AppDockError("staged update ZIP identity is invalid")
+    return identity
+
+
+def _verify_identity_tree(root: Path, identity: dict[str, Any], *, complete: bool) -> dict[str, Any]:
+    verified = _validate_staged_identity(identity, require_zip=identity.get("zip_sha256") is not None)
+    actual = _staged_identity(root, zip_sha256=verified["zip_sha256"], complete=complete)
+    if actual != verified:
+        raise AppDockError("staged update identity does not match staged bytes")
+    return actual
+
+
+def _validate_staged_identity(identity: Any, *, require_zip: bool = True) -> dict[str, Any]:
+    if not isinstance(identity, dict) or set(identity) != {"zip_sha256", "inventory_sha256", "helper_sha256", "inventory"}:
+        raise AppDockError("staged update identity is invalid")
+    zip_sha256 = identity["zip_sha256"]
+    if zip_sha256 is not None and (not isinstance(zip_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", zip_sha256)):
+        raise AppDockError("staged update ZIP identity is invalid")
+    if require_zip and zip_sha256 is None:
+        raise AppDockError("staged update ZIP identity is missing")
+    for field_name in ("inventory_sha256", "helper_sha256"):
+        if not isinstance(identity[field_name], str) or not re.fullmatch(r"[0-9a-f]{64}", identity[field_name]):
+            raise AppDockError("staged update identity checksum is invalid")
+    records = identity["inventory"]
+    if not isinstance(records, list) or not records:
+        raise AppDockError("staged update inventory identity is invalid")
+    previous = ""
+    normalized: list[dict[str, Any]] = []
+    for record in records:
+        if not isinstance(record, dict) or set(record) != {"path", "sha256", "size"}:
+            raise AppDockError("staged update inventory identity is invalid")
+        relative, digest, size = record["path"], record["sha256"], record["size"]
+        if not isinstance(relative, str) or relative <= previous or "\\" in relative or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise AppDockError("staged update inventory identity is invalid")
+        try:
+            _assert_zip_member(relative, zipfile.ZipInfo(relative))
+        except AppDockError as exc:
+            raise AppDockError("staged update inventory identity is invalid") from exc
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            raise AppDockError("staged update inventory identity is invalid")
+        previous = relative
+        normalized.append({"path": relative, "sha256": digest, "size": size})
+    if hashlib.sha256(_canonical_json(normalized)).hexdigest() != identity["inventory_sha256"]:
+        raise AppDockError("staged update inventory identity digest is invalid")
+    return {"zip_sha256": zip_sha256, "inventory_sha256": identity["inventory_sha256"], "helper_sha256": identity["helper_sha256"], "inventory": normalized}
+
+
+def _staged_record_digest(version: str, identity: dict[str, Any]) -> str:
+    return _digest({"version": version, "identity": identity})
+
+
+def _verify_staged_record(config: AppDockConfig, record: dict[str, Any], *, require_zip: bool = True) -> dict[str, Any]:
+    if not isinstance(record, dict):
+        raise AppDockError("staged update receipt is invalid")
+    allowed = {"version", "path", "digest", "identity"}
+    if set(record) == allowed:
+        pass
+    elif set(record) == {"staged", *allowed} and record.get("staged") is True:
+        pass
+    else:
+        raise AppDockError("staged update receipt is invalid")
+    version = record["version"]
+    raw_path = record["path"]
+    digest = record["digest"]
+    identity = record["identity"]
+    if not isinstance(version, str) or not SEMVER_RE.fullmatch(version) or not isinstance(raw_path, str) or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise AppDockError("staged update receipt is invalid")
+    normalized_identity = _validate_staged_identity(identity, require_zip=require_zip)
+    staged = _validate_staged_path(config, version, raw_path)
+    actual = _staged_identity(staged, zip_sha256=normalized_identity["zip_sha256"])
+    if actual != normalized_identity or _staged_record_digest(version, actual) != digest:
+        raise AppDockError("staged update identity does not match staged bytes")
+    return {"staged": True, "version": version, "path": str(staged), "digest": digest, "identity": actual}
 
 
 def validate_zip(data: bytes) -> list[str]:
@@ -2194,6 +2916,89 @@ def validate_zip(data: bytes) -> list[str]:
     return names
 
 
+def _staged_receipt_path(config: AppDockConfig) -> Path:
+    _assert_safe_directory_ancestors(config.data_root)
+    _assert_safe_directory_ancestors(config.runtime_root)
+    config.runtime_root.mkdir(parents=True, exist_ok=True)
+    _assert_safe_directory_ancestors(config.runtime_root)
+    return config.runtime_root / "staged-update.json"
+
+
+def _validate_staged_path(config: AppDockConfig, version: str, raw_path: str) -> Path:
+    expected = _safe_version_child(config.updates_root, version)
+    staged_lexical = Path(raw_path).expanduser().absolute()
+    _assert_safe_directory_ancestors(staged_lexical)
+    if _is_link_or_reparse(staged_lexical):
+        raise AppDockError("staged update root is a symlink or reparse point")
+    staged = staged_lexical.resolve()
+    if staged != expected.resolve() or not staged.is_dir() or not _inside(staged, config.updates_root):
+        raise AppDockError("staged update receipt path is invalid")
+    _assert_tree_safe(staged_lexical, config.updates_root)
+    _load_release_inventory(staged, complete=True)
+    return staged
+
+
+def _read_staged_receipt(config: AppDockConfig) -> dict[str, Any] | None:
+    receipt_path = _staged_receipt_path(config)
+    if not receipt_path.exists():
+        return None
+    _assert_no_link_or_reparse_ancestor(receipt_path)
+    receipt_stat = receipt_path.stat()
+    if _is_link_or_reparse(receipt_path) or not stat.S_ISREG(receipt_stat.st_mode) or receipt_stat.st_nlink != 1:
+        raise AppDockError("staged update receipt is unsafe")
+    receipt = _read_bounded_json(receipt_path)
+    if (
+        not isinstance(receipt, dict)
+        or set(receipt) != {"schema_version", "version", "path", "digest", "identity"}
+        or receipt.get("schema_version") != 2
+    ):
+        raise AppDockError("staged update receipt is invalid")
+    return _verify_staged_record(config, {
+        "version": receipt["version"],
+        "path": receipt["path"],
+        "digest": receipt["digest"],
+        "identity": receipt["identity"],
+    })
+
+
+def _write_staged_receipt(config: AppDockConfig, staged: dict[str, Any]) -> None:
+    if not isinstance(staged, dict) or set(staged) != {"staged", "version", "path", "digest", "identity"} or staged.get("staged") is not True:
+        raise AppDockError("staged update receipt data is invalid")
+    verified = _verify_staged_record(config, {
+        "version": staged["version"],
+        "path": staged["path"],
+        "digest": staged["digest"],
+        "identity": staged["identity"],
+    })
+    _durable_write_json(_staged_receipt_path(config), {
+        "schema_version": 2,
+        "version": verified["version"],
+        "path": verified["path"],
+        "digest": verified["digest"],
+        "identity": verified["identity"],
+    })
+
+
+def _clear_staged_receipt(config: AppDockConfig | str | Path, expected_path: str | Path | None = None) -> None:
+    if not isinstance(config, AppDockConfig):
+        config = AppDockConfig.from_environment(data_dir=config)
+    receipt_path = _staged_receipt_path(config)
+    if not receipt_path.exists():
+        return
+    if expected_path is not None:
+        try:
+            receipt = _read_bounded_json(receipt_path)
+            actual = Path(str(receipt.get("path") or "")).expanduser().absolute().resolve()
+            expected = Path(expected_path).expanduser().absolute().resolve()
+        except (AppDockError, OSError):
+            return
+        if actual != expected:
+            return
+    if _is_link_or_reparse(receipt_path):
+        raise AppDockError("staged update receipt is unsafe")
+    receipt_path.unlink(missing_ok=True)
+
+
 def stage_update(release: dict[str, Any], config: AppDockConfig, *, opener: Callable[..., Any] | None = None, repository: str = DEFAULT_UPDATE_REPOSITORY) -> dict[str, Any]:
     version = str(release.get("version") or release.get("latest") or "")
     version = version[1:] if version.startswith("v") else version
@@ -2203,12 +3008,20 @@ def stage_update(release: dict[str, Any], config: AppDockConfig, *, opener: Call
     opener = opener or urllib.request.urlopen
     zip_bytes = _read_asset(opener, assets["appdock-windows.zip"]["url"], MAX_UPDATE_ASSET_BYTES)
     sums = _read_asset(opener, assets["SHA256SUMS.txt"]["url"], 1024 * 1024).decode("utf-8", "replace")
-    verify_sha256(zip_bytes, sums)
+    zip_sha256 = verify_sha256(zip_bytes, sums)
     validate_zip(zip_bytes)
     config.ensure()
+    if _staged_receipt_path(config).exists():
+        _read_staged_receipt(config)
+        raise AppDockError("an update is already staged")
     destination = _safe_version_child(config.updates_root, version)
     if destination.exists():
-        raise AppDockError("update version is already staged")
+        # A completed directory without its durable receipt can only remain after
+        # the staging owner exited between the atomic rename and receipt write.
+        # Validate the exact managed tree before deleting it, then make the same
+        # version safely retryable while the caller still owns the update lock.
+        _validate_staged_path(config, version, str(destination))
+        _remove_tree(destination)
     temporary = Path(tempfile.mkdtemp(prefix=f"{version}-", dir=config.updates_root))
     try:
         with zipfile.ZipFile(__import__("io").BytesIO(zip_bytes)) as archive:
@@ -2219,20 +3032,39 @@ def stage_update(release: dict[str, Any], config: AppDockConfig, *, opener: Call
     except Exception:
         _remove_tree(temporary, ignore_errors=True)
         raise
-    return {"staged": True, "version": version, "path": str(destination), "digest": _digest({"version": version, "release_url": release.get("release_url"), "assets": assets})}
+    result_identity = _staged_identity(destination, zip_sha256=zip_sha256)
+    result = {
+        "staged": True,
+        "version": version,
+        "path": str(destination),
+        "identity": result_identity,
+        "digest": _staged_record_digest(version, result_identity),
+    }
+    try:
+        _write_staged_receipt(config, result)
+    except Exception:
+        _remove_tree(destination, ignore_errors=True)
+        raise
+    return result
 
 
 def _update_transactions_root(data: Path) -> Path:
-    root = (data / "updates" / "transactions").resolve()
+    data = Path(data).expanduser().absolute()
+    _assert_safe_directory_ancestors(data)
+    root = data / "updates" / "transactions"
+    _assert_safe_directory_ancestors(root)
     if not _inside(root, data):
         raise AppDockError("update transaction root is unsafe")
     root.mkdir(parents=True, exist_ok=True)
-    return root
+    _assert_safe_directory_ancestors(root)
+    if _is_link_or_reparse(root) or not root.is_dir():
+        raise AppDockError("update transaction root is unsafe")
+    return root.resolve()
 
 
 def _update_journal(tx_root: Path) -> dict[str, Any]:
     journal = _read_bounded_json(tx_root / "transaction.json")
-    required = {"schema_version", "operation_id", "install", "candidate", "backup", "old_exists", "phase", "recovery", "files", "preexisting"}
+    required = {"schema_version", "operation_id", "install", "candidate", "backup", "old_exists", "phase", "recovery", "files", "preexisting", "identity"}
     if (
         not isinstance(journal, dict)
         or set(journal) != required
@@ -2242,9 +3074,78 @@ def _update_journal(tx_root: Path) -> dict[str, Any]:
         or not isinstance(journal.get("old_exists"), bool)
         or not isinstance(journal.get("files"), list)
         or not isinstance(journal.get("preexisting"), list)
+        or not all(isinstance(journal.get(field), str) and journal[field] for field in ("operation_id", "install", "candidate", "backup"))
     ):
         raise AppDockError("update transaction is invalid")
+    if not isinstance(journal["identity"], dict):
+        raise AppDockError("update transaction identity is invalid")
+    if journal["phase"] in {"prepared", "swapping", "rolled_back"} and journal["recovery"] != "restore-old":
+        raise AppDockError("update transaction recovery phase is invalid")
+    if journal["phase"] in {"committed", "complete"} and journal["recovery"] != "finish-new":
+        raise AppDockError("update transaction recovery phase is invalid")
+    for field in ("files", "preexisting"):
+        values = journal[field]
+        if not all(isinstance(item, str) and item and "\\" not in item and not Path(item).is_absolute() and all(part not in {"", ".", ".."} for part in PurePosixPath(item).parts) for item in values):
+            raise AppDockError("update transaction file list is invalid")
+        if len(values) != len(set(values)):
+            raise AppDockError("update transaction file list contains duplicates")
+    if not set(journal["preexisting"]).issubset(set(journal["files"])):
+        raise AppDockError("update transaction preexisting list is invalid")
+    _validate_staged_identity(journal["identity"], require_zip=journal["identity"].get("zip_sha256") is not None)
     return journal
+
+
+def _lexical_path_key(path: str | Path) -> str:
+    return os.path.normcase(os.path.normpath(os.path.abspath(str(Path(path).expanduser()))))
+
+
+def _transaction_paths(install: Path, data: Path, operation_id: str) -> dict[str, Path]:
+    if not UPDATE_OPERATION_ID_RE.fullmatch(operation_id):
+        raise AppDockError("update transaction operation id is invalid")
+    install, data = _validated_update_roots(install, data)
+    transactions = _update_transactions_root(data)
+    tx_root = transactions / operation_id
+    candidate = install.parent / f".{install.name}.appdock-{operation_id}.candidate"
+    backup = install.parent / f".{install.name}.appdock-{operation_id}.backup"
+    evidence_backup = data / "updates" / "backups" / operation_id
+    for path in (tx_root, candidate, backup, evidence_backup):
+        _assert_no_link_or_reparse_ancestor(path)
+    return {
+        "tx_root": tx_root,
+        "journal": tx_root / "transaction.json",
+        "install": install,
+        "candidate": candidate,
+        "backup": backup,
+        "evidence_backup": evidence_backup,
+    }
+
+
+def _validated_transaction_context(tx_root: Path, install: Path, data: Path) -> dict[str, Any]:
+    """Validate all transaction paths before exposing any destructive operation."""
+    install, data = _validated_update_roots(install, data)
+    tx_lexical = Path(tx_root).expanduser().absolute()
+    _assert_no_link_or_reparse_ancestor(tx_lexical)
+    if _is_link_or_reparse(tx_lexical) or not tx_lexical.is_dir() or not UPDATE_OPERATION_ID_RE.fullmatch(tx_lexical.name):
+        raise AppDockError("update transaction root is unsafe")
+    derived = _transaction_paths(install, data, tx_lexical.name)
+    if _lexical_path_key(tx_lexical) != _lexical_path_key(derived["tx_root"]):
+        raise AppDockError("update transaction root does not match its operation")
+    journal = _update_journal(tx_lexical)
+    operation_id = journal["operation_id"]
+    if operation_id != tx_lexical.name:
+        raise AppDockError("update transaction operation does not match its root")
+    if _lexical_path_key(journal["install"]) != _lexical_path_key(derived["install"]):
+        raise AppDockError("update transaction installation path is invalid")
+    if _lexical_path_key(journal["candidate"]) != _lexical_path_key(derived["candidate"]):
+        raise AppDockError("update transaction candidate path is invalid")
+    if _lexical_path_key(journal["backup"]) != _lexical_path_key(derived["backup"]):
+        raise AppDockError("update transaction backup path is invalid")
+    for name in ("candidate", "backup"):
+        path = derived[name]
+        _assert_no_link_or_reparse_ancestor(path)
+        if path.exists() and (not path.is_dir() or _is_link_or_reparse(path)):
+            raise AppDockError("update transaction path is not a directory")
+    return {**derived, "journal_data": journal}
 
 
 def _set_update_phase(tx_root: Path, journal: dict[str, Any], phase: str, recovery: str) -> None:
@@ -2254,6 +3155,9 @@ def _set_update_phase(tx_root: Path, journal: dict[str, Any], phase: str, recove
 
 
 def _copy_release_tree(source: Path, destination: Path) -> None:
+    _assert_safe_directory_ancestors(destination.parent)
+    if _is_link_or_reparse(destination):
+        raise AppDockError("release tree destination is unsafe")
     destination.mkdir(parents=True, exist_ok=False)
     for path in sorted(source.rglob("*")):
         relative = path.relative_to(source)
@@ -2267,6 +3171,20 @@ def _copy_release_tree(source: Path, destination: Path) -> None:
         else:
             raise AppDockError("release tree contains a non-file member")
     _fsync_directory(destination)
+
+
+def _safe_backup_copy(source: Path, destination: Path) -> None:
+    """Snapshot a managed source before copying it into the transaction backup."""
+    payload = _read_regular_single_link(source, MAX_UPDATE_UNCOMPRESSED_BYTES)
+    _assert_safe_directory_ancestors(destination.parent)
+    probe = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.backup-tmp")
+    try:
+        # Keep the existing copy2 failure seam while publishing only the
+        # opened-handle-verified snapshot through the durable writer.
+        shutil.copy2(source, probe)
+    finally:
+        probe.unlink(missing_ok=True)
+    _durable_write_bytes(destination, payload)
 
 
 LEGACY_RELEASE_TOP_LEVEL = {
@@ -2298,6 +3216,8 @@ def _validate_installed_tree(install: Path) -> tuple[dict[str, str], list[str]]:
         if path.is_symlink() or _is_link_or_reparse(path):
             raise AppDockError("managed installation contains a symlink or reparse point")
         if path.is_file():
+            relative = path.relative_to(install).as_posix()
+            _release_path(install, relative)
             actual.add(path.relative_to(install).as_posix())
     allowed_generated = {"run-appdock.cmd"}
     if not inventory:
@@ -2307,7 +3227,7 @@ def _validate_installed_tree(install: Path) -> tuple[dict[str, str], list[str]]:
         if "appdock.py" not in managed or not all(_legacy_release_path(relative) for relative in managed):
             raise AppDockError("managed installation has no trusted release inventory")
         inventory = {
-            relative: hashlib.sha256(_release_path(install, relative).read_bytes()).hexdigest()
+            relative: hashlib.sha256(_read_regular_single_link(_release_path(install, relative), MAX_UPDATE_UNCOMPRESSED_BYTES)).hexdigest()
             for relative in sorted(managed)
         }
         return inventory, sorted(actual - managed)
@@ -2317,32 +3237,36 @@ def _validate_installed_tree(install: Path) -> tuple[dict[str, str], list[str]]:
         raise AppDockError("managed installation contains unexpected unowned files")
     for relative, digest in inventory.items():
         target = _release_path(install, relative)
-        if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
+        if hashlib.sha256(_read_regular_single_link(target, MAX_UPDATE_UNCOMPRESSED_BYTES)).hexdigest() != digest:
             raise AppDockError("managed installation file does not match its release inventory")
     return inventory, sorted(extras)
 
 
-def _recover_one_update(tx_root: Path, *, phase_hook: Callable[[str], None] | None = None) -> str:
-    journal = _update_journal(tx_root)
+def _recover_one_update(tx_root: Path, *, install: Path, data: Path, phase_hook: Callable[[str], None] | None = None) -> str:
+    context = _validated_transaction_context(tx_root, install, data)
+    journal = context["journal_data"]
     if journal["phase"] in {"complete", "rolled_back"}:
         return journal["phase"]
-    install = Path(journal["install"]).resolve()
-    candidate = Path(journal["candidate"]).resolve()
-    backup = Path(journal["backup"]).resolve()
+    install = context["install"]
+    candidate = context["candidate"]
+    backup = context["backup"]
     finish_new = journal["phase"] == "committed" or journal["recovery"] == "finish-new"
     if phase_hook:
         phase_hook("recovery:finish-new" if finish_new else "recovery:restore-old")
     if finish_new:
         if not install.exists() and candidate.is_dir():
+            _verify_identity_tree(candidate, journal["identity"], complete=False)
             os.replace(candidate, install)
             _fsync_directory(install.parent)
+        if install.exists():
+            _verify_identity_tree(install, journal["identity"], complete=False)
         _validate_installed_tree(install)
         if backup.exists():
             _remove_tree(backup)
         if candidate.exists():
             _remove_tree(candidate)
-        _remove_tree(tx_root.parent.parent / "backups" / journal["operation_id"], ignore_errors=True)
-        _set_update_phase(tx_root, journal, "complete", "finish-new")
+        _remove_tree(context["evidence_backup"], ignore_errors=True)
+        _set_update_phase(context["tx_root"], journal, "complete", "finish-new")
         return "complete"
     if journal["old_exists"]:
         if backup.is_dir():
@@ -2356,28 +3280,46 @@ def _recover_one_update(tx_root: Path, *, phase_hook: Callable[[str], None] | No
     elif install.exists():
         _remove_tree(install)
     if candidate.exists():
+        _verify_identity_tree(candidate, journal["identity"], complete=False)
         _remove_tree(candidate)
-    _remove_tree(tx_root.parent.parent / "backups" / journal["operation_id"], ignore_errors=True)
-    _set_update_phase(tx_root, journal, "rolled_back", "restore-old")
+    _remove_tree(context["evidence_backup"], ignore_errors=True)
+    _set_update_phase(context["tx_root"], journal, "rolled_back", "restore-old")
     return "rolled_back"
 
 
+@_locked_transaction(0)
 def recover_update_transactions(data_dir: str | Path, *, expected_install: str | Path | None = None, phase_hook: Callable[[str], None] | None = None) -> list[str]:
-    data = Path(data_dir).expanduser().resolve()
+    if expected_install is None:
+        raise AppDockError("expected installation root is required for update recovery")
+    expected, data = _validated_update_roots(expected_install, data_dir)
     root = _update_transactions_root(data)
-    expected = Path(expected_install).expanduser().resolve() if expected_install is not None else None
     recovered: list[str] = []
     for tx_root in sorted(root.iterdir(), key=lambda item: item.name):
         if not tx_root.is_dir() or tx_root.is_symlink() or _is_link_or_reparse(tx_root):
             raise AppDockError("update transaction root is unsafe")
-        journal = _update_journal(tx_root)
-        if expected is not None and Path(journal["install"]).resolve() != expected:
-            continue
+        context = _validated_transaction_context(tx_root, expected, data)
+        journal = context["journal_data"]
         if journal["phase"] not in {"complete", "rolled_back"}:
-            recovered.append(_recover_one_update(tx_root, phase_hook=phase_hook))
+            recovered.append(_recover_one_update(tx_root, install=expected, data=data, phase_hook=phase_hook))
     return recovered
 
 
+def _validated_update_roots(install_dir: str | Path, data_dir: str | Path) -> tuple[Path, Path]:
+    install_lexical = Path(install_dir).expanduser().absolute()
+    data_lexical = Path(data_dir).expanduser().absolute()
+    for root in (install_lexical, data_lexical):
+        _assert_no_link_or_reparse_ancestor(root)
+    if install_lexical.exists() and not install_lexical.is_dir():
+        raise AppDockError("installation root is not a directory")
+    if data_lexical.exists() and not data_lexical.is_dir():
+        raise AppDockError("update data root is not a directory")
+    install, data = install_lexical.resolve(), data_lexical.resolve()
+    if _inside(install, data) or _inside(data, install):
+        raise AppDockError("installation and data roots must not overlap")
+    return install, data
+
+
+@_locked_transaction(2)
 def apply_update(
     staged_dir: str | Path,
     install_dir: str | Path,
@@ -2385,52 +3327,66 @@ def apply_update(
     *,
     restart: Callable[[], Any] | None = None,
     phase_hook: Callable[[str], None] | None = None,
+    expected_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     staged_lexical = Path(staged_dir).expanduser().absolute()
-    install, data = Path(install_dir).resolve(), Path(data_dir).resolve()
+    install, data = _validated_update_roots(install_dir, data_dir)
     if _is_link_or_reparse(staged_lexical):
         raise AppDockError("staged update root is a symlink or reparse point")
     staged = staged_lexical.resolve()
-    if _inside(install, data) or _inside(data, install):
-        raise AppDockError("installation and data roots must not overlap")
     if not staged.is_dir() or not _inside(staged, data / "updates"):
         raise AppDockError("staged update path is invalid")
     _assert_tree_safe(staged_lexical, data / "updates")
     recover_update_transactions(data, expected_install=install)
-    target_inventory = _load_release_inventory(staged, complete=True)
+    if expected_identity is None:
+        target_identity = _staged_identity(staged, complete=True)
+    elif isinstance(expected_identity, dict) and "identity" in expected_identity:
+        config = AppDockConfig.from_environment(data_dir=data)
+        verified_record = _verify_staged_record(config, expected_identity)
+        if Path(verified_record["path"]).resolve() != staged:
+            raise AppDockError("staged update identity path does not match apply path")
+        target_identity = verified_record["identity"]
+    else:
+        target_identity = _validate_staged_identity(expected_identity)
+        _verify_identity_tree(staged, target_identity, complete=True)
+    target_inventory = {record["path"]: record["sha256"] for record in target_identity["inventory"]}
     current_inventory, generated = _validate_installed_tree(install)
     target_files = {*target_inventory, RELEASE_MANIFEST_NAME}
     current_files = set(current_inventory)
-    if (install / RELEASE_MANIFEST_NAME).is_file():
+    if (install / RELEASE_MANIFEST_NAME).exists():
+        _release_path(install, RELEASE_MANIFEST_NAME)
         current_files.add(RELEASE_MANIFEST_NAME)
     affected = sorted(target_files | current_files)
     operation_id = uuid.uuid4().hex
-    tx_root = _update_transactions_root(data) / operation_id
+    paths = _transaction_paths(install, data, operation_id)
+    tx_root = paths["tx_root"]
     tx_root.mkdir(parents=True, exist_ok=False)
-    evidence_backup = data / "updates" / "backups" / operation_id
+    _assert_no_link_or_reparse_ancestor(tx_root)
+    evidence_backup = paths["evidence_backup"]
     try:
         if install.exists():
             for path in sorted(install.rglob("*")):
                 if path.is_file():
                     destination = evidence_backup / path.relative_to(install)
                     destination.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(path, destination)
+                    _safe_backup_copy(path, destination)
     except Exception as exc:
         _remove_tree(evidence_backup, ignore_errors=True)
         _remove_tree(tx_root, ignore_errors=True)
         raise AppDockError("update backup failed; installation was not changed") from exc
-    candidate = install.parent / f".{install.name}.appdock-{operation_id}.candidate"
-    backup = install.parent / f".{install.name}.appdock-{operation_id}.backup"
+    candidate = paths["candidate"]
+    backup = paths["backup"]
     if candidate.exists() or backup.exists():
         raise AppDockError("update transaction paths already exist")
     try:
         _copy_release_tree(staged, candidate)
         for relative in generated:
-            _durable_copy(_release_path(install, relative), _release_path(candidate, relative))
+            _durable_copy(_release_path(install, relative), _release_path(candidate, relative, require_file=False))
         _load_release_inventory(candidate, complete=False)
         candidate_inventory, candidate_generated = _validate_installed_tree(candidate)
         if candidate_inventory != target_inventory or candidate_generated != generated:
             raise AppDockError("candidate program tree verification failed")
+        _verify_identity_tree(candidate, target_identity, complete=False)
     except Exception:
         _remove_tree(candidate, ignore_errors=True)
         _remove_tree(tx_root, ignore_errors=True)
@@ -2446,6 +3402,7 @@ def apply_update(
         "recovery": "restore-old",
         "files": affected,
         "preexisting": sorted(current_files),
+        "identity": target_identity,
     }
     _durable_write_json(tx_root / "transaction.json", journal)
     if phase_hook:
@@ -2455,6 +3412,7 @@ def apply_update(
         "backup": str(backup),
         "files": affected,
         "preexisting": sorted(current_files),
+        "identity": target_identity,
         "transaction": str(tx_root / "transaction.json"),
     }
     try:
@@ -2478,49 +3436,55 @@ def apply_update(
             restart()
             finalize_update(result, install, data)
     except BaseException as exc:
-        _recover_one_update(tx_root)
+        _recover_one_update(tx_root, install=install, data=data)
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise
         raise AppDockError("update failed and was rolled back") from exc
     return result
 
 
+@_locked_transaction(2)
 def finalize_update(applied: dict[str, Any], install_dir: str | Path, data_dir: str | Path) -> None:
-    install, data = Path(install_dir).resolve(), Path(data_dir).resolve()
-    transaction = Path(str(applied.get("transaction") or "")).resolve()
-    if not transaction.is_file() or not _inside(transaction, _update_transactions_root(data)):
+    install, data = _validated_update_roots(install_dir, data_dir)
+    transaction = Path(str(applied.get("transaction") or "")).expanduser().absolute()
+    _assert_no_link_or_reparse_ancestor(transaction)
+    if transaction.name != "transaction.json":
         raise AppDockError("update transaction path is invalid")
     tx_root = transaction.parent
-    journal = _update_journal(tx_root)
-    if Path(journal["install"]).resolve() != install or journal["phase"] != "committed":
+    context = _validated_transaction_context(tx_root, install, data)
+    if _lexical_path_key(transaction) != _lexical_path_key(context["journal"]) or context["journal_data"]["phase"] != "committed":
         raise AppDockError("update transaction is not ready to finalize")
-    _recover_one_update(tx_root)
+    _verify_identity_tree(install, context["journal_data"]["identity"], complete=False)
+    _recover_one_update(tx_root, install=install, data=data)
 
 
+@_locked_transaction(2)
 def rollback_update(applied: dict[str, Any], install_dir: str | Path, data_dir: str | Path) -> None:
-    install, data = Path(install_dir).resolve(), Path(data_dir).resolve()
-    if _inside(install, data) or _inside(data, install):
-        raise AppDockError("installation and data roots must not overlap")
+    install, data = _validated_update_roots(install_dir, data_dir)
     transaction_raw = applied.get("transaction")
     if isinstance(transaction_raw, str) and transaction_raw:
-        transaction = Path(transaction_raw).resolve()
-        if not transaction.is_file() or not _inside(transaction, _update_transactions_root(data)):
+        transaction = Path(transaction_raw).expanduser().absolute()
+        _assert_no_link_or_reparse_ancestor(transaction)
+        if transaction.name != "transaction.json":
             raise AppDockError("update transaction path is invalid")
         tx_root = transaction.parent
-        journal = _update_journal(tx_root)
-        if Path(journal["install"]).resolve() != install:
-            raise AppDockError("update transaction installation path is invalid")
+        context = _validated_transaction_context(tx_root, install, data)
+        if _lexical_path_key(transaction) != _lexical_path_key(context["journal"]):
+            raise AppDockError("update transaction path is invalid")
+        journal = context["journal_data"]
         if journal["phase"] == "complete":
             raise AppDockError("finalized update can no longer be rolled back automatically")
         journal["phase"] = "swapping"
         journal["recovery"] = "restore-old"
-        _durable_write_json(transaction, journal)
-        _recover_one_update(tx_root)
+        _durable_write_json(context["journal"], journal)
+        _recover_one_update(tx_root, install=install, data=data)
         return
     # Compatibility for pre-v0.1.1 in-memory results retained for focused rollback tests.
-    backup = Path(str(applied.get("backup") or "")).resolve()
-    backup_root = (data / "updates" / "backups").resolve()
-    if not backup.is_dir() or not _inside(backup, backup_root):
+    backup = Path(str(applied.get("backup") or "")).expanduser().absolute()
+    backup_root = data / "updates" / "backups"
+    _assert_no_link_or_reparse_ancestor(backup_root)
+    _assert_no_link_or_reparse_ancestor(backup)
+    if not backup.is_dir() or _is_link_or_reparse(backup) or not _inside(backup, backup_root):
         raise AppDockError("update backup path is invalid")
     files = applied.get("files")
     preexisting = applied.get("preexisting")
@@ -2533,16 +3497,14 @@ def rollback_update(applied: dict[str, Any], install_dir: str | Path, data_dir: 
         relative = Path(raw_relative)
         if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
             raise AppDockError("update rollback path is invalid")
-        target = (install / relative).resolve()
-        saved = (backup / relative).resolve()
-        if not _inside(target, install) or not _inside(saved, backup):
-            raise AppDockError("update rollback path escapes its root")
+        target = _release_path(install, raw_relative, require_file=False)
+        saved = _release_path(backup, raw_relative)
         if raw_relative in preexisting_set:
-            if not saved.is_file():
-                raise AppDockError("update rollback backup is incomplete")
             _durable_copy(saved, target)
         else:
-            target.unlink(missing_ok=True)
+            if target.exists():
+                _release_path(install, raw_relative)
+                target.unlink()
 
 
 def _is_development_checkout(install_dir: Path) -> bool:
@@ -2560,6 +3522,7 @@ def launch_update_helper(
     helper_path: str | Path | None = None,
     popen: Callable[..., Any] | None = None,
     restart_args: Iterable[str] = (),
+    expected_identity: dict[str, Any] | None = None,
 ) -> Any:
     """Start the stdlib updater outside the AppDock process.
 
@@ -2573,11 +3536,28 @@ def launch_update_helper(
         _assert_no_link_or_reparse_ancestor(root)
     if _is_development_checkout(install):
         raise AppDockError("one-click updates are disabled in a .git checkout; use git pull")
-    helper = Path(helper_path).expanduser().resolve() if helper_path else staged / "scripts" / "update_helper.py"
     if not _inside(staged, data / "updates"):
         raise AppDockError("staged update path is invalid")
-    if not helper.is_file() or helper.is_symlink() or not _inside(helper, staged):
-        raise AppDockError("verified staged update helper is not installed")
+    helper = _release_path(staged, "scripts/update_helper.py")
+    staged_config = AppDockConfig.from_environment(data_dir=data)
+    claimed_record = expected_identity if isinstance(expected_identity, dict) and "identity" in expected_identity else None
+    if claimed_record is not None:
+        verified_claim = _verify_staged_record(staged_config, claimed_record)
+        identity = verified_claim["identity"]
+    else:
+        identity = _staged_identity(staged)
+        if expected_identity is not None:
+            identity_claim = _validate_staged_identity(expected_identity)
+            if identity_claim["inventory_sha256"] != identity["inventory_sha256"] or identity_claim["helper_sha256"] != identity["helper_sha256"] or identity_claim["inventory"] != identity["inventory"]:
+                raise AppDockError("staged update identity does not match staged bytes")
+            identity = identity_claim
+    if hashlib.sha256(_read_regular_single_link(helper, MAX_UPDATE_UNCOMPRESSED_BYTES)).hexdigest() != identity["helper_sha256"]:
+        raise AppDockError("staged update helper checksum does not match its identity")
+    if claimed_record is not None:
+        # The stage is user-writable after staging. Revalidate the complete
+        # receipt/tree a second time immediately before constructing Popen.
+        verified_claim = _verify_staged_record(staged_config, claimed_record)
+        identity = verified_claim["identity"]
     command = [sys.executable, str(install / "appdock.py"), *list(restart_args)] if restart_command is None else restart_command
     if not isinstance(command, list) or not command or not all(isinstance(item, str) and item for item in command):
         raise AppDockError("restart command is invalid")
@@ -2596,6 +3576,14 @@ def launch_update_helper(
     handshake.parent.mkdir(parents=True, exist_ok=True)
     handshake.unlink(missing_ok=True)
     helper_command.extend(["--handshake", str(handshake), "--handshake-token", handshake_token])
+    if claimed_record is not None:
+        helper_command.extend([
+            "--expected-version", verified_claim["version"],
+            "--expected-digest", verified_claim["digest"],
+            "--expected-zip-sha256", identity["zip_sha256"],
+            "--expected-inventory-sha256", identity["inventory_sha256"],
+            "--expected-helper-sha256", identity["helper_sha256"],
+        ])
     if command and command[0] != sys.executable:
         raise AppDockError("restart command must use the configured Python executable")
     for argument in command[2:]:
@@ -2648,32 +3636,63 @@ HTML = r'''<!doctype html>
 </head>
 <body>
   <header class="topbar">
+    <button id="menuButton" class="menu-button" type="button" aria-expanded="false" aria-controls="drawer" aria-label="Open navigation">☰</button>
     <div class="brand">App<span>Dock</span></div>
-    <nav class="actions" aria-label="AppDock actions">
+    <div class="actions" aria-label="AppDock actions">
       <button id="addButton" type="button" class="primary">Add App</button>
-      <button id="settingsButton" type="button">Settings / Updates</button>
-    </nav>
+    </div>
   </header>
 
-  <main class="shell">
-    <div class="toolbar">
-      <div>
-        <h1>Your apps</h1>
-        <p class="muted">Register explicit manifests, then control each process locally.</p>
-      </div>
-      <button id="refreshButton" type="button">Refresh</button>
-    </div>
-    <section id="apps" class="apps" aria-live="polite"></section>
+  <div id="drawerBackdrop" class="drawer-backdrop" hidden></div>
+  <aside id="drawer" class="drawer" aria-label="AppDock navigation" aria-hidden="true" inert>
+    <div class="drawer-heading"><strong>Navigate</strong><button id="closeDrawerButton" type="button" aria-label="Close navigation">×</button></div>
+    <nav class="drawer-nav">
+      <button id="dashboardLink" type="button" data-view="dashboard">Dashboard</button>
+      <button id="lmStudioLink" type="button" data-view="lm-studio">LM Studio</button>
+      <button id="updatesLink" type="button" data-view="updates">Updates <span id="updatesBadge" class="nav-badge" hidden aria-label="Updates available">!</span></button>
+    </nav>
+  </aside>
 
-    <section id="extensionsPanel" class="extensions" aria-labelledby="extensionsTitle" hidden>
-      <h2 id="extensionsTitle">Extensions</h2>
-      <p id="extensionsError" class="status warning" role="status" hidden></p>
-      <div id="widgets" class="widgets" aria-live="polite"></div>
+  <main class="shell">
+    <div id="updateBanner" class="update-banner" role="status" hidden>
+      <div><strong>AppDock update available.</strong><span id="updateBannerText"></span></div>
+      <button id="bannerUpdatesButton" type="button">Review updates</button>
+    </div>
+
+    <section id="dashboardView" class="view" data-view="dashboard">
+      <div class="toolbar">
+        <div>
+          <h1>Your apps</h1>
+          <p class="muted">Register explicit manifests, then control each process locally.</p>
+        </div>
+        <button id="refreshButton" type="button">Refresh</button>
+      </div>
+      <section id="apps" class="apps" aria-live="polite"></section>
+
+      <section id="extensionsPanel" class="extensions" aria-labelledby="extensionsTitle" hidden>
+        <h2 id="extensionsTitle">Extensions</h2>
+        <p id="extensionsError" class="status warning" role="status" hidden></p>
+        <div id="widgets" class="widgets" aria-live="polite"></div>
+      </section>
     </section>
 
-    <section id="updatesPanel" class="panel" hidden>
-      <h2>AppDock updates</h2>
-      <p class="muted">Release assets are downloaded from the configured GitHub repository, checksum-verified, staged, and applied with rollback.</p>
+    <section id="lmStudioView" class="view" data-view="lm-studio" hidden>
+      <div class="toolbar">
+        <div>
+          <h1>LM Studio</h1>
+          <p class="muted">Optional local model management through the LM Studio <code>lms</code> CLI.</p>
+        </div>
+        <button id="lmRefreshButton" type="button">Refresh</button>
+      </div>
+      <p id="lmStatus" class="status" role="status"></p>
+      <p id="lmHelp" class="muted">LM Studio is optional. <a href="https://lmstudio.ai/docs/cli" target="_blank" rel="noopener noreferrer">Install or read the lms CLI docs</a>.</p>
+      <section class="panel" aria-labelledby="lmLoadedTitle"><h2 id="lmLoadedTitle">Loaded instances</h2><div id="lmLoaded" class="lm-list" aria-live="polite"></div></section>
+      <section class="panel" aria-labelledby="lmModelsTitle"><h2 id="lmModelsTitle">Installed models</h2><div id="lmModels" class="lm-list" aria-live="polite"></div></section>
+    </section>
+
+    <section id="updatesPanel" class="view panel" data-view="updates" hidden>
+      <h1>AppDock updates</h1>
+      <p class="muted">Checks contact GitHub Releases. Downloads happen only after you explicitly confirm Update now; release assets are checksum-verified, staged, backed up, and rollback-safe.</p>
       <div class="actions">
         <button id="checkUpdateButton" type="button">Check for updates</button>
         <button id="updateButton" type="button" class="primary" hidden>Update now</button>
@@ -2716,11 +3735,23 @@ HTML = r'''<!doctype html>
 
 
 class UpdateCoordinator:
-    def __init__(self) -> None:
+    def __init__(self, config: AppDockConfig | None = None) -> None:
         self._lock = threading.Lock()
         self._staged: dict[str, Any] | None = None
         self._staging = False
         self._applying = False
+        self._update_lock: UpdateLock | None = None
+        self._config: AppDockConfig | None = None
+        if config is not None:
+            self.bind(config)
+
+    def bind(self, config: AppDockConfig) -> None:
+        with self._lock:
+            self._config = config
+            if self._staged is None:
+                staged = _read_staged_receipt(config)
+                if staged is not None:
+                    self._staged = staged
 
     def begin_stage(self) -> None:
         with self._lock:
@@ -2761,6 +3792,10 @@ class UpdateCoordinator:
                 raise AppDockError("an update is still staging")
             if not self._staged or confirmation != self._staged.get("digest"):
                 raise AppDockError("staged update confirmation is stale or invalid")
+            if self._config is not None and _staged_receipt_path(self._config).exists():
+                self._staged = _read_staged_receipt(self._config)
+                if not self._staged or confirmation != self._staged.get("digest"):
+                    raise AppDockError("staged update confirmation is stale or invalid")
             staged = self._staged
             self._staged = None
             self._applying = True
@@ -2771,6 +3806,19 @@ class UpdateCoordinator:
             self._applying = False
             self._staged = staged
 
+    def retain_update_lock(self, update_lock: UpdateLock) -> None:
+        with self._lock:
+            if self._update_lock is not None:
+                raise AppDockError("an updater lock is already retained")
+            self._update_lock = update_lock
+
+    def release_update_lock(self) -> None:
+        with self._lock:
+            update_lock = self._update_lock
+            self._update_lock = None
+        if update_lock is not None:
+            update_lock.release()
+
 
 def stage_coordinated_update(
     release: dict[str, Any],
@@ -2780,11 +3828,16 @@ def stage_coordinated_update(
     repository: str,
     stager: Callable[..., dict[str, Any]] = stage_update,
 ) -> dict[str, Any]:
+    coordinator.bind(config)
     coordinator.begin_stage()
+    update_lock: UpdateLock | None = None
     staged: dict[str, Any] | None = None
     try:
+        update_lock = acquire_update_lock(config.data_root)
         staged = stager(release, config, repository=repository)
         coordinator.finish_stage(staged)
+        coordinator.retain_update_lock(update_lock)
+        update_lock = None
     except Exception:
         if staged is not None:
             raw_path = staged.get("path")
@@ -2792,8 +3845,12 @@ def stage_coordinated_update(
                 staged_path = Path(raw_path).resolve()
                 if staged_path != config.updates_root.resolve() and _inside(staged_path, config.updates_root):
                     _remove_tree(staged_path, ignore_errors=True)
+        _clear_staged_receipt(config)
         coordinator.cancel_stage()
         raise
+    finally:
+        if update_lock is not None:
+            update_lock.release()
     return staged
 
 
@@ -2805,6 +3862,8 @@ class Handler(BaseHTTPRequestHandler):
     github: GitHubOnboarding = GitHubOnboarding(config)
     checker: ReleaseChecker = ReleaseChecker(config.update_repository)
     coordinator: UpdateCoordinator = UpdateCoordinator()
+    lm_adapter: LMStudioAdapter = LMStudioAdapter()
+    lm_mutation_lock = threading.Lock()
     ready_token: str | None = None
     def _security_headers(self) -> None:
         self.send_header("X-Content-Type-Options", "nosniff")
@@ -2898,6 +3957,8 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/updates/check":
                 release = self.checker.check()
                 self._json({**release, "confirmation_digest": _digest(release)})
+            elif path == "/api/lm-studio":
+                self._json(self.lm_adapter.snapshot())
             elif path.startswith("/api/apps/") and path.endswith("/logs"):
                 app_id = urllib.parse.unquote(path.removeprefix("/api/apps/").removesuffix("/logs").strip("/")); spec = self.manager.discover().get(app_id)
                 if spec is None: self._json({"error": "app not found"}, 404)
@@ -2932,12 +3993,44 @@ class Handler(BaseHTTPRequestHandler):
                 install_dir = Path(__file__).resolve().parent
                 restart_args = ["--host", str(self.server.server_address[0]), "--port", str(self.server.server_address[1]), "--data-dir", str(self.config.data_root)]
                 try:
-                    launch_update_helper(staged["path"], install_dir, self.config.data_root, current_pid=os.getpid(), restart_args=restart_args)
+                    launch_update_helper(
+                        staged["path"], install_dir, self.config.data_root,
+                        current_pid=os.getpid(), restart_args=restart_args,
+                        expected_identity=staged,
+                    )
                 except Exception:
                     Handler.coordinator.restore(staged)
+                    Handler.coordinator.release_update_lock()
                     raise
                 self._json({"restart_pending": True, "version": staged.get("version")}, 202)
                 threading.Thread(target=self.server.shutdown, daemon=True).start(); return
+            if path in {"/api/lm-studio/load", "/api/lm-studio/unload"}:
+                if not self.lm_mutation_lock.acquire(blocking=False):
+                    self._json({"error": "another LM Studio operation is already in progress; retry shortly"}, 409)
+                    return
+                try:
+                    snapshot = self.lm_adapter.snapshot()
+                    if not snapshot.get("available"):
+                        self._json({"error": snapshot.get("error") or "LM Studio is unavailable"}, 503)
+                        return
+                    if not snapshot.get("running"):
+                        self._json({"error": "LM Studio is not running; start LM Studio, then retry."}, 503)
+                        return
+                    if path.endswith("/load"):
+                        args = build_lm_load_args(body, snapshot.get("installed_models") or [])
+                    else:
+                        args = build_lm_unload_args(body, snapshot.get("loaded_instances") or [])
+                    ok, timed_out, detail = self.lm_adapter.execute(args)
+                    if not ok:
+                        self._json({"error": detail}, 504 if timed_out else 500)
+                    else:
+                        self._json({"ok": True, "message": "LM Studio operation requested"})
+                except ValueError as exc:
+                    status = 409 if "currently loaded" in str(exc) else 400
+                    self._json({"error": str(exc)}, status)
+                finally:
+                    self.lm_mutation_lock.release()
+                return
             self._json({"error": "not found"}, 404)
         except KeyError: self._json({"error": "app not found"}, 404)
         except (AppDockError, OSError, ValueError, TypeError) as exc: self._json({"error": str(exc)}, 400)
@@ -2951,15 +4044,25 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--data-dir", default=None)
     parser.add_argument("--ready-token", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--update-helper-startup", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
     validate_bind_host(args.host)
     if args.ready_token is not None and not re.fullmatch(r"[A-Za-z0-9_-]{20,128}", args.ready_token):
         parser.error("invalid readiness token")
+    if args.update_helper_startup is not None:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{20,128}", args.update_helper_startup) or args.ready_token is None or not secrets.compare_digest(args.update_helper_startup, args.ready_token):
+            parser.error("invalid update helper startup authorization")
     config = AppDockConfig.from_environment(data_dir=args.data_dir)
     config.ensure()
-    recover_private_migrations(config)
-    recover_update_transactions(config.data_root, expected_install=Path(__file__).resolve().parent)
-    Handler.config = config; Handler.extensions = ExtensionManager(config); Handler.manager = AppManager(config=config, extensions=Handler.extensions); Handler.local = LocalFolderOnboarding(config); Handler.github = GitHubOnboarding(config); Handler.checker = ReleaseChecker(config.update_repository); Handler.coordinator = UpdateCoordinator(); Handler.ready_token = args.ready_token
+    if args.update_helper_startup is not None:
+        _consume_update_startup_handoff(config.data_root, Path(__file__).resolve().parent, args.update_helper_startup)
+        startup_coordinator = UpdateCoordinator()
+    else:
+        with acquire_update_lock(config.data_root):
+            recover_private_migrations(config)
+            recover_update_transactions(config.data_root, expected_install=Path(__file__).resolve().parent)
+            startup_coordinator = UpdateCoordinator(config)
+    Handler.config = config; Handler.extensions = ExtensionManager(config); Handler.manager = AppManager(config=config, extensions=Handler.extensions); Handler.local = LocalFolderOnboarding(config); Handler.github = GitHubOnboarding(config); Handler.checker = ReleaseChecker(config.update_repository); Handler.coordinator = startup_coordinator; Handler.lm_adapter = LMStudioAdapter(); Handler.lm_mutation_lock = threading.Lock(); Handler.ready_token = args.ready_token
     cleanup_stop = threading.Event()
     cleanup_thread = threading.Thread(target=_staging_cleanup_loop, args=(Handler.github, cleanup_stop), name="appdock-staging-cleanup", daemon=True)
     cleanup_thread.start()
@@ -2969,6 +4072,7 @@ def main() -> None:
     except KeyboardInterrupt: pass
     finally:
         cleanup_stop.set()
+        Handler.coordinator.release_update_lock()
         server.server_close()
 
 

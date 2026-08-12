@@ -144,7 +144,7 @@ function Test-AppDockOwnedProcessCommandLine {
     if ([string]::IsNullOrWhiteSpace($CommandLine)) { return $false }
     $EntryPoint = Join-Path (Get-AppDockFullPath $InstallDir) 'appdock.py'
     $EscapedEntryPoint = [Regex]::Escape($EntryPoint)
-    $Python = '(?:"[^"\r\n]*\\pythonw?\.exe"|[^\s"\r\n]*pythonw?\.exe)'
+    $Python = '(?:"(?:[^"]*[\\/])?pythonw?\.exe"|(?:(?:[A-Za-z]:)?[^\s"]*[\\/])?pythonw?\.exe)(?=\s|$)'
     $Script = '(?:"' + $EscapedEntryPoint + '"|' + $EscapedEntryPoint + ')'
     $Pattern = '(?i)^\s*' + $Python + '\s+' + $Script + '(?=\s|$)'
     return [Regex]::IsMatch($CommandLine, $Pattern)

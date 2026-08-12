@@ -5,21 +5,73 @@ import json
 import os
 import re
 import secrets
+import stat
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import Callable
 
 # The helper is deliberately stdlib-only and imports the update primitive before
 # waiting. The parent AppDock process can therefore exit and replace its files.
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from appdock import _remove_tree, apply_update, finalize_update, recover_update_transactions, rollback_update  # noqa: E402
+from appdock import AppDockError, AppDockConfig, _assert_no_link_or_reparse_ancestor, _clear_staged_receipt, _is_link_or_reparse, _read_staged_receipt, _remove_tree, _update_lock_path, _write_update_startup_handoff, acquire_update_lock, apply_update, finalize_update, recover_update_transactions, rollback_update  # noqa: E402
 
 RESTART_READY_TIMEOUT_SECONDS = 20.0
+
+
+def _process_group_options() -> dict[str, object]:
+    """Keep the restarted service out of the helper/test console process group."""
+    if os.name == "nt":
+        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+    return {"start_new_session": True}
+
+
+def _safe_append_update_log(path: Path, message: str) -> None:
+    """Append one line without following an unsafe or multiply-linked log file."""
+    path = path.expanduser().absolute()
+    _assert_no_link_or_reparse_ancestor(path.parent)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _assert_no_link_or_reparse_ancestor(path.parent)
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+    binary_flag = getattr(os, "O_BINARY", 0)
+    flags |= binary_flag
+    for attempt in range(2):
+        existed = path.exists()
+        before = path.stat() if existed else None
+        if existed:
+            if _is_link_or_reparse(path) or before is None or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                raise AppDockError("update log is not a regular single-link file")
+        else:
+            flags |= os.O_EXCL
+        try:
+            descriptor = os.open(path, flags, 0o600)
+        except FileExistsError:
+            flags &= ~os.O_EXCL
+            continue
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+                raise AppDockError("update log opened as an unsafe file")
+            if before is not None and (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+                raise AppDockError("update log changed while opening")
+            with os.fdopen(descriptor, "a", encoding="utf-8", newline="") as stream:
+                descriptor = -1
+                stream.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+                after = os.fstat(stream.fileno())
+                if not stat.S_ISREG(after.st_mode) or after.st_nlink != 1:
+                    raise AppDockError("update log changed link identity while writing")
+        finally:
+            if descriptor != -1:
+                os.close(descriptor)
+        return
+    raise AppDockError("update log could not be created safely")
 
 
 def _alive(pid: int) -> bool:
@@ -111,17 +163,103 @@ def _discard_stage(staged: Path, data: Path) -> None:
     if candidate.resolve() == updates_root:
         return
     _remove_tree(candidate, ignore_errors=True)
+    _clear_staged_receipt(data, candidate)
 
 
-def _launch_and_wait(restart_script: Path, install: Path, restart_args: list[str]) -> object:
-    ready_token = secrets.token_urlsafe(32)
-    command = [sys.executable, str(restart_script), *restart_args, "--ready-token", ready_token]
-    restarted = subprocess.Popen(command, shell=False, cwd=str(install), close_fds=True)
+def _restart_data_dir(restart_args: list[str]) -> Path | None:
+    for index, argument in enumerate(restart_args):
+        if argument == "--data-dir" and index + 1 < len(restart_args):
+            return Path(restart_args[index + 1])
+        if argument.startswith("--data-dir="):
+            return Path(argument.partition("=")[2])
+    return None
+
+
+def _verify_helper_identity(
+    staged: Path,
+    data: Path,
+    *,
+    expected_version: str | None,
+    expected_digest: str | None,
+    expected_zip_sha256: str | None,
+    expected_inventory_sha256: str | None,
+    expected_helper_sha256: str | None,
+) -> dict[str, object] | None:
+    config = AppDockConfig.from_environment(data_dir=data)
+    receipt = _read_staged_receipt(config)
+    expected = (expected_version, expected_digest, expected_zip_sha256, expected_inventory_sha256, expected_helper_sha256)
+    if any(value is not None for value in expected):
+        if receipt is None or any(not isinstance(value, str) for value in expected):
+            raise AppDockError("helper update identity arguments are incomplete")
+        if receipt["version"] != expected_version or receipt["digest"] != expected_digest:
+            raise AppDockError("helper update receipt claim does not match")
+        identity = receipt["identity"]
+        if (
+            identity["zip_sha256"] != expected_zip_sha256
+            or identity["inventory_sha256"] != expected_inventory_sha256
+            or identity["helper_sha256"] != expected_helper_sha256
+        ):
+            raise AppDockError("helper update identity claim does not match")
+    if receipt is not None and Path(receipt["path"]).expanduser().resolve() != staged.expanduser().resolve():
+        raise AppDockError("helper staged path does not match its receipt")
+    return receipt
+
+
+def _restore_existing_service_after_preapply_failure(
+    restart_script: Path,
+    install: Path,
+    data: Path,
+    restart_args: list[str],
+    log: Callable[[str], None],
+) -> bool:
+    """Restore the old serving process after the parent has handed off."""
+    try:
+        _launch_and_wait(restart_script, install, restart_args, startup_data=data)
+    except Exception as exc:
+        log(f"existing AppDock could not be restored before apply: {exc}")
+        return False
+    log("existing AppDock restored and readiness verified before apply")
+    return True
+
+
+def _launch_and_wait(
+    restart_script: Path,
+    install: Path,
+    restart_args: list[str],
+    *,
+    startup_data: Path | None = None,
+    ready_token: str | None = None,
+) -> object:
+    ready_token = ready_token or secrets.token_urlsafe(32)
+    data = startup_data or _restart_data_dir(restart_args)
+    startup_receipt = _write_update_startup_handoff(data, install, ready_token) if data is not None else None
+    command = [
+        sys.executable,
+        str(restart_script),
+        *restart_args,
+        f"--ready-token={ready_token}",
+        f"--update-helper-startup={ready_token}",
+    ]
+    try:
+        restarted = subprocess.Popen(
+            command,
+            shell=False,
+            cwd=str(install),
+            close_fds=True,
+            **_process_group_options(),
+        )
+    except OSError:
+        if startup_receipt is not None:
+            startup_receipt.unlink(missing_ok=True)
+        raise
     try:
         _wait_for_restart_ready(restarted, restart_args, ready_token)
     except Exception:
         _stop_restarted_process(restarted)
         raise
+    finally:
+        if startup_receipt is not None:
+            startup_receipt.unlink(missing_ok=True)
     return restarted
 
 
@@ -136,13 +274,18 @@ def run(
     handshake: Path | None = None,
     handshake_token: str | None = None,
     phase_hook: object | None = None,
+    expected_version: str | None = None,
+    expected_digest: str | None = None,
+    expected_zip_sha256: str | None = None,
+    expected_inventory_sha256: str | None = None,
+    expected_helper_sha256: str | None = None,
 ) -> int:
+    data = data.expanduser().absolute()
+    _update_lock_path(data)
     log_path = data / "runtime" / "update.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
 
     def log(message: str) -> None:
-        with log_path.open("a", encoding="utf-8") as stream:
-            stream.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+        _safe_append_update_log(log_path, message)
 
     log(f"update helper started for pid {pid}")
     if handshake is not None and handshake_token is not None:
@@ -151,38 +294,68 @@ def run(
         temporary.replace(handshake)
     while _alive(pid):
         time.sleep(0.2)
-    recover_update_transactions(data, expected_install=install)
-    service_restored = False
     try:
-        result = apply_update(staged, install, data, phase_hook=phase_hook if callable(phase_hook) else None)
-        log(f"update applied: {result['files']}")
-        log("restarting AppDock with a fixed argument list")
-        try:
-            _launch_and_wait(restart_script, install, restart_args)
-            finalize_update(result, install, data)
-        except Exception as restart_exc:
-            rollback_update(result, install, data)
-            log("restart readiness failed; previous program files restored")
-            try:
-                _launch_and_wait(restart_script, install, restart_args)
-                service_restored = True
-                log("restored AppDock restarted successfully")
-            except Exception as restore_exc:
-                log(f"restored AppDock restart failed: {restore_exc}")
-            raise restart_exc
-    except Exception as exc:  # copy failures and restart-launch failures roll back
-        if not service_restored:
-            try:
-                _launch_and_wait(restart_script, install, restart_args)
-                log("existing AppDock restarted after update failure")
-            except Exception as restore_exc:
-                log(f"existing AppDock restart after update failure failed: {restore_exc}")
-        _discard_stage(staged, data)
-        log(f"update failed: {exc}")
+        claimed_identity = _verify_helper_identity(
+            staged,
+            data,
+            expected_version=expected_version,
+            expected_digest=expected_digest,
+            expected_zip_sha256=expected_zip_sha256,
+            expected_inventory_sha256=expected_inventory_sha256,
+            expected_helper_sha256=expected_helper_sha256,
+        )
+    except Exception as exc:
+        log(f"update helper identity verification failed: {exc}")
+        _restore_existing_service_after_preapply_failure(restart_script, install, data, restart_args, log)
         return 1
-    _discard_stage(staged, data)
-    log("update helper finished")
-    return 0
+    try:
+        with acquire_update_lock(data):
+            try:
+                recover_update_transactions(data, expected_install=install)
+            except Exception as exc:
+                _restore_existing_service_after_preapply_failure(restart_script, install, data, restart_args, log)
+                log(f"update recovery failed before apply: {exc}")
+                return 1
+            service_restored = False
+            try:
+                result = apply_update(
+                    staged,
+                    install,
+                    data,
+                    phase_hook=phase_hook if callable(phase_hook) else None,
+                    expected_identity=claimed_identity,
+                )
+                log(f"update applied: {result['files']}")
+                log("restarting AppDock with a fixed argument list")
+                try:
+                    _launch_and_wait(restart_script, install, restart_args, startup_data=data)
+                    finalize_update(result, install, data)
+                except Exception as restart_exc:
+                    rollback_update(result, install, data)
+                    log("restart readiness failed; previous program files restored")
+                    try:
+                        _launch_and_wait(restart_script, install, restart_args, startup_data=data)
+                        service_restored = True
+                        log("restored AppDock restarted successfully")
+                    except Exception as restore_exc:
+                        log(f"restored AppDock restart failed: {restore_exc}")
+                    raise restart_exc
+            except Exception as exc:  # copy failures and restart-launch failures roll back
+                if not service_restored:
+                    try:
+                        _launch_and_wait(restart_script, install, restart_args, startup_data=data)
+                        log("existing AppDock restarted after update failure")
+                    except Exception as restore_exc:
+                        log(f"existing AppDock restart after update failure failed: {restore_exc}")
+                _discard_stage(staged, data)
+                log(f"update failed: {exc}")
+                return 1
+            _discard_stage(staged, data)
+            log("update helper finished")
+            return 0
+    except Exception as exc:
+        log(f"update helper could not acquire updater lock or recover transactions: {exc}")
+        return 1
 
 
 def main() -> int:
@@ -195,23 +368,42 @@ def main() -> int:
     parser.add_argument("--restart-arg", action="append", default=[])
     parser.add_argument("--handshake", type=Path, required=True)
     parser.add_argument("--handshake-token", required=True)
+    parser.add_argument("--expected-version", required=True)
+    parser.add_argument("--expected-digest", required=True)
+    parser.add_argument("--expected-zip-sha256", required=True)
+    parser.add_argument("--expected-inventory-sha256", required=True)
+    parser.add_argument("--expected-helper-sha256", required=True)
     args = parser.parse_args()
+    data = args.data.expanduser().absolute()
+    try:
+        runtime_root = _update_lock_path(data).parent
+    except Exception as exc:
+        raise SystemExit(f"unsafe update data root: {exc}") from exc
     handshake = args.handshake.expanduser().absolute()
-    runtime_root = (args.data.resolve() / "runtime").resolve()
-    if handshake.parent.resolve() != runtime_root or not re.fullmatch(r"update-helper-[0-9a-f]{32}\.ready", handshake.name):
+    staged = args.staged.expanduser().absolute()
+    install = args.install.expanduser().absolute()
+    restart_script = args.restart_script.expanduser().absolute()
+    for path in (handshake, staged, install, restart_script):
+        _assert_no_link_or_reparse_ancestor(path)
+    if _is_link_or_reparse(handshake) or handshake.parent != runtime_root or not re.fullmatch(r"update-helper-[0-9a-f]{32}\.ready", handshake.name):
         raise SystemExit("invalid update helper handshake path")
     if not re.fullmatch(r"[A-Za-z0-9_-]{20,128}", args.handshake_token):
         raise SystemExit("invalid update helper handshake token")
     handshake.parent.mkdir(parents=True, exist_ok=True)
     return run(
-        args.staged.expanduser().absolute(),
-        args.install.resolve(),
-        args.data.resolve(),
+        staged,
+        install,
+        data,
         args.pid,
-        args.restart_script.resolve(),
+        restart_script,
         list(args.restart_arg),
         handshake=handshake,
         handshake_token=args.handshake_token,
+        expected_version=args.expected_version,
+        expected_digest=args.expected_digest,
+        expected_zip_sha256=args.expected_zip_sha256,
+        expected_inventory_sha256=args.expected_inventory_sha256,
+        expected_helper_sha256=args.expected_helper_sha256,
     )
 
 

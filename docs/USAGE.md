@@ -13,6 +13,14 @@ The dashboard lists registered apps in your saved order. Each row shows:
 
 AppDock polls conservatively. A running process is not considered healthy unless its configured health URL responds successfully.
 
+The navigation drawer provides Dashboard, LM Studio, and Updates views. A newer release appears as a non-modal dashboard banner and Updates badge without blocking app controls.
+
+## Optional LM Studio
+
+LM Studio is optional and AppDock works normally without it. When the local `lms` CLI is available, AppDock reads installed models with `lms ls --json` and loaded instances with `lms ps --json`. The page distinguishes an absent CLI, an unavailable local application/server, partial or malformed status, timeouts, and zero models. The browser never receives the resolved executable path or model filesystem paths.
+
+Load accepts only a model key from a fresh installed snapshot. Unload accepts only an exact identifier from a fresh loaded-instance snapshot. Settings are strictly bounded and mutation calls are serialized; AppDock never offers unload-all.
+
 ## Add a local app
 
 1. Put an `appdock.json` manifest in the app's root directory.
@@ -93,12 +101,14 @@ The command-line value takes precedence.
 
 ## Updates
 
-1. Open **Settings** → **Updates**.
+Use the navigation drawer to open **Updates**, or select the non-modal availability banner. Automatic check failures stay quiet in normal dashboard use; a manual check reports its failure here.
+
+1. Open **Updates** from the navigation drawer.
 2. Select **Check for updates**.
 3. Read the target version and release notes.
 4. Select **Update now** and confirm.
 
-AppDock accepts update files only from the configured official GitHub repository release, validates the expected asset names and checksum, scans ZIP paths, backs up the current program files, applies the release, and restarts. User data stays in the separate data directory.
+AppDock contacts GitHub Releases for checks and may disclose ordinary connection metadata to GitHub. It accepts update files only from the configured official GitHub repository release, validates the expected asset names and checksum, scans ZIP paths, backs up the current program files, applies the release, polls same-origin `/health` for the expected version, and reloads only after health is confirmed. User data stays in the separate mutable data directory. Windows is supported for explicit one-click application; development clones should use Git rather than one-click update.
 
 ## Backups
 

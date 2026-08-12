@@ -327,21 +327,171 @@ async function loadLogs(details) {
   }
 }
 
-async function checkUpdates() {
-  const output = byId("updateResult");
-  output.textContent = "Checking GitHub releases…";
-  byId("updateButton").hidden = true;
-  byId("releaseNotes").textContent = "";
-  try {
-    verifiedRelease = await api("/api/updates/check");
-    output.textContent = verifiedRelease.update_available
-      ? `AppDock ${verifiedRelease.version} is available. You are running ${verifiedRelease.current}.`
-      : `AppDock ${verifiedRelease.current} is current.`;
-    byId("releaseNotes").textContent = verifiedRelease.notes || "";
-    byId("updateButton").hidden = !verifiedRelease.update_available;
-  } catch (error) {
-    output.textContent = error.message;
+const AUTO_UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
+let lmPending = false;
+let drawerWasOpen = false;
+
+function addOption(select, value, label) {
+  const option = element("option", label);
+  option.value = value;
+  select.append(option);
+}
+
+function numericInput(name, label, min, max, step = "1") {
+  const wrapper = element("label", "", "lm-field");
+  wrapper.append(element("span", label));
+  const input = document.createElement("input");
+  input.name = name; input.type = "number"; input.min = String(min); input.max = String(max); input.step = step;
+  wrapper.append(input);
+  return wrapper;
+}
+
+function selectInput(name, label, options) {
+  const wrapper = element("label", "", "lm-field");
+  wrapper.append(element("span", label));
+  const select = document.createElement("select");
+  select.name = name;
+  options.forEach(([value, optionLabel]) => addOption(select, value, optionLabel));
+  wrapper.append(select);
+  return wrapper;
+}
+
+function lmFormRequest(form, modelKey) {
+  const request = { model: modelKey };
+  for (const field of form.elements) {
+    if (!field.name || field.value === "" || field.name === "gpu_choice" || field.name === "gpu_ratio") continue;
+    request[field.name] = field.type === "number" ? Number(field.value) : field.value;
   }
+  const gpuChoice = form.elements.gpu_choice.value;
+  const gpuRatio = form.elements.gpu_ratio.value;
+  if (gpuChoice) request.gpu = gpuChoice;
+  else if (gpuRatio !== "") request.gpu = Number(gpuRatio);
+  return request;
+}
+
+function lmModelRow(model) {
+  const row = element("article", "", "lm-model-row");
+  const heading = element("div", "", "lm-model-heading");
+  heading.append(element("strong", model.display_name || model.key || "Model"));
+  if (model.loaded) heading.append(element("span", "loaded", "badge running"));
+  row.append(heading, element("p", model.key || "Model key unavailable", "lm-model-key"));
+  const meta = [model.publisher, model.params, model.quantization, model.max_context ? `max context ${model.max_context}` : ""].filter(Boolean);
+  if (meta.length) row.append(element("p", meta.join(" · "), "meta"));
+  const details = document.createElement("details");
+  details.append(element("summary", "Load settings"));
+  const form = document.createElement("form");
+  form.dataset.lmForm = "true"; form.dataset.model = model.key || ""; form.className = "lm-form";
+  form.append(selectInput("gpu_choice", "GPU", [["", "Automatic"], ["off", "Off"], ["max", "Maximum"]]));
+  form.append(numericInput("gpu_ratio", "GPU ratio (0–1)", 0, 1, "0.01"));
+  form.append(numericInput("context_length", "Context length", 1, 1048576));
+  form.append(numericInput("parallel", "Parallel count", 1, 128));
+  form.append(numericInput("ttl", "TTL seconds", 1, 604800));
+  const identifier = element("label", "", "lm-field"); identifier.append(element("span", "Custom identifier"));
+  const identifierInput = document.createElement("input"); identifierInput.name = "identifier"; identifierInput.maxLength = 128; identifier.append(identifierInput); form.append(identifier);
+  form.append(selectInput("speculative_draft_mtp", "MTP", [["default", "Default"], ["enable", "Enable"], ["disable", "Disable"]]));
+  form.append(selectInput("speculative_draft_simple", "Simple speculative", [["default", "Default"], ["enable", "Enable"], ["disable", "Disable"]]));
+  form.append(numericInput("speculative_draft_max_tokens", "Draft max tokens", 1, 512));
+  form.append(numericInput("speculative_draft_min_tokens", "Draft min tokens", 0, 512));
+  form.append(numericInput("speculative_draft_min_continue_probability", "Draft minimum continue probability", 0, 1, "0.01"));
+  const draft = element("label", "", "lm-field"); draft.append(element("span", "Draft model"));
+  const draftInput = document.createElement("input"); draftInput.name = "speculative_draft_model"; draftInput.maxLength = 256; draft.append(draftInput); form.append(draft);
+  const submit = element("button", "Load", "primary"); submit.type = "submit"; submit.classList.add("lm-action"); form.append(submit);
+  details.append(form); row.append(details);
+  return row;
+}
+
+function lmLoadedRow(instance) {
+  const row = element("article", "", "lm-loaded-row");
+  const details = element("div", "", "lm-loaded-details");
+  details.append(element("strong", instance.identifier || "Unnamed instance"));
+  details.append(element("span", instance.display_name || instance.key || "Model unavailable", "lm-model-key"));
+  const meta = [instance.status, instance.context_length != null ? `context ${instance.context_length}` : "", instance.parallel != null ? `parallel ${instance.parallel}` : "", instance.ttl_seconds != null ? `TTL ${instance.ttl_seconds}s` : ""].filter(Boolean);
+  details.append(element("span", meta.join(" · ") || "Loaded details unavailable", "meta"));
+  const unload = element("button", "Unload"); unload.type = "button"; unload.classList.add("lm-action"); unload.dataset.lmUnload = instance.identifier || "";
+  row.append(details, unload);
+  return row;
+}
+
+function setLmPending(value) {
+  lmPending = value;
+  document.querySelectorAll(".lm-action").forEach((button) => { button.disabled = value; });
+}
+
+function renderLM(state) {
+  const status = byId("lmStatus"); status.className = "status";
+  if (!state.available) { status.classList.add("warning"); status.textContent = state.error || "LM Studio is unavailable. This optional integration is not installed."; }
+  else if (state.status === "timeout") { status.classList.add("warning"); status.textContent = "LM Studio status check timed out. Retry when the local application is responsive."; }
+  else if (state.error) { status.classList.add("warning"); status.textContent = state.error; }
+  else if (state.warning) { status.classList.add("warning"); status.textContent = state.warning; }
+  else if (state.status === "empty") status.textContent = "LM Studio is reachable, but no installed models or loaded instances were reported.";
+  else status.textContent = state.running ? "LM Studio is reachable. Loaded state is live." : "LM Studio CLI found; start the local application to inspect loaded instances.";
+  const loaded = Array.isArray(state.loaded_instances) ? state.loaded_instances : [];
+  const models = Array.isArray(state.installed_models) ? state.installed_models : [];
+  const loadedRoot = byId("lmLoaded"); const modelsRoot = byId("lmModels");
+  loadedRoot.replaceChildren(); modelsRoot.replaceChildren();
+  if (loaded.length) loaded.forEach((item) => loadedRoot.append(lmLoadedRow(item))); else loadedRoot.append(element("p", "No loaded instances reported.", "empty"));
+  if (models.length) models.forEach((item) => modelsRoot.append(lmModelRow(item))); else modelsRoot.append(element("p", state.available ? "No installed models were reported by lms ls." : "Installed models are unavailable until the optional CLI is installed.", "empty"));
+  setLmPending(lmPending);
+}
+
+async function loadLM() {
+  try { renderLM(await api("/api/lm-studio")); }
+  catch (error) { renderLM({ available: false, error: error.message, installed_models: [], loaded_instances: [] }); }
+}
+
+async function lmMutation(path, body) {
+  if (lmPending) return;
+  setLmPending(true); byId("lmStatus").textContent = "Working…";
+  try { await api(path, { method: "POST", body: JSON.stringify(body) }); await loadLM(); }
+  catch (error) { await loadLM(); byId("lmStatus").className = "status warning"; byId("lmStatus").textContent = error.message; }
+  finally { setLmPending(false); }
+}
+
+function setUpdateAvailability(release) {
+  const available = Boolean(release && release.update_available);
+  byId("updatesBadge").hidden = !available; byId("updateBanner").hidden = !available;
+  byId("updateButton").hidden = !available;
+  if (available) { byId("updateBannerText").textContent = ` AppDock ${release.version} is available.`; byId("updateButton").hidden = false; }
+}
+
+async function checkUpdates({ automatic = false } = {}) {
+  const output = byId("updateResult");
+  if (!automatic) {
+    output.textContent = "Checking GitHub Releases…";
+    byId("updateButton").hidden = true;
+    byId("releaseNotes").textContent = "";
+  }
+  try {
+    const release = await api("/api/updates/check");
+    verifiedRelease = release;
+    setUpdateAvailability(release);
+    if (!automatic) {
+      output.textContent = release.update_available
+        ? `AppDock ${release.version} is available. You are running ${release.current}.`
+        : `AppDock ${release.current} is current.`;
+      byId("releaseNotes").textContent = release.notes || "No release notes provided.";
+      byId("updateButton").hidden = !release.update_available;
+    }
+    return release;
+  } catch (error) {
+    if (!automatic) output.textContent = `Could not check GitHub Releases. ${error.message} Try again from this page.`;
+    return null;
+  }
+}
+
+async function waitForHealthyVersion(expectedVersion) {
+  const deadline = Date.now() + 45_000;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch("/health", { cache: "no-store", headers: { Accept: "application/json" } });
+      if (response.ok) {
+        const health = await response.json();
+        if (health && health.ok === true && health.version === expectedVersion) return true;
+      }
+    } catch (_error) { /* restart window */ }
+    await new Promise((resolve) => window.setTimeout(resolve, 500));
+  }
+  return false;
 }
 
 async function applyVerifiedUpdate() {
@@ -354,11 +504,19 @@ async function applyVerifiedUpdate() {
       method: "POST",
       body: JSON.stringify({ confirmation: verifiedRelease.confirmation_digest }),
     });
-    output.textContent = "Verified. Restarting AppDock…";
-    await api("/api/updates/apply", {
+    output.textContent = "Verified. Applying the update and waiting for the expected version…";
+    const applied = await api("/api/updates/apply", {
       method: "POST",
       body: JSON.stringify({ confirmation: staged.confirmation_digest }),
     });
+    const healthy = await waitForHealthyVersion(applied.version || verifiedRelease.version);
+    if (healthy) {
+      output.textContent = `AppDock ${applied.version || verifiedRelease.version} is healthy. Reloading…`;
+      window.location.reload();
+    } else {
+      output.textContent = "AppDock did not report the expected version healthy before the timeout. Check the local update log and restart AppDock manually; success was not confirmed.";
+      byId("updateButton").disabled = false;
+    }
   } catch (error) {
     output.textContent = error.message;
     byId("updateButton").disabled = false;
@@ -375,16 +533,56 @@ byId("apps").addEventListener("toggle", (event) => {
 byId("addButton").addEventListener("click", showAddDialog);
 byId("closeAddButton").addEventListener("click", closeAddDialog);
 byId("refreshButton").addEventListener("click", loadApps);
-byId("settingsButton").addEventListener("click", () => { byId("updatesPanel").hidden = !byId("updatesPanel").hidden; });
 byId("previewLocalButton").addEventListener("click", () => previewApp("local"));
 byId("previewGithubButton").addEventListener("click", () => previewApp("github"));
 byId("registerButton").addEventListener("click", registerPreview);
 byId("checkUpdateButton").addEventListener("click", checkUpdates);
 byId("updateButton").addEventListener("click", applyVerifiedUpdate);
+byId("lmRefreshButton").addEventListener("click", loadLM);
+byId("lmModels").addEventListener("submit", (event) => {
+  if (!event.target.matches("form[data-lm-form]")) return;
+  event.preventDefault();
+  lmMutation("/api/lm-studio/load", lmFormRequest(event.target, event.target.dataset.model));
+});
+byId("lmLoaded").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-lm-unload]");
+  if (button) lmMutation("/api/lm-studio/unload", { identifier: button.dataset.lmUnload });
+});
+function closeDrawer() {
+  const drawer = byId("drawer");
+  drawer.classList.remove("open"); drawer.setAttribute("aria-hidden", "true"); drawer.inert = true;
+  byId("drawerBackdrop").hidden = true; byId("menuButton").setAttribute("aria-expanded", "false");
+  if (drawerWasOpen) byId("menuButton").focus();
+  drawerWasOpen = false;
+}
+function openDrawer() {
+  const drawer = byId("drawer");
+  drawerWasOpen = true; drawer.inert = false; drawer.classList.add("open"); drawer.setAttribute("aria-hidden", "false");
+  byId("drawerBackdrop").hidden = false; byId("menuButton").setAttribute("aria-expanded", "true");
+  byId("dashboardLink").focus();
+}
+function showView(view) {
+  document.querySelectorAll(".view").forEach((section) => { section.hidden = section.dataset.view !== view; });
+  document.querySelectorAll(".drawer-nav button").forEach((button) => { button.setAttribute("aria-current", button.dataset.view === view ? "page" : "false"); });
+  closeDrawer();
+  if (view === "lm-studio") loadLM();
+}
+byId("menuButton").addEventListener("click", () => byId("drawer").classList.contains("open") ? closeDrawer() : openDrawer());
+byId("closeDrawerButton").addEventListener("click", closeDrawer);
+byId("drawerBackdrop").addEventListener("click", closeDrawer);
+document.querySelectorAll(".drawer-nav button").forEach((button) => button.addEventListener("click", () => showView(button.dataset.view)));
+byId("bannerUpdatesButton").addEventListener("click", () => showView("updates"));
 byId("addModal").addEventListener("click", (event) => { if (event.target === byId("addModal")) closeAddDialog(); });
-document.addEventListener("keydown", (event) => { if (event.key === "Escape" && !byId("addModal").hidden) closeAddDialog(); });
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  if (!byId("addModal").hidden) closeAddDialog();
+  else if (byId("drawer").classList.contains("open")) closeDrawer();
+});
 
 loadApps();
 loadExtensions();
+loadLM();
+window.setTimeout(() => { checkUpdates({ automatic: true }); }, 0);
 window.setInterval(loadApps, 5000);
 window.setInterval(loadExtensions, 5000);
+window.setInterval(() => { checkUpdates({ automatic: true }); }, AUTO_UPDATE_CHECK_INTERVAL_MS);

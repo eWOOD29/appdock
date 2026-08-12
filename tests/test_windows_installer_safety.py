@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -7,7 +8,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
+
+from scripts import build_portable
 
 
 @unittest.skipUnless(os.name == "nt", "Windows installer safety tests")
@@ -125,16 +129,22 @@ Write-Output 'legacy marker accepted'
         with tempfile.TemporaryDirectory() as temp:
             install = (Path(temp).resolve() / "AppDock")
             exact = f'python.exe "{install / "appdock.py"}" --port 8765'
+            exact_unquoted = f'python.exe {install / "appdock.py"} --port 8765'
             prefix_collision = f'python.exe "{install}-dev\\appdock.py" --port 8765'
             relative = 'python.exe appdock.py --port 8765'
             config_collision = f'python.exe other.py --config "{install / "appdock.py"}"'
+            quoted_executable_collision = f'"{install / "notpython.exe"}" "{install / "appdock.py"}"'
+            unquoted_executable_collision = f'{install / "notpython.exe"} "{install / "appdock.py"}"'
             payload = json.dumps(
                 {
                     "install": str(install),
                     "exact": exact,
+                    "exact_unquoted": exact_unquoted,
                     "prefix": prefix_collision,
                     "relative": relative,
                     "config": config_collision,
+                    "quoted_executable_collision": quoted_executable_collision,
+                    "unquoted_executable_collision": unquoted_executable_collision,
                 }
             ).replace("'", "''")
             probe = rf"""
@@ -142,9 +152,12 @@ $ErrorActionPreference = 'Stop'
 . .\scripts\path_safety.ps1
 $case = ConvertFrom-Json '{payload}'
 if (-not (Test-AppDockOwnedProcessCommandLine -CommandLine $case.exact -InstallDir $case.install)) {{ throw 'exact entry point was not matched' }}
+if (-not (Test-AppDockOwnedProcessCommandLine -CommandLine $case.exact_unquoted -InstallDir $case.install)) {{ throw 'unquoted exact entry point was not matched' }}
 if (Test-AppDockOwnedProcessCommandLine -CommandLine $case.prefix -InstallDir $case.install) {{ throw 'prefix collision was matched' }}
 if (Test-AppDockOwnedProcessCommandLine -CommandLine $case.relative -InstallDir $case.install) {{ throw 'relative ambiguous entry point was matched' }}
 if (Test-AppDockOwnedProcessCommandLine -CommandLine $case.config -InstallDir $case.install) {{ throw 'non-entry-point config token was matched' }}
+if (Test-AppDockOwnedProcessCommandLine -CommandLine $case.quoted_executable_collision -InstallDir $case.install) {{ throw 'quoted executable suffix collision was matched' }}
+if (Test-AppDockOwnedProcessCommandLine -CommandLine $case.unquoted_executable_collision -InstallDir $case.install) {{ throw 'unquoted executable suffix collision was matched' }}
 Write-Output 'process ownership probe passed'
 """
             result = self.run_probe(probe)
@@ -185,6 +198,104 @@ Write-Output 'process ownership probe passed'
             self.assertNotEqual(result.returncode, 0)
             self.assertTrue(data_file.is_file())
             self.assertTrue(install.is_dir(), "uninstaller modified program files before rejecting DataDir")
+
+    def test_installer_rejects_tampered_safety_module_before_marker_or_action(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            bundle = root / "bundle"
+            install = root / "installed" / "AppDock"
+            data = root / "data" / "AppDock"
+            self.copy_bundle(bundle)
+            safety = bundle / "scripts" / "path_safety.ps1"
+            safety.write_text(safety.read_text(encoding="utf-8") + "\n# tampered\n", encoding="utf-8")
+            result = subprocess.run(
+                [
+                    "powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                    "-File", str(bundle / "scripts" / "install.ps1"),
+                    "-InstallDir", str(install), "-DataDir", str(data),
+                    "-PythonExe", sys.executable, "-NoStart",
+                ],
+                text=True,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse(install.exists(), "tampered safety module was allowed to create an install marker")
+            self.assertFalse(data.exists(), "tampered safety module was allowed to create data")
+
+    def test_packaged_installer_rejects_tampered_helper_before_side_effects(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            archive = root / "artifact" / "appdock-windows.zip"
+            bundle = root / "bundle"
+            install = root / "installed" / "AppDock"
+            data = root / "data" / "AppDock"
+            build_portable.build_archive(archive, source_root)
+            with zipfile.ZipFile(archive) as packaged:
+                packaged.extractall(bundle)
+            safety = bundle / "scripts" / "path_safety.ps1"
+            safety.write_bytes(safety.read_bytes() + b"\n# tampered packaged helper\n")
+
+            result = subprocess.run(
+                [
+                    "powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                    "-File", str(bundle / "scripts" / "install.ps1"),
+                    "-InstallDir", str(install), "-DataDir", str(data),
+                    "-PythonExe", sys.executable, "-NoStart",
+                ],
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse(install.exists(), "tampered packaged helper was allowed to create an install marker")
+            self.assertFalse(data.exists(), "tampered packaged helper was allowed to create data")
+
+    def test_packaged_installer_accepts_the_production_archive_and_preserves_data(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        installer_source = (source_root / "scripts" / "install.ps1").read_text(encoding="utf-8")
+        trusted = installer_source.split("$TrustedPathSafetySha256 = '", 1)[1].split("'", 1)[0]
+        source_helper_digest = hashlib.sha256((source_root / "scripts" / "path_safety.ps1").read_bytes()).hexdigest()
+        self.assertEqual(trusted, source_helper_digest)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            archive = root / "artifact" / "appdock-windows.zip"
+            bundle = root / "bundle"
+            install = root / "installed" / "AppDock"
+            data = root / "data" / "AppDock"
+            data.mkdir(parents=True)
+            sentinel = data / "preserve-me.txt"
+            sentinel.write_text("user data must survive", encoding="utf-8")
+
+            build_portable.build_archive(archive, source_root)
+            with zipfile.ZipFile(archive) as packaged:
+                manifest = json.loads(packaged.read("RELEASE-MANIFEST.json"))
+                packaged_helper = packaged.read("scripts/path_safety.ps1")
+                manifest_entry = next(item for item in manifest["files"] if item["path"] == "scripts/path_safety.ps1")
+                self.assertEqual(hashlib.sha256(packaged_helper).hexdigest(), source_helper_digest)
+                self.assertEqual(manifest_entry["sha256"], source_helper_digest)
+                packaged.extractall(bundle)
+
+            result = subprocess.run(
+                [
+                    "powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                    "-File", str(bundle / "scripts" / "install.ps1"),
+                    "-InstallDir", str(install), "-DataDir", str(data),
+                    "-PythonExe", sys.executable, "-NoStart",
+                ],
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue((install / "run-appdock.cmd").is_file())
+            self.assertTrue((install / "appdock.py").is_file())
+            self.assertTrue((install / "RELEASE-MANIFEST.json").is_file())
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "user data must survive")
 
     def test_installer_uses_a_staged_mirror_and_rejects_source_overlap(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

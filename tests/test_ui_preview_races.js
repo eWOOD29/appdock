@@ -15,8 +15,9 @@ function makeHarness() {
   const cleanups = [];
   const previewRequests = [];
 
-  function makeElement() {
+  function makeElement(initial = {}) {
     return {
+      ...initial,
       hidden: true,
       value: "",
       textContent: "",
@@ -25,12 +26,14 @@ function makeHarness() {
       open: false,
       style: {},
       tabIndex: -1,
+      focusCount: 0,
+      attributes: {},
       addEventListener() {},
-      setAttribute() {},
+      setAttribute(name, value) { this.attributes[name] = String(value); },
       append() {},
       appendChild() {},
       replaceChildren() {},
-      focus() {},
+      focus() { this.focusCount += 1; },
       querySelector() { return makeElement(); },
       closest() { return null; },
       matches() { return false; },
@@ -40,10 +43,11 @@ function makeHarness() {
 
   const document = {
     getElementById(id) {
-      if (!elements.has(id)) elements.set(id, makeElement());
+      if (!elements.has(id)) elements.set(id, makeElement(id === "drawer" ? { inert: true } : {}));
       return elements.get(id);
     },
     createElement() { return makeElement(); },
+    querySelectorAll() { return []; },
     addEventListener() {},
   };
 
@@ -65,6 +69,7 @@ function makeHarness() {
     alert() {},
     open() {},
     location: { hostname: "127.0.0.1" },
+    setTimeout() { return 1; },
     setInterval() { return 1; },
   };
   const context = vm.createContext({ console, document, fetch, URL, window, setTimeout, clearTimeout });
@@ -72,6 +77,20 @@ function makeHarness() {
   vm.runInContext(source, context, { filename: "static/app.js" });
   return { context, elements, cleanups, previewRequests };
 }
+
+test("drawer starts inert and toggles inert with aria-hidden while returning focus", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "appdock.py"), "utf8");
+  assert.match(source, /<aside id="drawer"[^>]*aria-hidden="true"[^>]*inert/);
+  const harness = makeHarness();
+  const drawer = harness.elements.get("drawer") || harness.context.document?.getElementById("drawer");
+  vm.runInContext("openDrawer()", harness.context);
+  assert.equal(drawer.inert, false);
+  assert.equal(drawer.attributes["aria-hidden"], "false");
+  vm.runInContext("closeDrawer()", harness.context);
+  assert.equal(drawer.inert, true);
+  assert.equal(drawer.attributes["aria-hidden"], "true");
+  assert.equal(harness.elements.get("menuButton").focusCount, 1);
+});
 
 async function tick() {
   await new Promise((resolve) => setImmediate(resolve));
