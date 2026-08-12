@@ -876,18 +876,37 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.assertIn("${{ runner.temp }}/appdock-package/SHA256SUMS.txt", build_text)
         self.assertRegex(publish_text, r"needs:\s+build")
 
-    def test_ci_package_jobs_use_external_runner_temp_outputs(self) -> None:
+    def test_ci_package_jobs_keep_runner_context_out_of_job_env(self) -> None:
         workflow = (Path(__file__).parents[1] / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         for job, archive in (("package-windows", "appdock-windows.zip"), ("package-ubuntu", "appdock-ubuntu.zip")):
-            match = re.search(rf"(?ms)^  {job}:\n(.*?)(?=^  [\\w-]+:\n|\Z)", workflow)
+            match = re.search(rf"(?ms)^  {job}:\n(.*?)(?=^  [\w-]+:\n|\Z)", workflow)
             self.assertIsNotNone(match, job)
             job_text = match.group(1)
-            expected = f"${{{{ runner.temp }}}}/appdock-package/{archive}"
-            self.assertIn("PACKAGE_DIR: ${{ runner.temp }}/appdock-package", job_text)
-            self.assertIn(f"PACKAGE_ARCHIVE: {expected}", job_text)
-            self.assertRegex(job_text, rf"--output .*PACKAGE_ARCHIVE")
-            self.assertIn(expected, job_text)
+            self.assertNotRegex(job_text, r"(?m)^    env:\n(?:^      .*\n?)+")
             self.assertNotIn(f"dist/{archive}", job_text)
+            self.assertIn(f"${{{{ runner.temp }}}}/appdock-package/{archive}", job_text)
+
+        windows = re.search(r"(?ms)^  package-windows:\n(.*?)(?=^  package-ubuntu:\n)", workflow)
+        ubuntu = re.search(r"(?ms)^  package-ubuntu:\n(.*?)(?=^  deterministic-package:\n)", workflow)
+        self.assertIsNotNone(windows)
+        self.assertIsNotNone(ubuntu)
+        self.assertRegex(windows.group(1), r"Join-Path \$env:RUNNER_TEMP")
+        self.assertRegex(windows.group(1), r"--output \$packageArchive")
+        self.assertRegex(ubuntu.group(1), r"\$RUNNER_TEMP/appdock-package")
+        self.assertRegex(ubuntu.group(1), r"package_archive=\"\$RUNNER_TEMP/appdock-package/appdock-ubuntu\.zip\"")
+        self.assertRegex(ubuntu.group(1), r"--output \"\$package_archive\"")
+
+    def test_runner_temp_is_allowed_only_in_step_contexts(self) -> None:
+        workflows = {
+            "ci": (Path(__file__).parents[1] / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"),
+            "release": (Path(__file__).parents[1] / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8"),
+        }
+        for name, workflow in workflows.items():
+            for job_name in re.findall(r"(?m)^  ([\w-]+):\n", workflow):
+                job = re.search(rf"(?ms)^  {re.escape(job_name)}:\n(.*?)(?=^  [\w-]+:\n|\Z)", workflow).group(1)
+                env = re.search(r"(?ms)^    env:\n((?:^      .*\n?)+)", job)
+                self.assertFalse(env and "${{ runner." in env.group(1), f"{name}/{job_name} uses runner context in job env")
+        self.assertIn("path: ${{ runner.temp }}/appdock-package", workflows["release"])
 
     def test_ci_windows_tests_are_direct_quiet_without_pipe_capture(self) -> None:
         workflow = (Path(__file__).parents[1] / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
@@ -911,9 +930,10 @@ class ReleaseHardeningTests(unittest.TestCase):
         for archive in ("appdock-windows.zip", "SHA256SUMS.txt"):
             expected = f"${{{{ runner.temp }}}}/appdock-package/{archive}"
             self.assertIn(expected, build_text)
-            self.assertIn(expected, publish_text)
             self.assertNotIn(f"dist/{archive}", build_text + publish_text)
-        self.assertRegex(build_text, r"--output .*PACKAGE_ARCHIVE")
+        self.assertIn("$packageArchive = Join-Path $packageDir 'appdock-windows.zip'", build_text)
+        self.assertIn("$checksumFile = Join-Path $packageDir 'SHA256SUMS.txt'", publish_text)
+        self.assertIn("$packageArchive, $checksumFile", publish_text)
         self.assertIn("path: ${{ runner.temp }}/appdock-package", publish_text)
         self.assertNotIn("build_portable.py", publish_text)
         self.assertNotIn("python -m unittest", publish_text)

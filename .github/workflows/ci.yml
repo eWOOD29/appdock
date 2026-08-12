@@ -92,19 +92,23 @@ jobs:
   package-windows:
     name: Verify portable package / Windows
     runs-on: windows-latest
-    env:
-      PACKAGE_DIR: ${{ runner.temp }}/appdock-package
-      PACKAGE_ARCHIVE: ${{ runner.temp }}/appdock-package/appdock-windows.zip
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.11'
-      - run: python scripts/build_portable.py --output "$env:PACKAGE_ARCHIVE"
+      - name: Build portable package
+        shell: pwsh
+        run: |
+          $packageDir = Join-Path $env:RUNNER_TEMP 'appdock-package'
+          $packageArchive = Join-Path $packageDir 'appdock-windows.zip'
+          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+          python scripts/build_portable.py --output $packageArchive
       - name: Inspect archive
         shell: pwsh
         run: |
-          $archive = [IO.Compression.ZipFile]::OpenRead((Resolve-Path $env:PACKAGE_ARCHIVE))
+          $packageArchive = Join-Path (Join-Path $env:RUNNER_TEMP 'appdock-package') 'appdock-windows.zip'
+          $archive = [IO.Compression.ZipFile]::OpenRead((Resolve-Path $packageArchive))
           try {
             foreach ($required in @('appdock.py', 'RELEASE-MANIFEST.json', 'static/app.js', 'static/app.css', 'scripts/update_helper.py', 'scripts/path_safety.ps1', 'scripts/migrate_private_state.py', 'scripts/build_private_package.py', 'scripts/emit_windows_path_fixture.py', 'docs/EXTENSIONS.md', 'docs/PRIVATE_MIGRATION.md')) {
               if (-not ($archive.Entries.FullName -contains $required)) { throw "$required missing from archive" }
@@ -115,7 +119,10 @@ jobs:
             $archive.Dispose()
           }
       - name: Scan exact archive privacy
-        run: python scripts/privacy_scan.py --archive "$env:PACKAGE_ARCHIVE"
+        shell: pwsh
+        run: |
+          $packageArchive = Join-Path (Join-Path $env:RUNNER_TEMP 'appdock-package') 'appdock-windows.zip'
+          python scripts/privacy_scan.py --archive $packageArchive
       - name: Exercise Windows installer and uninstaller without Get-FileHash
         shell: pwsh
         run: |
@@ -124,7 +131,8 @@ jobs:
           $data = Join-Path $env:RUNNER_TEMP 'AppDockData'
           $overlap = Join-Path $env:RUNNER_TEMP 'AppDockOverlap'
           $bundle = Join-Path $env:RUNNER_TEMP 'AppDockBundle'
-          Expand-Archive -Path $env:PACKAGE_ARCHIVE -DestinationPath $bundle
+          $packageArchive = Join-Path (Join-Path $env:RUNNER_TEMP 'appdock-package') 'appdock-windows.zip'
+          Expand-Archive -Path $packageArchive -DestinationPath $bundle
           $installer = Join-Path $bundle 'scripts/install.ps1'
           try {
             & $installer -InstallDir $overlap -DataDir (Join-Path $overlap 'data') -NoStart
@@ -159,15 +167,16 @@ jobs:
   package-ubuntu:
     name: Build portable package / Ubuntu
     runs-on: ubuntu-latest
-    env:
-      PACKAGE_DIR: ${{ runner.temp }}/appdock-package
-      PACKAGE_ARCHIVE: ${{ runner.temp }}/appdock-package/appdock-ubuntu.zip
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.11'
-      - run: python scripts/build_portable.py --output "$PACKAGE_ARCHIVE"
+      - name: Build portable package
+        run: |
+          package_archive="$RUNNER_TEMP/appdock-package/appdock-ubuntu.zip"
+          mkdir -p "$(dirname "$package_archive")"
+          python scripts/build_portable.py --output "$package_archive"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: appdock-ubuntu

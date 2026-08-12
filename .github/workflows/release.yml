@@ -11,10 +11,6 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
-    env:
-      PACKAGE_DIR: ${{ runner.temp }}/appdock-package
-      PACKAGE_ARCHIVE: ${{ runner.temp }}/appdock-package/appdock-windows.zip
-      CHECKSUM_FILE: ${{ runner.temp }}/appdock-package/SHA256SUMS.txt
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -37,11 +33,23 @@ jobs:
       - name: Documentation links
         run: python scripts/check_docs.py
       - name: Build portable release
-        run: python scripts/build_portable.py --output "$env:PACKAGE_ARCHIVE"
+        shell: pwsh
+        run: |
+          $packageDir = Join-Path $env:RUNNER_TEMP 'appdock-package'
+          $packageArchive = Join-Path $packageDir 'appdock-windows.zip'
+          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+          python scripts/build_portable.py --output $packageArchive
       - name: Scan exact archive privacy
-        run: python scripts/privacy_scan.py --archive "$env:PACKAGE_ARCHIVE"
+        shell: pwsh
+        run: |
+          $packageArchive = Join-Path (Join-Path $env:RUNNER_TEMP 'appdock-package') 'appdock-windows.zip'
+          python scripts/privacy_scan.py --archive $packageArchive
       - name: Verify release inventory
-        run: python -c "from pathlib import Path; import appdock, os; appdock.validate_zip(Path(os.environ['PACKAGE_ARCHIVE']).read_bytes())"
+        shell: pwsh
+        run: |
+          $packageArchive = Join-Path (Join-Path $env:RUNNER_TEMP 'appdock-package') 'appdock-windows.zip'
+          $env:PACKAGE_ARCHIVE = $packageArchive
+          python -c "from pathlib import Path; import appdock, os; appdock.validate_zip(Path(os.environ['PACKAGE_ARCHIVE']).read_bytes())"
       - name: Upload tested Windows release
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -56,10 +64,6 @@ jobs:
     runs-on: windows-latest
     permissions:
       contents: write
-    env:
-      PACKAGE_DIR: ${{ runner.temp }}/appdock-package
-      PACKAGE_ARCHIVE: ${{ runner.temp }}/appdock-package/appdock-windows.zip
-      CHECKSUM_FILE: ${{ runner.temp }}/appdock-package/SHA256SUMS.txt
     steps:
       - name: Download tested Windows release
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -71,9 +75,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          $packageDir = Join-Path $env:RUNNER_TEMP 'appdock-package'
+          $packageArchive = Join-Path $packageDir 'appdock-windows.zip'
+          $checksumFile = Join-Path $packageDir 'SHA256SUMS.txt'
           $arguments = @(
             'release', 'create', $env:GITHUB_REF_NAME,
-            $env:PACKAGE_ARCHIVE, $env:CHECKSUM_FILE,
+            $packageArchive, $checksumFile,
             '--verify-tag', '--generate-notes',
             '--title', "AppDock $env:GITHUB_REF_NAME"
           )
