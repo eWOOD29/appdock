@@ -27,6 +27,10 @@ EXCLUDED_PARTS = {"__pycache__", ".pytest_cache", ".git", ".venv", "dist", "buil
 EXCLUDED_SUFFIXES = {".pyc", ".pyo", ".log"}
 TEXT_SUFFIXES = {".css", ".html", ".js", ".json", ".md", ".ps1", ".py", ".toml", ".txt", ".yaml", ".yml"}
 TEXT_FILENAMES = {"LICENSE"}
+# The installer bootstraps this helper before trusting any other bundle code.
+# Keep its exact source bytes in the archive so the independent bootstrap digest
+# describes the bytes that are actually shipped.
+BYTE_EXACT_TEXT_FILES = {"scripts/path_safety.ps1"}
 
 # These limits apply to the immutable source snapshot, before manifest generation.
 # They are intentionally above the current release size while bounding memory and
@@ -360,7 +364,7 @@ def build_archive(output: Path = DEFAULT_OUTPUT, root: Path = ROOT) -> str:
         aggregate += len(content)
         if aggregate > MAX_SOURCE_TOTAL_BYTES:
             raise ValueError("source tree exceeds its aggregate limit")
-        if path.suffix.lower() in TEXT_SUFFIXES or path.name in TEXT_FILENAMES:
+        if (path.suffix.lower() in TEXT_SUFFIXES or path.name in TEXT_FILENAMES) and name not in BYTE_EXACT_TEXT_FILES:
             content = content.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
         payloads[name] = content
     _assert_outputs_disjoint_from_source(output, sidecar, root)

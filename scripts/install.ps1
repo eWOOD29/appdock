@@ -27,7 +27,7 @@ function Get-AppDockBootstrapSha256 {
 
 $SourceRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $BootstrapSafetyPath = Join-Path $PSScriptRoot 'path_safety.ps1'
-$TrustedPathSafetySha256 = 'b3492c502df9fe4a9b291d9149fece46cced435b9e3ed03247fe4801819e1539'
+$TrustedPathSafetySha256 = '092974029279438e494f2d9a52f35c08b58973dd7b9447eb1455b5eeac25df0e'
 if (-not (Test-Path -LiteralPath $BootstrapSafetyPath -PathType Leaf) -or
     (Get-AppDockBootstrapSha256 -Path $BootstrapSafetyPath) -ne $TrustedPathSafetySha256) {
     throw 'The packaged path-safety module failed independent integrity verification.'
