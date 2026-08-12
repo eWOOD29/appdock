@@ -1,0 +1,42 @@
+name: Temporary AppDock updater-lock patch
+
+on:
+  push:
+    branches:
+      - feat/appdock-v0.2.0
+    paths:
+      - .github/workflows/_appdock_lock_fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: feat/appdock-v0.2.0
+          fetch-depth: 0
+      - name: Apply exact updater-lock identity fix
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("appdock.py")
+          source = path.read_text(encoding="utf-8")
+          old = "    key = str(lock_path)\n"
+          new = "    key = os.path.normcase(str(lock_path.resolve()))\n"
+          if source.count(old) != 1:
+              raise SystemExit("expected updater-lock key boundary not found exactly once")
+          with path.open("w", encoding="utf-8", newline="\n") as stream:
+              stream.write(source.replace(old, new))
+          PY
+          rm .github/workflows/_appdock_lock_fix.yml
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add appdock.py .github/workflows/_appdock_lock_fix.yml
+          git commit -m "fix: canonicalize updater lock identity"
+          git push origin HEAD:feat/appdock-v0.2.0
