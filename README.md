@@ -15,8 +15,9 @@ It discovers explicit `appdock.json` manifests, shows process and health state, 
 - **Preview before trust:** inspect the resolved directory, command, URLs, and manifest before registration.
 - **Safe process launch:** argument arrays with `shell=False`; no arbitrary shell-command field.
 - **Health-aware controls:** distinguish stopped, running, healthy, unhealthy, and crashed apps.
-- **Update notifications:** quietly check GitHub Releases after startup and show a non-blocking banner/badge when a newer release is available. Checks never download or apply updates.
-- **Explicit updates:** Update now uses a confirmation digest, trusted checksum-verified assets, safe staging, backup/restart/rollback, and expected-version health verification. Windows is the supported one-click update target.
+- **Stable and Beta update channels:** Stable is the default. Users can explicitly opt into immutable numbered Beta prereleases from the Updates page without changing the verified update pipeline.
+- **Update notifications:** quietly check the selected GitHub Release channel after startup and show a non-blocking banner/badge when a newer eligible release is available. Checks never download or apply updates.
+- **Explicit updates:** Update now uses a channel-bound confirmation digest, trusted checksum-verified assets, safe staging, backup/restart/rollback, and expected-version health verification. Windows is the supported one-click update target.
 - **Optional LM Studio:** inspect installed/running models and manage exact instances through the local `lms` CLI when installed; AppDock itself has no network dependency for this integration.
 - **Windows-friendly:** guided installer, optional startup shortcut, portable ZIP releases, CI, and rollback-oriented updates.
 
@@ -124,7 +125,7 @@ A repository should also document its own prerequisites and setup. AppDock does 
 
 ## Updates
 
-Open the navigation drawer and select **Updates**, or follow the non-blocking availability banner. AppDock contacts GitHub Releases and ordinary connection metadata (such as request IP and user agent) may be processed by GitHub. A check never downloads or applies anything. **Update now** is explicit and downloads only the expected release asset, verifies `SHA256SUMS.txt`, checks the ZIP for unsafe paths, stages a backup, preserves the separate mutable user-data directory, and restarts AppDock. Mutable user data is separate from versioned program files. Windows is supported for one-click application. A development clone should use Git (`git pull`) rather than one-click update. See [Update design and recovery](docs/UPDATES.md).
+Open the navigation drawer and select **Updates**, or follow the non-blocking availability banner. The update channel defaults to **Stable**. **Beta (pre-release)** is an explicit opt-in for numbered GitHub prereleases such as `v0.2.1-beta.1`; AppDock never installs raw `develop` branch bytes. Switching back to Stable never forces a downgrade. AppDock contacts GitHub Releases and ordinary connection metadata (such as request IP and user agent) may be processed by GitHub. A check never downloads or applies anything. **Update now** is explicit and downloads only the expected release assets from the selected channel, verifies `SHA256SUMS.txt`, checks the ZIP for unsafe paths, stages a backup, preserves the separate mutable user data directory, and restarts AppDock. Both channels use the same verification and rollback pipeline. Windows is supported for one-click application. A development clone should use Git (`git pull`) rather than one-click update. See [Update design and recovery](docs/UPDATES.md).
 
 ## Optional LM Studio integration
 
@@ -147,6 +148,8 @@ LM Studio is optional. If the local `lms` executable is installed, the **LM Stud
 - [Changelog](CHANGELOG.md)
 
 ## Development
+
+`main` is the Stable integration branch. Ongoing release work is integrated on `develop`; numbered Beta prereleases are cut only from commits contained in `develop`, then promoted to `main` after final validation.
 
 ```powershell
 py -3.11 -m unittest discover -s tests -v

@@ -91,7 +91,7 @@ Use a comma-separated list for multiple proxy hostnames. Do not add public or wi
 
 ## Upgrade
 
-Use **Settings → Updates** in AppDock. Manual replacement is also supported: stop AppDock, install the new release over the program directory, and keep `%LOCALAPPDATA%\AppDock` unchanged.
+Use **Updates** in AppDock. Stable is the default update channel; Beta prereleases are an explicit opt-in on that page. Manual replacement is also supported: stop AppDock, install the intended release over the program directory, and keep `%LOCALAPPDATA%\AppDock` unchanged.
 
 ## Uninstall
 

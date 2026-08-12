@@ -96,13 +96,13 @@ Possible causes:
 
 - no network access to GitHub;
 - GitHub rate limiting or service interruption;
-- no stable release exists yet;
+- no eligible release exists for the selected channel yet (for Beta, no valid numbered prerelease may have been published);
 - the configured update repository is invalid;
 - a proxy/security product blocked the GitHub API.
 
 A source/development checkout should use `git pull` rather than one-click update.
 
-Automatic check failures are intentionally quiet on the dashboard. Open **Updates** and run **Check for updates** to see the actionable error. Checks contact GitHub Releases and may disclose ordinary connection metadata to GitHub; they do not download or apply updates.
+Automatic check failures are intentionally quiet on the dashboard. Open **Updates**, confirm the selected Stable/Beta channel, and run **Check for updates** to see the actionable error. A missing/corrupt channel settings file fails safe to Stable. Checks contact GitHub Releases and may disclose ordinary connection metadata to GitHub; they do not download or apply updates.
 
 ## LM Studio is unavailable
 
