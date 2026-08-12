@@ -872,9 +872,51 @@ class ReleaseHardeningTests(unittest.TestCase):
         build_text = build.group(1)
         publish_text = publish.group(1)
         self.assertIn("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a", build_text)
-        self.assertIn("dist/appdock-windows.zip", build_text)
-        self.assertIn("dist/SHA256SUMS.txt", build_text)
+        self.assertIn("${{ runner.temp }}/appdock-package/appdock-windows.zip", build_text)
+        self.assertIn("${{ runner.temp }}/appdock-package/SHA256SUMS.txt", build_text)
         self.assertRegex(publish_text, r"needs:\s+build")
+
+    def test_ci_package_jobs_use_external_runner_temp_outputs(self) -> None:
+        workflow = (Path(__file__).parents[1] / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        for job, archive in (("package-windows", "appdock-windows.zip"), ("package-ubuntu", "appdock-ubuntu.zip")):
+            match = re.search(rf"(?ms)^  {job}:\n(.*?)(?=^  [\\w-]+:\n|\Z)", workflow)
+            self.assertIsNotNone(match, job)
+            job_text = match.group(1)
+            expected = f"${{{{ runner.temp }}}}/appdock-package/{archive}"
+            self.assertIn("PACKAGE_DIR: ${{ runner.temp }}/appdock-package", job_text)
+            self.assertIn(f"PACKAGE_ARCHIVE: {expected}", job_text)
+            self.assertRegex(job_text, rf"--output .*PACKAGE_ARCHIVE")
+            self.assertIn(expected, job_text)
+            self.assertNotIn(f"dist/{archive}", job_text)
+
+    def test_ci_windows_tests_are_direct_quiet_without_pipe_capture(self) -> None:
+        workflow = (Path(__file__).parents[1] / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        test_job = re.search(r"(?ms)^  test:\n(.*?)(?=^  private-fixture:\n)", workflow)
+        self.assertIsNotNone(test_job)
+        test_text = test_job.group(1)
+        self.assertIn("python -m unittest discover -s tests -q", test_text)
+        self.assertNotIn("subprocess.PIPE", test_text)
+        self.assertNotIn("capture_output", test_text)
+        self.assertNotIn("unit-test-output.txt", test_text)
+        self.assertNotRegex(test_text, r"unittest['\"]?,?\s+.*-v")
+
+    def test_release_build_and_publish_use_same_external_artifact_paths(self) -> None:
+        workflow = (Path(__file__).parents[1] / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+        build = re.search(r"(?ms)^  build:\n(.*?)(?=^  publish:\n)", workflow)
+        publish = re.search(r"(?ms)^  publish:\n(.*)\Z", workflow)
+        self.assertIsNotNone(build)
+        self.assertIsNotNone(publish)
+        build_text = build.group(1)
+        publish_text = publish.group(1)
+        for archive in ("appdock-windows.zip", "SHA256SUMS.txt"):
+            expected = f"${{{{ runner.temp }}}}/appdock-package/{archive}"
+            self.assertIn(expected, build_text)
+            self.assertIn(expected, publish_text)
+            self.assertNotIn(f"dist/{archive}", build_text + publish_text)
+        self.assertRegex(build_text, r"--output .*PACKAGE_ARCHIVE")
+        self.assertIn("path: ${{ runner.temp }}/appdock-package", publish_text)
+        self.assertNotIn("build_portable.py", publish_text)
+        self.assertNotIn("python -m unittest", publish_text)
         self.assertRegex(publish_text, r"permissions:\s*\n\s+contents: write")
         self.assertIn("actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093", publish_text)
         self.assertIn("'release', 'create'", publish_text)

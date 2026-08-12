@@ -11,6 +11,10 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      PACKAGE_DIR: ${{ runner.temp }}/appdock-package
+      PACKAGE_ARCHIVE: ${{ runner.temp }}/appdock-package/appdock-windows.zip
+      CHECKSUM_FILE: ${{ runner.temp }}/appdock-package/SHA256SUMS.txt
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -22,7 +26,7 @@ jobs:
           $expected = 'v' + (python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
           if ($env:GITHUB_REF_NAME -ne $expected) { throw "Tag $env:GITHUB_REF_NAME does not match $expected" }
       - name: Test
-        run: python -m unittest discover -s tests -v
+        run: python -m unittest discover -s tests -q
       - name: Compile and JavaScript checks
         run: |
           python -m compileall -q appdock.py tests scripts
@@ -33,31 +37,35 @@ jobs:
       - name: Documentation links
         run: python scripts/check_docs.py
       - name: Build portable release
-        run: python scripts/build_portable.py --output dist/appdock-windows.zip
+        run: python scripts/build_portable.py --output "$env:PACKAGE_ARCHIVE"
       - name: Scan exact archive privacy
-        run: python scripts/privacy_scan.py --archive dist/appdock-windows.zip
+        run: python scripts/privacy_scan.py --archive "$env:PACKAGE_ARCHIVE"
       - name: Verify release inventory
-        run: python -c "from pathlib import Path; import appdock; appdock.validate_zip(Path('dist/appdock-windows.zip').read_bytes())"
+        run: python -c "from pathlib import Path; import appdock, os; appdock.validate_zip(Path(os.environ['PACKAGE_ARCHIVE']).read_bytes())"
       - name: Upload tested Windows release
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tested-windows-release
           if-no-files-found: error
           path: |
-            dist/appdock-windows.zip
-            dist/SHA256SUMS.txt
+            ${{ runner.temp }}/appdock-package/appdock-windows.zip
+            ${{ runner.temp }}/appdock-package/SHA256SUMS.txt
 
   publish:
     needs: build
     runs-on: windows-latest
     permissions:
       contents: write
+    env:
+      PACKAGE_DIR: ${{ runner.temp }}/appdock-package
+      PACKAGE_ARCHIVE: ${{ runner.temp }}/appdock-package/appdock-windows.zip
+      CHECKSUM_FILE: ${{ runner.temp }}/appdock-package/SHA256SUMS.txt
     steps:
       - name: Download tested Windows release
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: tested-windows-release
-          path: dist
+          path: ${{ runner.temp }}/appdock-package
       - name: Publish GitHub release
         shell: pwsh
         env:
@@ -65,7 +73,7 @@ jobs:
         run: |
           $arguments = @(
             'release', 'create', $env:GITHUB_REF_NAME,
-            'dist/appdock-windows.zip', 'dist/SHA256SUMS.txt',
+            $env:PACKAGE_ARCHIVE, $env:CHECKSUM_FILE,
             '--verify-tag', '--generate-notes',
             '--title', "AppDock $env:GITHUB_REF_NAME"
           )
