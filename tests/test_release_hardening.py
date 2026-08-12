@@ -723,7 +723,7 @@ class ReleaseHardeningTests(unittest.TestCase):
             subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200, create=True
         ):
             windows = _helper_process_group_options()
-        self.assertEqual(windows, {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP})
+        self.assertEqual(windows, {"creationflags": 0x200})
         self.assertNotIn("start_new_session", windows)
 
         with patch.object(os, "name", "posix"):
@@ -1215,7 +1215,9 @@ class ReleaseHardeningTests(unittest.TestCase):
         identity = receipt["identity"]
         with patch("scripts.update_helper._alive", side_effect=alive_then_tamper), patch(
             "scripts.update_helper.time.sleep", return_value=None
-        ):
+        ), patch(
+            "scripts.update_helper._restore_existing_service_after_preapply_failure", return_value=False
+        ) as restore:
             result = update_helper.run(
                 staged, install, self.config.data_root, 123, install / "appdock.py", [],
                 expected_version="0.3.5",
@@ -1226,6 +1228,10 @@ class ReleaseHardeningTests(unittest.TestCase):
             )
         self.assertEqual(result, 1)
         self.assertEqual((install / "appdock.py").read_bytes(), b"old")
+        restore.assert_called_once()
+        self.assertEqual(restore.call_args.args[:4], (install / "appdock.py", install, self.config.data_root, []))
+        with acquire_update_lock(self.config.data_root):
+            pass
 
     def test_apply_update_rejects_identity_mismatch_before_backup(self) -> None:
         install = self.root / "install-apply-identity"
