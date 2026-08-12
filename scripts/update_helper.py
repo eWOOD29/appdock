@@ -200,7 +200,7 @@ def _verify_helper_identity(
             or identity["helper_sha256"] != expected_helper_sha256
         ):
             raise AppDockError("helper update identity claim does not match")
-    if receipt is not None and Path(receipt["path"]).expanduser().absolute() != staged.expanduser().absolute():
+    if receipt is not None and Path(receipt["path"]).expanduser().resolve() != staged.expanduser().resolve():
         raise AppDockError("helper staged path does not match its receipt")
     return receipt
 
