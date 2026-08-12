@@ -22,6 +22,28 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+
+def _helper_process_group_options() -> dict[str, object]:
+    """Isolate the real helper wrapper from this test runner's console group."""
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+def _launch_helper_process(command, *, cwd, env, stdout, stderr):
+    return subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=env,
+        stdout=stdout,
+        stderr=stderr,
+        text=True,
+        shell=False,
+        close_fds=True,
+        **_helper_process_group_options(),
+    )
+
+
 import appdock
 from scripts import update_helper
 from appdock import (
@@ -603,13 +625,12 @@ class ReleaseHardeningTests(unittest.TestCase):
         )
         environment = os.environ.copy()
         environment["APPDOCK_DATA_DIR"] = str(self.config.data_root)
-        helper_process = subprocess.Popen(
+        helper_process = _launch_helper_process(
             [sys.executable, "-B", "-c", wrapper],
             cwd=Path(__file__).parents[1],
             env=environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
         )
         try:
             deadline = time.monotonic() + 15
@@ -659,6 +680,54 @@ class ReleaseHardeningTests(unittest.TestCase):
             self.assertEqual(helper_process.returncode, 0, helper_stderr)
             lock = acquire_update_lock(self.config.data_root)
             lock.release()
+
+    def test_real_helper_wrapper_launch_options_are_platform_isolated(self) -> None:
+        captured: dict[str, object] = {}
+
+        def capture_popen(_command, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace()
+
+        with patch.object(os, "name", "nt"), patch.object(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200, create=True
+        ), patch.object(subprocess, "Popen", side_effect=capture_popen):
+            _launch_helper_process(
+                [sys.executable, "-c", "pass"],
+                cwd=self.root,
+                env=os.environ.copy(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+        self.assertTrue(captured["close_fds"])
+        self.assertFalse(captured["shell"])
+        self.assertEqual(captured["creationflags"], 0x200)
+        self.assertNotIn("start_new_session", captured)
+        with patch.object(os, "name", "posix"), patch.object(
+            subprocess, "Popen", side_effect=capture_popen
+        ):
+            _launch_helper_process(
+                [sys.executable, "-c", "pass"],
+                cwd=self.root,
+                env=os.environ.copy(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        self.assertEqual(captured["start_new_session"], True)
+        expected_group_options = _helper_process_group_options()
+        self.assertEqual(
+            {key: captured[key] for key in expected_group_options},
+            expected_group_options,
+        )
+        with patch.object(os, "name", "nt"), patch.object(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200, create=True
+        ):
+            windows = _helper_process_group_options()
+        self.assertEqual(windows, {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP})
+        self.assertNotIn("start_new_session", windows)
+
+        with patch.object(os, "name", "posix"):
+            self.assertEqual(_helper_process_group_options(), {"start_new_session": True})
 
     def test_fresh_coordinator_rehydrates_stage_after_staging_process_loss(self) -> None:
         staged = self.config.updates_root / "0.2.1"

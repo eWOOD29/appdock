@@ -74,11 +74,14 @@ class V020Tests(unittest.TestCase):
                 "USERPROFILE": str(root / "profile"),
                 "PATH": str(path_bin),
             }
-            self.assertEqual(discover_lms(environment), str(override))
+            discovered = discover_lms(environment)
+            self.assertTrue(os.path.samefile(discovered, override))
             environment.pop("APPDOCK_LMS_PATH")
-            self.assertEqual(discover_lms(environment), str(profile_bin / "lms.cmd"))
+            discovered = discover_lms(environment)
+            self.assertTrue(os.path.samefile(discovered, profile_bin / "lms.cmd"))
             (profile_bin / "lms.cmd").unlink()
-            self.assertEqual(discover_lms(environment), str(path_bin / "lms"))
+            discovered = discover_lms(environment)
+            self.assertTrue(os.path.samefile(discovered, path_bin / "lms"))
 
     def test_lms_absent_state_is_useful_and_never_exposes_executable(self) -> None:
         with patch("appdock.discover_lms", return_value=None):
