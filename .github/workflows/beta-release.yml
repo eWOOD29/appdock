@@ -1,10 +1,9 @@
-name: Release
+name: Beta Release
 
 on:
   push:
     tags:
-      - 'v*'
-      - '!v*-*'
+      - 'v*-beta.*'
 
 permissions:
   contents: read
@@ -14,14 +13,22 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.11'
-      - name: Verify version tag
+      - name: Verify Beta tag and develop ancestry
         shell: pwsh
         run: |
+          if ($env:GITHUB_REF_NAME -notmatch '^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-beta\.(0|[1-9]\d*)$') {
+            throw "Tag $env:GITHUB_REF_NAME is not an AppDock Beta tag"
+          }
           $expected = 'v' + (python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
           if ($env:GITHUB_REF_NAME -ne $expected) { throw "Tag $env:GITHUB_REF_NAME does not match $expected" }
+          git fetch origin develop
+          git merge-base --is-ancestor $env:GITHUB_SHA origin/develop
+          if ($LASTEXITCODE -ne 0) { throw 'Beta tag must point to a commit contained in develop' }
       - name: Test
         run: python -m unittest discover -s tests -q
       - name: Compile and JavaScript checks
@@ -33,7 +40,7 @@ jobs:
         run: python scripts/privacy_scan.py
       - name: Documentation links
         run: python scripts/check_docs.py
-      - name: Build portable release
+      - name: Build portable Beta release
         shell: pwsh
         run: |
           $packageDir = Join-Path $env:RUNNER_TEMP 'appdock-package'
@@ -51,10 +58,10 @@ jobs:
           $packageArchive = Join-Path (Join-Path $env:RUNNER_TEMP 'appdock-package') 'appdock-windows.zip'
           $env:PACKAGE_ARCHIVE = $packageArchive
           python -c "from pathlib import Path; import appdock, os; appdock.validate_zip(Path(os.environ['PACKAGE_ARCHIVE']).read_bytes())"
-      - name: Upload tested Windows release
+      - name: Upload tested Windows Beta release
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: tested-windows-release
+          name: tested-windows-beta-release
           if-no-files-found: error
           path: |
             ${{ runner.temp }}/appdock-package/appdock-windows.zip
@@ -66,12 +73,12 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download tested Windows release
+      - name: Download tested Windows Beta release
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: tested-windows-release
+          name: tested-windows-beta-release
           path: ${{ runner.temp }}/appdock-package
-      - name: Publish GitHub release
+      - name: Publish GitHub Beta prerelease
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -79,17 +86,8 @@ jobs:
           $packageDir = Join-Path $env:RUNNER_TEMP 'appdock-package'
           $packageArchive = Join-Path $packageDir 'appdock-windows.zip'
           $checksumFile = Join-Path $packageDir 'SHA256SUMS.txt'
-          $arguments = @(
-            'release', 'create', $env:GITHUB_REF_NAME,
-            $packageArchive, $checksumFile,
-            '--repo', $env:GITHUB_REPOSITORY,
-            '--verify-tag', '--generate-notes',
-            '--title', "AppDock $env:GITHUB_REF_NAME"
-          )
-          if ($env:GITHUB_REF_NAME -eq 'v0.1.1') {
-            $arguments += @(
-              '--notes',
-              "Updating from v0.1.0: install v0.1.1 manually using the verified ZIP and scripts/install.ps1. The v0.1.0 one-click updater intentionally rejects v0.1.1's release-inventory schema. See docs/MIGRATING.md."
-            )
-          }
-          & gh @arguments
+          & gh release create $env:GITHUB_REF_NAME `
+            $packageArchive $checksumFile `
+            --repo $env:GITHUB_REPOSITORY `
+            --verify-tag --generate-notes --prerelease --latest=false `
+            --title "AppDock $env:GITHUB_REF_NAME"

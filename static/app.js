@@ -4,6 +4,7 @@ const byId = (id) => document.getElementById(id);
 let previewState = null;
 let previewKind = "";
 let verifiedRelease = null;
+let updateChannel = "stable";
 let previewRequestId = 0;
 let addDialogOpen = false;
 
@@ -447,29 +448,73 @@ async function lmMutation(path, body) {
   finally { setLmPending(false); }
 }
 
+function channelLabel(channel = updateChannel) { return channel === "beta" ? "Beta" : "Stable"; }
+
+function renderUpdateChannel(channel) {
+  updateChannel = channel === "beta" ? "beta" : "stable";
+  byId("updateChannel").value = updateChannel;
+  byId("betaChannelWarning").hidden = updateChannel !== "beta";
+}
+
+async function loadUpdateChannel() {
+  try {
+    const config = await api("/api/config");
+    renderUpdateChannel(config.update_channel);
+  } catch (_error) {
+    renderUpdateChannel("stable");
+  }
+}
+
+async function changeUpdateChannel() {
+  const select = byId("updateChannel");
+  const requested = select.value === "beta" ? "beta" : "stable";
+  select.disabled = true;
+  try {
+    const result = await api("/api/updates/channel", { method: "POST", body: JSON.stringify({ channel: requested }) });
+    renderUpdateChannel(result.channel);
+    verifiedRelease = null;
+    setUpdateAvailability(null);
+    byId("releaseNotes").textContent = "";
+    byId("updateResult").textContent = `${channelLabel()} channel selected.`;
+    await checkUpdates();
+  } catch (error) {
+    await loadUpdateChannel();
+    byId("updateResult").textContent = error.message;
+  } finally {
+    select.disabled = false;
+  }
+}
+
 function setUpdateAvailability(release) {
   const available = Boolean(release && release.update_available);
   byId("updatesBadge").hidden = !available; byId("updateBanner").hidden = !available;
   byId("updateButton").hidden = !available;
-  if (available) { byId("updateBannerText").textContent = ` AppDock ${release.version} is available.`; byId("updateButton").hidden = false; }
+  if (available) { byId("updateBannerText").textContent = ` AppDock ${release.version} is available on ${channelLabel(release.channel)}.`; byId("updateButton").hidden = false; }
 }
 
 async function checkUpdates({ automatic = false } = {}) {
   const output = byId("updateResult");
   if (!automatic) {
-    output.textContent = "Checking GitHub Releases…";
+    output.textContent = `Checking ${channelLabel()} releases…`;
     byId("updateButton").hidden = true;
     byId("releaseNotes").textContent = "";
   }
   try {
     const release = await api("/api/updates/check");
+    renderUpdateChannel(release.channel);
     verifiedRelease = release;
     setUpdateAvailability(release);
     if (!automatic) {
-      output.textContent = release.update_available
-        ? `AppDock ${release.version} is available. You are running ${release.current}.`
-        : `AppDock ${release.current} is current.`;
-      byId("releaseNotes").textContent = release.notes || "No release notes provided.";
+      if (!release.available) {
+        output.textContent = `No ${channelLabel(release.channel)} prerelease is currently available. You are running ${release.current}.`;
+        byId("releaseNotes").textContent = "";
+      } else if (release.update_available) {
+        output.textContent = `AppDock ${release.version} is available on ${channelLabel(release.channel)}. You are running ${release.current}.`;
+        byId("releaseNotes").textContent = release.notes || "No release notes provided.";
+      } else {
+        output.textContent = `No newer ${channelLabel(release.channel)} release is available. You are running ${release.current}.`;
+        byId("releaseNotes").textContent = release.notes || "";
+      }
       byId("updateButton").hidden = !release.update_available;
     }
     return release;
@@ -495,7 +540,7 @@ async function waitForHealthyVersion(expectedVersion) {
 }
 
 async function applyVerifiedUpdate() {
-  if (!verifiedRelease || !window.confirm(`Update AppDock to ${verifiedRelease.version}? AppDock will restart after verification.`)) return;
+  if (!verifiedRelease || !window.confirm(`Update AppDock to ${verifiedRelease.version} from the ${channelLabel(verifiedRelease.channel)} channel? AppDock will restart after verification.`)) return;
   const output = byId("updateResult");
   byId("updateButton").disabled = true;
   try {
@@ -537,6 +582,7 @@ byId("previewLocalButton").addEventListener("click", () => previewApp("local"));
 byId("previewGithubButton").addEventListener("click", () => previewApp("github"));
 byId("registerButton").addEventListener("click", registerPreview);
 byId("checkUpdateButton").addEventListener("click", checkUpdates);
+byId("updateChannel").addEventListener("change", changeUpdateChannel);
 byId("updateButton").addEventListener("click", applyVerifiedUpdate);
 byId("lmRefreshButton").addEventListener("click", loadLM);
 byId("lmModels").addEventListener("submit", (event) => {
@@ -582,7 +628,7 @@ document.addEventListener("keydown", (event) => {
 loadApps();
 loadExtensions();
 loadLM();
-window.setTimeout(() => { checkUpdates({ automatic: true }); }, 0);
+loadUpdateChannel().then(() => checkUpdates({ automatic: true }));
 window.setInterval(loadApps, 5000);
 window.setInterval(loadExtensions, 5000);
 window.setInterval(() => { checkUpdates({ automatic: true }); }, AUTO_UPDATE_CHECK_INTERVAL_MS);

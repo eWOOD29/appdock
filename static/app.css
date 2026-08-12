@@ -22,7 +22,7 @@ body {
   font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
 }
 
-button, input { font: inherit; }
+button, input, select { font: inherit; }
 button, summary, a { -webkit-tap-highlight-color: transparent; }
 
 .topbar {
@@ -76,7 +76,7 @@ button {
   cursor: pointer;
 }
 button:hover { border-color: rgba(0, 150, 255, 0.62); }
-button:focus-visible, a:focus-visible, summary:focus-visible, input:focus-visible {
+button:focus-visible, a:focus-visible, summary:focus-visible, input:focus-visible, select:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
@@ -155,6 +155,13 @@ summary { width: fit-content; color: #55b9ff; cursor: pointer; }
 .progress-reset, .widget-timestamp { display: block; margin-top: 5px; color: var(--muted); font-size: 11px; }
 .widget-timestamp { margin-bottom: 0; }
 .panel[hidden], .modal[hidden], #previewPanel[hidden] { display: none; }
+.update-channel { max-width: 360px; margin: 18px 0 10px; }
+.update-channel span { display: block; margin-bottom: 5px; }
+.update-channel select {
+  width: 100%; min-height: 42px; padding: 9px 10px; border: 1px solid var(--line); border-radius: 6px;
+  background: #0e1115; color: var(--text);
+}
+#betaChannelWarning { max-width: 720px; margin: 0 0 14px; }
 .release-notes { max-height: 210px; overflow: auto; white-space: pre-wrap; color: var(--muted); }
 .lm-list { display: grid; gap: 10px; }
 .lm-model-row, .lm-loaded-row { padding: 13px 0; border-top: 1px solid var(--line); }

@@ -4,6 +4,20 @@ All notable changes to AppDock are documented here. The project follows Semantic
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-12
+
+### Added
+
+- Opt-in **Beta** update channel with Stable as the fail-safe default.
+- Persistent update-channel preference stored in the separate AppDock data root.
+- Numbered Beta prerelease discovery (`vX.Y.Z-beta.N`) with SemVer ordering and no automatic downgrade when returning to Stable.
+- Long-lived `develop` integration branch, CI on `develop`, and a separate Beta prerelease workflow that reuses the verified portable-release pipeline.
+
+### Changed
+
+- Stable publication excludes prerelease tags so Beta tags cannot enter the Stable release workflow.
+- Update confirmations are bound to the selected channel while staging/application continues to use the existing checksum, inventory, backup, restart, health, rollback, and cleanup path.
+
 ## [0.2.0] - 2026-08-01
 
 ### Added

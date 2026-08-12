@@ -46,7 +46,7 @@ No. The one-click updater updates AppDock itself. Update managed applications th
 
 ## How does AppDock update itself?
 
-It checks the configured official GitHub release, selects exact expected assets, verifies the release checksum, scans the archive, stages a backup, exits, replaces program files through an external helper, restarts, and rolls back on failure. Development checkouts should use `git pull` instead.
+It checks the configured official GitHub Releases using the selected update channel. Stable is the default and rejects prereleases. Beta is explicit opt-in and accepts only numbered published prereleases such as `v0.2.1-beta.1`; it never installs raw `develop` bytes. Both channels select the same exact expected assets, verify the release checksum and inventory, scan the archive, stage a backup, replace program files through the external helper, restart, and roll back on failure. Switching back to Stable never forces a downgrade. Development checkouts should use `git pull` instead.
 
 ## Where is my data?
 

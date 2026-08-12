@@ -22,9 +22,16 @@ py -3.11 appdock.py --data-dir "$env:TEMP\appdock-dev"
 
 AppDock intentionally uses only the Python standard library at runtime. Discuss new runtime dependencies before adding them.
 
+## Branch and release model
+
+- `main` represents the Stable channel and should contain only release-ready changes.
+- `develop` is the long-lived integration branch for the next release and the source of numbered Beta prereleases.
+- Feature/fix branches should normally target `develop`; promotion from `develop` to `main` happens only after final validation.
+- Beta release tags use `v<major>.<minor>.<patch>-beta.<n>` and must point to a commit contained in `develop`. They are GitHub prereleases and are never treated as Stable/latest releases.
+
 ## Pull requests
 
-1. Fork and create a focused branch.
+1. Fork and create a focused branch, normally based on `develop` for next-release work.
 2. Write a failing behavior test before production code.
 3. Keep generated user data outside the repository.
 4. Run all tests and compile checks.

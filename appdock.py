@@ -32,10 +32,13 @@ else:
     import fcntl
 
 MANIFEST_NAME = "appdock.json"
-CURRENT_VERSION = "0.2.0"
+CURRENT_VERSION = "0.2.1"
 DEFAULT_UPDATE_REPOSITORY = "eWOOD29/appdock"
+DEFAULT_UPDATE_CHANNEL = "stable"
+UPDATE_CHANNELS = frozenset({"stable", "beta"})
 APP_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 SEMVER_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$")
+BETA_TAG_RE = re.compile(r"^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-beta\.(0|[1-9]\d*)$")
 MAX_JSON_BYTES = 128 * 1024
 MAX_UPDATE_ASSET_BYTES = 100 * 1024 * 1024
 MAX_UPDATE_FILE_COUNT = 4096
@@ -2549,14 +2552,55 @@ def compare_semver(left: str, right: str) -> int:
     return (len(a[3]) > len(b[3])) - (len(a[3]) < len(b[3]))
 
 
-def parse_release(payload: dict[str, Any]) -> dict[str, Any]:
+def _update_channel_path(config: AppDockConfig) -> Path:
+    return config.data_root / "update-settings.json"
+
+
+def read_update_channel(config: AppDockConfig) -> str:
+    path = _update_channel_path(config)
+    if not path.exists():
+        return DEFAULT_UPDATE_CHANNEL
+    try:
+        raw = _read_bounded_json(path)
+        if (
+            isinstance(raw, dict)
+            and set(raw) == {"schema_version", "channel"}
+            and raw.get("schema_version") == 1
+            and raw.get("channel") in UPDATE_CHANNELS
+        ):
+            return str(raw["channel"])
+    except (AppDockError, OSError, ValueError, TypeError):
+        pass
+    return DEFAULT_UPDATE_CHANNEL
+
+
+def write_update_channel(config: AppDockConfig, channel: str) -> str:
+    if channel not in UPDATE_CHANNELS:
+        raise AppDockError("update channel must be stable or beta")
+    config.ensure()
+    _durable_write_json(_update_channel_path(config), {"schema_version": 1, "channel": channel})
+    return channel
+
+
+def parse_release(payload: dict[str, Any], *, channel: str = DEFAULT_UPDATE_CHANNEL) -> dict[str, Any]:
+    if channel not in UPDATE_CHANNELS:
+        raise AppDockError("update channel is invalid")
     if not isinstance(payload, dict):
         raise AppDockError("release response is invalid")
-    if payload.get("draft") or payload.get("prerelease"):
-        raise AppDockError("release is not a stable public release")
-    tag = str(payload.get("tag_name") or "")
-    tag = tag[1:] if tag.startswith("v") else tag
-    compare_semver(tag, "0.0.0")
+    if payload.get("draft"):
+        raise AppDockError("draft releases are not eligible for updates")
+    prerelease = payload.get("prerelease") is True
+    tag_raw = str(payload.get("tag_name") or "")
+    tag = tag_raw[1:] if tag_raw.startswith("v") else tag_raw
+    match = SEMVER_RE.fullmatch(tag)
+    if match is None:
+        raise AppDockError("release tag is not a semantic version")
+    if channel == "stable":
+        if prerelease or match.group(4):
+            raise AppDockError("release is not a stable public release")
+    else:
+        if not prerelease or BETA_TAG_RE.fullmatch(tag_raw) is None:
+            raise AppDockError("release is not an AppDock Beta prerelease")
     assets = []
     for asset in payload.get("assets") or []:
         if isinstance(asset, dict) and isinstance(asset.get("name"), str) and isinstance(asset.get("browser_download_url"), str):
@@ -2569,28 +2613,53 @@ class ReleaseChecker:
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
             raise ValueError("invalid update repository")
         self.repository, self.opener, self.cache_ttl, self.current = repository, opener or urllib.request.urlopen, cache_ttl, current
-        self._cache: tuple[float, dict[str, Any]] | None = None
+        self._cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
-    def check(self) -> dict[str, Any]:
-        now = time.monotonic()
-        if self._cache and now - self._cache[0] < self.cache_ttl:
-            return self._cache[1]
-        endpoint = f"https://api.github.com/repos/{self.repository}/releases/latest"
+    def _fetch_json(self, endpoint: str) -> Any:
         request = urllib.request.Request(endpoint, headers={"Accept": "application/vnd.github+json", "User-Agent": "AppDock"})
         try:
-            try:
-                response = self.opener(request, timeout=5)
-            except TypeError:
-                response = self.opener(request)
-            if hasattr(response, "__enter__"):
-                with response as stream:
-                    payload = json.loads(stream.read().decode("utf-8"))
+            response = self.opener(request, timeout=5)
+        except TypeError:
+            response = self.opener(request)
+        if hasattr(response, "__enter__"):
+            with response as stream:
+                return json.loads(stream.read().decode("utf-8"))
+        return json.loads(response.read().decode("utf-8"))
+
+    def check(self, channel: str = DEFAULT_UPDATE_CHANNEL) -> dict[str, Any]:
+        if channel not in UPDATE_CHANNELS:
+            raise AppDockError("update channel is invalid")
+        now = time.monotonic()
+        cached = self._cache.get(channel)
+        if cached and now - cached[0] < self.cache_ttl:
+            return cached[1]
+        try:
+            if channel == "stable":
+                endpoint = f"https://api.github.com/repos/{self.repository}/releases/latest"
+                release = parse_release(self._fetch_json(endpoint), channel="stable")
             else:
-                payload = json.loads(response.read().decode("utf-8"))
-            release = parse_release(payload)
+                endpoint = f"https://api.github.com/repos/{self.repository}/releases?per_page=100"
+                payload = self._fetch_json(endpoint)
+                if not isinstance(payload, list):
+                    raise AppDockError("release response is invalid")
+                candidates: list[dict[str, Any]] = []
+                for item in payload:
+                    try:
+                        candidates.append(parse_release(item, channel="beta"))
+                    except (AppDockError, ValueError, TypeError):
+                        continue
+                if candidates:
+                    release = candidates[0]
+                    for candidate in candidates[1:]:
+                        if compare_semver(candidate["version"], release["version"]) > 0:
+                            release = candidate
+                else:
+                    release = {"version": "", "latest": "", "release_url": "", "notes": "", "assets": []}
+            release["channel"] = channel
             release["current"] = self.current
-            release["update_available"] = compare_semver(release["version"], self.current) > 0
-            self._cache = (now, release)
+            release["available"] = bool(release["version"])
+            release["update_available"] = bool(release["version"]) and compare_semver(release["version"], self.current) > 0
+            self._cache[channel] = (now, release)
             return release
         except (OSError, ValueError, TypeError, json.JSONDecodeError, urllib.error.URLError) as exc:
             raise AppDockError("could not check GitHub releases") from exc
@@ -3693,6 +3762,14 @@ HTML = r'''<!doctype html>
     <section id="updatesPanel" class="view panel" data-view="updates" hidden>
       <h1>AppDock updates</h1>
       <p class="muted">Checks contact GitHub Releases. Downloads happen only after you explicitly confirm Update now; release assets are checksum-verified, staged, backed up, and rollback-safe.</p>
+      <label class="update-channel" for="updateChannel">
+        <span>Update channel</span>
+        <select id="updateChannel">
+          <option value="stable">Stable</option>
+          <option value="beta">Beta (pre-release)</option>
+        </select>
+      </label>
+      <p id="betaChannelWarning" class="warning" hidden>Beta builds are optional prereleases and may contain unfinished features or regressions. They use the same verified update and rollback pipeline as Stable.</p>
       <div class="actions">
         <button id="checkUpdateButton" type="button">Check for updates</button>
         <button id="updateButton" type="button" class="primary" hidden>Update now</button>
@@ -3953,9 +4030,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(health)
             elif path == "/api/apps": self._json(self.manager.all_status())
             elif path == "/api/extensions": self._json(self.extensions.snapshot(self.manager.discover()))
-            elif path == "/api/config": self._json({"version": CURRENT_VERSION, "update_repository": self.config.update_repository})
+            elif path == "/api/config": self._json({"version": CURRENT_VERSION, "update_repository": self.config.update_repository, "update_channel": read_update_channel(self.config)})
             elif path == "/api/updates/check":
-                release = self.checker.check()
+                release = self.checker.check(read_update_channel(self.config))
                 self._json({**release, "confirmation_digest": _digest(release)})
             elif path == "/api/lm-studio":
                 self._json(self.lm_adapter.snapshot())
@@ -3982,8 +4059,13 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/onboarding/github/preview": self._json(self.github.preview(body.get("url"))); return
             if path == "/api/onboarding/github/register": self._json(self.github.register(body.get("preview"), body.get("confirmation", ""))); return
             if path == "/api/onboarding/github/cleanup": self._json({"cleaned": self.github.cleanup(body.get("staging_id", ""))}); return
+            if path == "/api/updates/channel":
+                if set(body) != {"channel"}:
+                    raise AppDockError("update channel request is invalid")
+                channel = write_update_channel(self.config, body.get("channel"))
+                self._json({"channel": channel}); return
             if path == "/api/updates/stage":
-                release = self.checker.check()
+                release = self.checker.check(read_update_channel(self.config))
                 if not release.get("update_available") or body.get("confirmation") != _digest(release):
                     raise AppDockError("update confirmation is stale or invalid")
                 staged = stage_coordinated_update(release, self.config, Handler.coordinator, repository=self.config.update_repository)

@@ -104,11 +104,14 @@ The command-line value takes precedence.
 Use the navigation drawer to open **Updates**, or select the non-modal availability banner. Automatic check failures stay quiet in normal dashboard use; a manual check reports its failure here.
 
 1. Open **Updates** from the navigation drawer.
-2. Select **Check for updates**.
-3. Read the target version and release notes.
-4. Select **Update now** and confirm.
+2. Leave **Update channel** on **Stable** (the default), or explicitly select **Beta (pre-release)** if you want numbered test builds.
+3. Select **Check for updates**.
+4. Read the selected channel, target version, and release notes.
+5. Select **Update now** and confirm.
 
-AppDock contacts GitHub Releases for checks and may disclose ordinary connection metadata to GitHub. It accepts update files only from the configured official GitHub repository release, validates the expected asset names and checksum, scans ZIP paths, backs up the current program files, applies the release, polls same-origin `/health` for the expected version, and reloads only after health is confirmed. User data stays in the separate mutable data directory. Windows is supported for explicit one-click application; development clones should use Git rather than one-click update.
+Beta is opt-in and may contain unfinished features or regressions. AppDock installs only published numbered prereleases, never raw `develop` branch bytes. Returning to Stable does not automatically downgrade a newer Beta installation.
+
+AppDock contacts GitHub Releases for checks and may disclose ordinary connection metadata to GitHub. Stable accepts only stable Releases; Beta accepts only published numbered AppDock prereleases. Both channels validate the expected asset names and checksum, scan ZIP paths, back up the current program files, apply the release, poll same-origin `/health` for the expected version, and reload only after health is confirmed. The update-channel preference and other user data stay in the separate mutable data directory. Windows is supported for explicit one-click application; development clones should use Git rather than one-click update.
 
 ## Backups
 

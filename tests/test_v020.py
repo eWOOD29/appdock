@@ -53,9 +53,9 @@ class V020Tests(unittest.TestCase):
             ReleaseChecker("owner/repo", opener=lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("offline")), current=CURRENT_VERSION).check()
 
     def test_version_consistency(self) -> None:
-        self.assertEqual(CURRENT_VERSION, "0.2.0")
+        self.assertEqual(CURRENT_VERSION, "0.2.1")
         pyproject = Path(__file__).parents[1] / "pyproject.toml"
-        self.assertIn('version = "0.2.0"', pyproject.read_text(encoding="utf-8"))
+        self.assertIn('version = "0.2.1"', pyproject.read_text(encoding="utf-8"))
 
     def test_lms_discovery_honors_override_then_user_bin_then_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

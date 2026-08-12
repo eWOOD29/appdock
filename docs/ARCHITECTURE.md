@@ -107,7 +107,7 @@ LM Studio is optional. Server-side discovery checks `APPDOCK_LMS_PATH`, standard
 configured GitHub repository
         |
         v
-latest release metadata + SemVer comparison
+selected Stable/Beta release metadata + SemVer comparison
         |
         v
 exact expected archive/checksum assets
@@ -130,7 +130,7 @@ backup -> replace program files -> restart
         +-- failure -> rollback backup
 ```
 
-The browser cannot provide an arbitrary update asset URL. Both assets must come from the configured repository's release. The checksum proves integrity relative to that GitHub release; it is not an independent signature.
+The browser cannot provide an arbitrary update asset URL. Stable uses the configured repository's latest stable Release; Beta is an explicit persisted opt-in and only considers non-draft numbered AppDock prereleases. Both assets must come from the selected GitHub Release, and both channels feed the same staging/application trust chain. The checksum proves integrity relative to that GitHub release; it is not an independent signature.
 
 ## Extension principles
 

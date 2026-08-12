@@ -2,18 +2,27 @@
 
 AppDock's updater is designed around versioned GitHub release assets and a user-data directory that is separate from program files.
 
-## v0.2.0 notification behavior
+## Update channels and notification behavior
 
-After the UI starts, AppDock performs a non-blocking check against GitHub Releases. It repeats no more than once every six hours, while the server-side `ReleaseChecker` cache remains authoritative. A newer stable release is shown in a non-modal dashboard banner and Updates navigation badge. Automatic failures are quiet during normal dashboard use; a manual check displays an actionable failure on the Updates page. Checks never download or apply an update.
+AppDock has two release channels:
+
+- **Stable** (default): checks GitHub's `releases/latest` endpoint and rejects drafts and prereleases.
+- **Beta (pre-release)** (explicit opt-in): enumerates GitHub Releases and considers only non-draft numbered prereleases matching `v<major>.<minor>.<patch>-beta.<n>`. Raw `develop` branch snapshots are never update candidates.
+
+The selected channel is stored as `update-settings.json` in the separate AppDock data root, so it survives program-file replacement. A missing, corrupt, or unsupported setting fails safe to Stable. Switching from a newer Beta build back to Stable does not downgrade AppDock; Stable becomes eligible only when a strictly newer stable version exists.
+
+After the UI starts, AppDock performs a non-blocking check against the selected channel. It repeats no more than once every six hours, while the server-side `ReleaseChecker` cache remains authoritative per channel. A newer eligible release is shown in a non-modal dashboard banner and Updates navigation badge. Automatic failures are quiet during normal dashboard use; a manual check displays an actionable failure on the Updates page. Checks never download or apply an update.
 
 GitHub may receive ordinary connection metadata for the Releases request, such as the client IP and user agent. AppDock itself has no update telemetry or analytics.
 
 ## Check flow
 
-1. AppDock queries the configured repository's GitHub `releases/latest` API.
-2. It compares the release tag with the running semantic version.
-3. It displays the version, public release URL, and release notes.
-4. It does not download or apply anything during a check.
+1. AppDock reads the persisted update channel; Stable is used if no valid preference exists.
+2. Stable queries the configured repository's GitHub `releases/latest` API. Beta queries the Releases collection and filters to valid numbered AppDock Beta prereleases. Drafts are always rejected.
+3. It compares the selected release tag with the running semantic version.
+4. It displays the channel, version, public release URL, and release notes.
+5. The confirmation digest includes the selected release metadata and channel, so changing channels invalidates a stale update confirmation.
+6. It does not download or apply anything during a check.
 
 ## Updating from v0.1.0
 
@@ -23,7 +32,7 @@ The v0.1.0 one-click updater intentionally cannot apply v0.1.1's release-invento
 
 After the user chooses **Update now** and confirms:
 
-1. AppDock reuses the trusted release metadata it fetched from the configured repository.
+1. AppDock re-reads the persisted channel and reuses only release metadata that still matches the channel-bound confirmation digest.
 2. It selects only `appdock-windows.zip` and `SHA256SUMS.txt` assets from that same release.
 3. It applies bounded timeouts and download-size limits, and validates the final redirect against GitHub-owned release-asset hosts.
 4. It parses the checksum file and verifies the ZIP with SHA-256.
@@ -37,7 +46,7 @@ After the user chooses **Update now** and confirms:
 
 After the apply endpoint returns HTTP 202, the browser shows progress and polls same-origin `/health` for a bounded period. It reloads only after the response is healthy and its version exactly matches the expected release. A timeout reports that success was not confirmed and points the user to the local update log/manual restart recovery; it does not claim the update succeeded.
 
-The browser cannot supply an arbitrary download URL to the update endpoint. Update assets must come from the expected configured GitHub release.
+The browser cannot supply an arbitrary download URL to the update endpoint. Update assets must come from the expected configured GitHub release selected by the persisted channel. Stable and Beta use the same checksum, inventory, staging, backup, restart, health, rollback, and cleanup implementation.
 
 ## Data preservation
 
@@ -63,11 +72,19 @@ Normal crash recovery is automatic at helper or AppDock startup. If neither can 
 
 A development clone should use Git (`git pull`) and the normal test workflow rather than the one-click updater. One-click update application is explicit and Windows-supported.
 
+## Branch and publication model
+
+- `main` is the Stable branch. Stable tags/releases are promoted only after final readiness.
+- `develop` is the long-lived next-release integration branch. Normal feature iteration and Beta validation happen there.
+- A Beta tag must match the source version, use `vX.Y.Z-beta.N`, and point to a commit contained in `develop`. The Beta workflow publishes it with GitHub's prerelease flag and explicitly does not mark it Latest.
+- The Stable workflow excludes tags containing a prerelease suffix, so a Beta tag cannot accidentally publish through the Stable path.
+- Beta and Stable publication both run tests, privacy/docs checks, exact portable build validation, release-inventory validation, and publish the tested artifact rather than rebuilding in the publish job.
+
 ## Release publisher checklist
 
 Every release must:
 
-- use a semantic version tag such as `v0.2.0`;
+- use a semantic version tag such as `v0.2.1` for Stable or `v0.2.2-beta.1` for Beta;
 - run the test suite on Windows and Linux;
 - build `appdock-windows.zip` from tracked release files on Windows and Ubuntu and prove the exact ZIP bytes are identical;
 - publish `SHA256SUMS.txt` containing the archive digest;

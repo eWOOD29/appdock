@@ -20,7 +20,7 @@ This data is not intended for source control. Default paths are excluded by the 
 
 AppDock makes network requests only for features the user invokes or configures:
 
-- **Check for updates:** GitHub's releases API for the configured AppDock repository.
+- **Check for updates:** GitHub's releases API for the configured AppDock repository. Stable uses the latest-stable endpoint; an explicitly enabled Beta channel reads the Releases collection to find numbered prereleases.
 - **Update now:** the expected release archive and checksum assets from GitHub.
 - **Advanced GitHub import:** `git clone` of the public repository URL entered by the user.
 - **Health checks:** URLs explicitly declared in registered manifests.
