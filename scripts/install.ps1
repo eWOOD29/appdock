@@ -7,8 +7,32 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Keep this bootstrap independent of path_safety.ps1: it is the first trust
+# decision and must run before any helper code, marker, or filesystem action.
+function Get-AppDockBootstrapSha256 {
+    param([Parameter(Mandatory=$true)][string]$Path)
+    $Stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $Hasher = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            return ([System.BitConverter]::ToString($Hasher.ComputeHash($Stream))).Replace('-', '').ToLowerInvariant()
+        } finally {
+            $Hasher.Dispose()
+        }
+    } finally {
+        $Stream.Dispose()
+    }
+}
+
 $SourceRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-. (Join-Path $PSScriptRoot 'path_safety.ps1')
+$BootstrapSafetyPath = Join-Path $PSScriptRoot 'path_safety.ps1'
+$TrustedPathSafetySha256 = 'b3492c502df9fe4a9b291d9149fece46cced435b9e3ed03247fe4801819e1539'
+if (-not (Test-Path -LiteralPath $BootstrapSafetyPath -PathType Leaf) -or
+    (Get-AppDockBootstrapSha256 -Path $BootstrapSafetyPath) -ne $TrustedPathSafetySha256) {
+    throw 'The packaged path-safety module failed independent integrity verification.'
+}
+. $BootstrapSafetyPath
 
 $InstallDir = Assert-AppDockSafePath -Path $InstallDir -Role InstallDir -SourceRoot $SourceRoot
 $DataDir = Assert-AppDockSafePath -Path $DataDir -Role DataDir -SourceRoot $SourceRoot

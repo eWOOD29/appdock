@@ -226,6 +226,37 @@ def _ensure_output_parent(path: Path) -> Path:
     return parent
 
 
+def _assert_output_disjoint_from_source(path: Path, root: Path, *, label: str) -> None:
+    path = _lexical(path)
+    root = _lexical(root)
+    if path == root or root in path.parents:
+        raise ValueError(f"{label} must be external to the source tree: {path}")
+    try:
+        resolved = path.resolve(strict=False)
+        resolved_root = root.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"{label} cannot be resolved safely: {path}") from exc
+    if resolved == resolved_root or resolved_root in resolved.parents:
+        raise ValueError(f"{label} must not resolve into the source tree: {path}")
+
+
+def _assert_outputs_disjoint_from_source(output: Path, sidecar: Path, root: Path) -> None:
+    _assert_output_disjoint_from_source(output, root, label="archive output")
+    _assert_output_disjoint_from_source(sidecar, root, label="checksum sidecar")
+
+
+def _assert_outputs_not_aliasing_source_members(output: Path, sidecar: Path, files: list[Path]) -> None:
+    source_identities = {
+        (observed.st_dev, observed.st_ino)
+        for path in files
+        if (observed := _metadata(path)) is not None
+    }
+    for candidate, label in ((output, "archive output"), (sidecar, "checksum sidecar")):
+        observed = _metadata(candidate)
+        if observed is not None and (observed.st_dev, observed.st_ino) in source_identities:
+            raise ValueError(f"{label} aliases a source member: {candidate}")
+
+
 def _validate_output_destination(path: Path) -> Path:
     path = _lexical(path)
     _ensure_output_parent(path)
@@ -235,7 +266,7 @@ def _validate_output_destination(path: Path) -> Path:
     return path
 
 
-def _atomic_write(path: Path, payload: bytes) -> None:
+def _atomic_write(path: Path, payload: bytes, *, source_root: Path | None = None, source_files: list[Path] | None = None) -> None:
     path = _validate_output_destination(path)
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     temporary = Path(temporary_name)
@@ -245,6 +276,9 @@ def _atomic_write(path: Path, payload: bytes) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         _validate_output_destination(path)
+        if source_root is not None and source_files is not None:
+            _assert_output_disjoint_from_source(path, source_root, label="checksum sidecar")
+            _assert_outputs_not_aliasing_source_members(path, path, source_files)
         temporary_metadata = _metadata(temporary)
         if temporary_metadata is None or _unsafe_metadata(temporary_metadata) or not stat.S_ISREG(temporary_metadata.st_mode) or temporary_metadata.st_nlink != 1:
             raise ValueError("temporary output is unsafe")
@@ -254,7 +288,7 @@ def _atomic_write(path: Path, payload: bytes) -> None:
         raise
 
 
-def _atomic_zip(path: Path, payloads: dict[str, bytes]) -> None:
+def _atomic_zip(path: Path, payloads: dict[str, bytes], *, source_root: Path | None = None, source_files: list[Path] | None = None) -> None:
     path = _validate_output_destination(path)
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     temporary = Path(temporary_name)
@@ -281,6 +315,9 @@ def _atomic_zip(path: Path, payloads: dict[str, bytes]) -> None:
         if temporary_metadata.st_size > MAX_ARCHIVE_BYTES:
             raise ValueError("portable archive exceeds its limit")
         _validate_output_destination(path)
+        if source_root is not None and source_files is not None:
+            _assert_output_disjoint_from_source(path, source_root, label="archive output")
+            _assert_outputs_not_aliasing_source_members(path, path, source_files)
         os.replace(temporary, path)
     except Exception:
         temporary.unlink(missing_ok=True)
@@ -299,13 +336,17 @@ def _manifest_bytes(payloads: dict[str, bytes]) -> bytes:
 
 
 def build_archive(output: Path = DEFAULT_OUTPUT, root: Path = ROOT) -> str:
-    output = _validate_output_destination(output)
+    output = _lexical(output)
     sidecar = output.parent / "SHA256SUMS.txt"
+    root = _require_source_directory(root)
+    _assert_outputs_disjoint_from_source(output, sidecar, root)
+    _validate_output_destination(output)
     if output == _lexical(sidecar):
         raise ValueError("archive output cannot be its checksum sidecar")
     _validate_output_destination(sidecar)
-    root = _require_source_directory(root)
     files = release_files(root)
+    _assert_outputs_disjoint_from_source(output, sidecar, root)
+    _assert_outputs_not_aliasing_source_members(output, sidecar, files)
     payloads: dict[str, bytes] = {}
     aggregate = 0
     for path in files:
@@ -322,10 +363,19 @@ def build_archive(output: Path = DEFAULT_OUTPUT, root: Path = ROOT) -> str:
         if path.suffix.lower() in TEXT_SUFFIXES or path.name in TEXT_FILENAMES:
             content = content.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
         payloads[name] = content
-    _atomic_zip(output, payloads)
+    _assert_outputs_disjoint_from_source(output, sidecar, root)
+    _assert_outputs_not_aliasing_source_members(output, sidecar, files)
+    _atomic_zip(output, payloads, source_root=root, source_files=files)
     archive_bytes = _read_bounded_source(output, MAX_ARCHIVE_BYTES)
     digest = hashlib.sha256(archive_bytes).hexdigest()
-    _atomic_write(sidecar, f"{digest}  {output.name}\n".encode("utf-8"))
+    _assert_outputs_disjoint_from_source(output, sidecar, root)
+    _assert_outputs_not_aliasing_source_members(output, sidecar, files)
+    _atomic_write(
+        sidecar,
+        f"{digest}  {output.name}\n".encode("utf-8"),
+        source_root=root,
+        source_files=files,
+    )
     return digest
 
 

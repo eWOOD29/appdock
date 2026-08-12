@@ -195,6 +195,31 @@ Write-Output 'process ownership probe passed'
             self.assertTrue(data_file.is_file())
             self.assertTrue(install.is_dir(), "uninstaller modified program files before rejecting DataDir")
 
+    def test_installer_rejects_tampered_safety_module_before_marker_or_action(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            bundle = root / "bundle"
+            install = root / "installed" / "AppDock"
+            data = root / "data" / "AppDock"
+            self.copy_bundle(bundle)
+            safety = bundle / "scripts" / "path_safety.ps1"
+            safety.write_text(safety.read_text(encoding="utf-8") + "\n# tampered\n", encoding="utf-8")
+            result = subprocess.run(
+                [
+                    "powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                    "-File", str(bundle / "scripts" / "install.ps1"),
+                    "-InstallDir", str(install), "-DataDir", str(data),
+                    "-PythonExe", sys.executable, "-NoStart",
+                ],
+                text=True,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse(install.exists(), "tampered safety module was allowed to create an install marker")
+            self.assertFalse(data.exists(), "tampered safety module was allowed to create data")
+
     def test_installer_uses_a_staged_mirror_and_rejects_source_overlap(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp).resolve()

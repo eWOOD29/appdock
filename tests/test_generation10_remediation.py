@@ -47,6 +47,38 @@ class Generation10ZipMetadataTests(unittest.TestCase):
                 archive.writestr(info, content)
         return stream.getvalue()
 
+    def test_validate_zip_rejects_all_explicit_directory_entries(self) -> None:
+        for kind in (0, stat.S_IFIFO, stat.S_IFSOCK, stat.S_IFCHR, stat.S_IFBLK, stat.S_IFLNK):
+            with self.subTest(kind=oct(kind)):
+                stream = io.BytesIO()
+                with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_STORED) as archive:
+                    for name, content in self.release_members().items():
+                        info = zipfile.ZipInfo(name)
+                        info.create_system = 3
+                        info.external_attr = (stat.S_IFREG | 0o644) << 16
+                        archive.writestr(info, content)
+                    directory = zipfile.ZipInfo("rogue/")
+                    directory.create_system = 3
+                    directory.external_attr = (kind | 0o755) << 16
+                    archive.writestr(directory, b"")
+                with self.assertRaises(appdock.AppDockError):
+                    appdock.validate_zip(stream.getvalue())
+
+    def test_validate_zip_rejects_file_directory_mismatch_before_extraction(self) -> None:
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_STORED) as archive:
+            for name, content in self.release_members().items():
+                info = zipfile.ZipInfo(name)
+                info.create_system = 3
+                info.external_attr = (stat.S_IFREG | 0o644) << 16
+                archive.writestr(info, content)
+            directory = zipfile.ZipInfo("appdock.py/")
+            directory.create_system = 3
+            directory.external_attr = (stat.S_IFDIR | 0o755) << 16
+            archive.writestr(directory, b"")
+        with self.assertRaises(appdock.AppDockError):
+            appdock.validate_zip(stream.getvalue())
+
     def test_validate_zip_rejects_fifo_socket_and_device_member_metadata(self) -> None:
         for kind in (stat.S_IFIFO, stat.S_IFSOCK, stat.S_IFCHR, stat.S_IFBLK):
             with self.subTest(kind=oct(kind)), self.assertRaises(appdock.AppDockError):
@@ -83,6 +115,63 @@ class Generation10PortableBuilderTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    def test_builder_rejects_output_exact_source_path_before_source_enumeration(self) -> None:
+        original = (self.source / "appdock.py").read_bytes()
+        with self.assertRaises(ValueError):
+            build_portable.build_archive(self.source / "appdock.py", self.source)
+        self.assertEqual((self.source / "appdock.py").read_bytes(), original)
+
+    def test_builder_rejects_hardlinked_output_alias_to_source_member(self) -> None:
+        sentinel = self.root / "source-alias-sentinel.zip"
+        os.link(self.source / "appdock.py", sentinel)
+        with self.assertRaises(ValueError):
+            build_portable.build_archive(sentinel, self.source)
+        self.assertEqual((self.source / "appdock.py").read_bytes(), b"portable app\n")
+        self.assertEqual(sentinel.read_bytes(), b"portable app\n")
+
+    def test_builder_rejects_symlinked_output_alias_to_source_member(self) -> None:
+        sentinel = self.root / "source-alias-sentinel.zip"
+        try:
+            sentinel.symlink_to(self.source / "appdock.py")
+        except OSError as exc:
+            self.skipTest(f"symlinks unavailable: {exc}")
+        original = (self.source / "appdock.py").read_bytes()
+        with self.assertRaises(ValueError):
+            build_portable.build_archive(sentinel, self.source)
+        self.assertEqual((self.source / "appdock.py").read_bytes(), original)
+        self.assertEqual(sentinel.read_bytes(), original)
+
+    def test_builder_rejects_symlinked_output_parent_resolving_into_source(self) -> None:
+        parent_alias = self.root / "source-parent-alias"
+        try:
+            parent_alias.symlink_to(self.source, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f"directory symlinks unavailable: {exc}")
+        original = (self.source / "appdock.py").read_bytes()
+        with self.assertRaises(ValueError):
+            build_portable.build_archive(parent_alias / "rogue.zip", self.source)
+        self.assertEqual((self.source / "appdock.py").read_bytes(), original)
+        self.assertFalse((self.source / "rogue.zip").exists())
+
+    def test_builder_rejects_sidecar_collision_with_source_path(self) -> None:
+        output = self.root / "nested" / "appdock-windows.zip"
+        output.parent.mkdir()
+        sidecar = output.parent / "SHA256SUMS.txt"
+        os.link(self.source / "appdock.py", sidecar)
+        with self.assertRaises(ValueError):
+            build_portable.build_archive(output, self.source)
+        self.assertEqual((self.source / "appdock.py").read_bytes(), b"portable app\n")
+        self.assertEqual(sidecar.read_bytes(), b"portable app\n")
+
+    def test_builder_builds_normal_external_output_deterministically(self) -> None:
+        first = self.root / "one" / "appdock-windows.zip"
+        second = self.root / "two" / "appdock-windows.zip"
+        first_digest = build_portable.build_archive(first, self.source)
+        second_digest = build_portable.build_archive(second, self.source)
+        self.assertEqual(first_digest, second_digest)
+        self.assertEqual(first.read_bytes(), second.read_bytes())
+        self.assertEqual((self.source / "appdock.py").read_bytes(), b"portable app\n")
 
     def test_builder_rejects_hardlinked_source_member_without_reading_external_sentinel(self) -> None:
         sentinel = self.root / "source-sentinel.txt"

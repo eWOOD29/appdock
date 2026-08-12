@@ -2671,6 +2671,8 @@ def verify_sha256(data: bytes, sums_text: str, filename: str = "appdock-windows.
 
 def _assert_zip_member(name: str, info: zipfile.ZipInfo) -> None:
     normalized = name.replace("\\", "/")
+    if info.is_dir() or normalized.endswith("/"):
+        raise AppDockError("update ZIP contains an explicit directory entry")
     if not normalized or normalized.startswith("/") or normalized.startswith("//") or re.match(r"^[A-Za-z]:", normalized):
         raise AppDockError("update ZIP contains an absolute path")
     if ":" in normalized:
