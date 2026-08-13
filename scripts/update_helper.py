@@ -521,7 +521,47 @@ def run(
         return 1
 
 
-def main() -> int:
+_HELPER_OPTIONS = frozenset({
+    "--staged",
+    "--install",
+    "--data",
+    "--pid",
+    "--restart-script",
+    "--restart-arg",
+    "--handshake",
+    "--handshake-token",
+    "--expected-version",
+    "--expected-digest",
+    "--expected-zip-sha256",
+    "--expected-inventory-sha256",
+    "--expected-helper-sha256",
+})
+
+
+def _normalize_helper_cli_args(argv: list[str] | None = None) -> list[str]:
+    """Bind a legacy split option-like handshake token before argparse sees it.
+
+    AppDock v0.2.1 passes ``--handshake-token`` and its random token as two
+    argv entries. ``secrets.token_urlsafe(32)`` may begin with ``-``, which
+    argparse otherwise treats as another option. Keep the compatibility shim
+    limited to a syntactically valid token and never consume a known option.
+    """
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    for index, argument in enumerate(arguments[:-1]):
+        if argument != "--handshake-token":
+            continue
+        candidate = arguments[index + 1]
+        if (
+            candidate.startswith("-")
+            and candidate not in _HELPER_OPTIONS
+            and re.fullmatch(r"[A-Za-z0-9_-]{20,128}", candidate)
+        ):
+            arguments[index:index + 2] = [f"--handshake-token={candidate}"]
+        break
+    return arguments
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="AppDock external update helper")
     parser.add_argument("--staged", type=Path, required=True)
     parser.add_argument("--install", type=Path, required=True)
@@ -536,7 +576,7 @@ def main() -> int:
     parser.add_argument("--expected-zip-sha256", required=True)
     parser.add_argument("--expected-inventory-sha256", required=True)
     parser.add_argument("--expected-helper-sha256", required=True)
-    args = parser.parse_args()
+    args = parser.parse_args(_normalize_helper_cli_args(argv))
     data = args.data.expanduser().absolute()
     try:
         runtime_root = _update_lock_path(data).parent
