@@ -4,9 +4,13 @@ import hashlib
 import inspect
 import io
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import appdock
 from scripts import update_helper
@@ -178,6 +182,38 @@ class UpdaterIncidentHardeningTests(unittest.TestCase):
         }
         (root / 'RELEASE-MANIFEST.json').write_text(json.dumps(manifest), encoding='utf-8')
 
+    def _write_candidate_stage(self, root: Path):
+        repo_root = Path(appdock.__file__).resolve().parent
+        members = {
+            relative: (repo_root / relative).read_bytes()
+            for relative in sorted(appdock.REQUIRED_RELEASE_FILES)
+        }
+        for relative, payload in members.items():
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(payload)
+        manifest = {
+            'schema_version': 2,
+            'files': [
+                {'path': relative, 'sha256': hashlib.sha256(payload).hexdigest()}
+                for relative, payload in sorted(members.items())
+            ],
+        }
+        (root / 'RELEASE-MANIFEST.json').write_text(json.dumps(manifest, sort_keys=True), encoding='utf-8')
+
+    def _write_staged_receipt(self, config: appdock.AppDockConfig, staged: Path):
+        version = '0.2.2-beta.1'
+        identity = appdock._staged_identity(staged, zip_sha256='a' * 64)
+        record = {
+            'staged': True,
+            'version': version,
+            'path': str(staged),
+            'digest': appdock._staged_record_digest(version, identity),
+            'identity': identity,
+        }
+        appdock._write_staged_receipt(config, record)
+        return record
+
     def test_mixed_install_inventory_is_rejected(self):
         with tempfile.TemporaryDirectory() as td:
             install = Path(td) / 'install'
@@ -189,11 +225,91 @@ class UpdaterIncidentHardeningTests(unittest.TestCase):
                 appdock._validate_installed_tree(install)
             self.assertIn('unexpected unowned files', str(raised.exception))
 
+    def test_clean_install_inventory_is_accepted(self):
+        with tempfile.TemporaryDirectory() as td:
+            install = Path(td) / 'install'
+            self._write_release_tree(install)
+            inventory, extras = appdock._validate_installed_tree(install)
+            self.assertTrue(inventory)
+            self.assertEqual(extras, [])
+
     def test_helper_preflight_occurs_before_shutdown_handshake(self):
         source = inspect.getsource(update_helper.run)
         self.assertLess(source.index('_validate_installed_tree(install)'), source.index('temporary.replace(handshake)'))
         self.assertLess(source.index('temporary.replace(handshake)'), source.index('while _alive(pid)'))
         self.assertIn('AppDock was left running', source)
+
+    def test_v021_parent_real_helper_rejects_mixed_install_before_handshake_and_releases_lock(self):
+        self.assertEqual(appdock.CURRENT_VERSION, '0.2.1')
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = appdock.AppDockConfig.from_environment(data_dir=root / 'data')
+            config.ensure()
+            install = root / 'install'
+            self._write_release_tree(install)
+            extra = install / '.venv' / 'Lib' / 'site.py'
+            extra.parent.mkdir(parents=True)
+            extra.write_text('preserve me\n', encoding='utf-8')
+
+            staged = config.updates_root / '0.2.2-beta.1'
+            staged.mkdir(parents=True)
+            self._write_candidate_stage(staged)
+            record = self._write_staged_receipt(config, staged)
+
+            coordinator = appdock.UpdateCoordinator(config)
+            coordinator.store(record)
+            coordinator.retain_update_lock(appdock.acquire_update_lock(config.data_root))
+            claimed = coordinator.claim(record['digest'])
+            try:
+                with self.assertRaises(appdock.AppDockError) as raised:
+                    appdock.launch_update_helper(
+                        staged,
+                        install,
+                        config.data_root,
+                        current_pid=os.getpid(),
+                        restart_args=['--host', '127.0.0.1', '--port', '65530', '--data-dir', str(config.data_root)],
+                        expected_identity=claimed,
+                    )
+            except Exception:
+                coordinator.restore(claimed)
+                coordinator.release_update_lock()
+                raise
+            coordinator.restore(claimed)
+            coordinator.release_update_lock()
+
+            self.assertIn('startup handshake', str(raised.exception))
+            self.assertEqual(extra.read_text(encoding='utf-8'), 'preserve me\n')
+            self.assertEqual(list(config.runtime_root.glob('update-helper-*.ready')), [])
+            update_log = (config.runtime_root / 'update.log').read_text(encoding='utf-8')
+            self.assertIn('update preflight rejected current installation', update_log)
+            self.assertIn('AppDock was left running', update_log)
+
+            restored = coordinator.claim(record['digest'])
+            self.assertEqual(restored['digest'], record['digest'])
+            coordinator.restore(restored)
+
+            repo_root = Path(appdock.__file__).resolve().parent
+            environment = os.environ.copy()
+            environment['PYTHONDONTWRITEBYTECODE'] = '1'
+            environment['PYTHONPATH'] = str(repo_root)
+            probe = subprocess.run(
+                [
+                    sys.executable,
+                    '-B',
+                    '-c',
+                    "import sys, appdock; lock=appdock.acquire_update_lock(sys.argv[1]); lock.release(); print('acquired')",
+                    str(config.data_root),
+                ],
+                cwd=repo_root,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                shell=False,
+                close_fds=True,
+            )
+            self.assertEqual(probe.returncode, 0, probe.stderr)
+            self.assertEqual(probe.stdout.strip(), 'acquired')
 
     def test_restart_launch_uses_durable_diagnostic_streams(self):
         source = inspect.getsource(update_helper._launch_and_wait)
@@ -203,6 +319,34 @@ class UpdaterIncidentHardeningTests(unittest.TestCase):
         self.assertIn('RESTART_STDERR_LOG_NAME', source)
         self.assertIn('restart diagnostics were captured', source)
         self.assertIn('close_fds=True', source)
+
+    def test_restart_launch_runtime_captures_child_output_on_status_120(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = appdock.AppDockConfig.from_environment(data_dir=root / 'data')
+            config.ensure()
+            install = root / 'install'
+            install.mkdir()
+            restart_script = install / 'restart_probe.py'
+            restart_script.write_text(
+                "import sys\nprint('stdout-diagnostic', flush=True)\nprint('stderr-diagnostic', file=sys.stderr, flush=True)\nraise SystemExit(120)\n",
+                encoding='utf-8',
+            )
+            token = 'A' * 32
+            with self.assertRaises(RuntimeError) as raised:
+                update_helper._launch_and_wait(
+                    restart_script,
+                    install,
+                    ['--host', '127.0.0.1', '--port', '65531'],
+                    startup_data=config.data_root,
+                    ready_token=token,
+                )
+            self.assertIn('status 120', str(raised.exception))
+            self.assertIn('runtime/update-restart.stdout.log', str(raised.exception))
+            self.assertIn('runtime/update-restart.stderr.log', str(raised.exception))
+            self.assertIn('stdout-diagnostic', (config.runtime_root / update_helper.RESTART_STDOUT_LOG_NAME).read_text(encoding='utf-8'))
+            self.assertIn('stderr-diagnostic', (config.runtime_root / update_helper.RESTART_STDERR_LOG_NAME).read_text(encoding='utf-8'))
+            self.assertFalse((config.runtime_root / f'update-startup-{token}.json').exists())
 
     def test_restart_log_stream_is_appendable_and_persistent(self):
         with tempfile.TemporaryDirectory() as td:
@@ -214,6 +358,57 @@ class UpdaterIncidentHardeningTests(unittest.TestCase):
                 stream.write('second\n')
                 stream.flush()
             self.assertEqual(path.read_text(encoding='utf-8'), 'first\nsecond\n')
+
+    def test_restart_log_retry_rechecks_reparse_after_create_collision(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'runtime' / update_helper.RESTART_STDOUT_LOG_NAME
+            collision = {'happened': False}
+            original_open = update_helper.os.open
+            original_check = update_helper._is_link_or_reparse
+
+            def racing_open(raw_path, flags, mode=0o777):
+                if Path(raw_path) == path and not collision['happened'] and flags & os.O_EXCL:
+                    collision['happened'] = True
+                    raise FileExistsError('simulated create collision')
+                return original_open(raw_path, flags, mode)
+
+            def raced_reparse(candidate):
+                if Path(candidate) == path and collision['happened']:
+                    return True
+                return original_check(Path(candidate))
+
+            with patch.object(update_helper.os, 'open', side_effect=racing_open), patch.object(
+                update_helper, '_is_link_or_reparse', side_effect=raced_reparse
+            ):
+                with self.assertRaises(appdock.AppDockError) as raised:
+                    update_helper._open_restart_log_stream(path)
+            self.assertTrue(collision['happened'])
+            self.assertIn('restart diagnostic log is unsafe', str(raised.exception))
+
+    def test_restart_log_retry_rejects_real_symlink_race_without_touching_target(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = root / 'runtime' / update_helper.RESTART_STDOUT_LOG_NAME
+            target = root / 'protected.log'
+            target.write_bytes(b'protected-bytes')
+            original_open = update_helper.os.open
+            collision = {'happened': False}
+
+            def racing_open(raw_path, flags, mode=0o777):
+                if Path(raw_path) == path and not collision['happened'] and flags & os.O_EXCL:
+                    collision['happened'] = True
+                    try:
+                        path.symlink_to(target)
+                    except OSError as exc:
+                        self.skipTest(f'file symlink creation unavailable: {exc}')
+                    raise FileExistsError('simulated create collision')
+                return original_open(raw_path, flags, mode)
+
+            with patch.object(update_helper.os, 'open', side_effect=racing_open):
+                with self.assertRaises(appdock.AppDockError):
+                    update_helper._open_restart_log_stream(path)
+            self.assertTrue(collision['happened'])
+            self.assertEqual(target.read_bytes(), b'protected-bytes')
 
 
 class BetaWorkflowTests(unittest.TestCase):
