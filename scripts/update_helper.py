@@ -19,9 +19,11 @@ from typing import Callable
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from appdock import AppDockError, AppDockConfig, _assert_no_link_or_reparse_ancestor, _clear_staged_receipt, _is_link_or_reparse, _read_staged_receipt, _remove_tree, _update_lock_path, _write_update_startup_handoff, acquire_update_lock, apply_update, finalize_update, recover_update_transactions, rollback_update  # noqa: E402
+from appdock import AppDockError, AppDockConfig, _assert_no_link_or_reparse_ancestor, _clear_staged_receipt, _is_link_or_reparse, _read_staged_receipt, _remove_tree, _update_lock_path, _validate_installed_tree, _write_update_startup_handoff, acquire_update_lock, apply_update, finalize_update, recover_update_transactions, rollback_update  # noqa: E402
 
 RESTART_READY_TIMEOUT_SECONDS = 20.0
+RESTART_STDOUT_LOG_NAME = "update-restart.stdout.log"
+RESTART_STDERR_LOG_NAME = "update-restart.stderr.log"
 
 
 def _process_group_options() -> dict[str, object]:
@@ -72,6 +74,40 @@ def _safe_append_update_log(path: Path, message: str) -> None:
                 os.close(descriptor)
         return
     raise AppDockError("update log could not be created safely")
+
+
+def _open_restart_log_stream(path: Path):
+    """Open a durable append-only restart log without following unsafe aliases."""
+    path = path.expanduser().absolute()
+    _assert_no_link_or_reparse_ancestor(path.parent)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _assert_no_link_or_reparse_ancestor(path.parent)
+    if _is_link_or_reparse(path):
+        raise AppDockError("restart diagnostic log is unsafe")
+    base_flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_BINARY", 0)
+    for _attempt in range(2):
+        existed = path.exists()
+        before = path.stat() if existed else None
+        if existed and (before is None or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1):
+            raise AppDockError("restart diagnostic log is not a regular single-link file")
+        flags = base_flags | (os.O_EXCL if not existed else 0)
+        try:
+            descriptor = os.open(path, flags, 0o600)
+        except FileExistsError:
+            continue
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+                raise AppDockError("restart diagnostic log opened as an unsafe file")
+            if before is not None and (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+                raise AppDockError("restart diagnostic log changed while opening")
+            stream = os.fdopen(descriptor, "a", encoding="utf-8", newline="")
+            descriptor = -1
+            return stream
+        finally:
+            if descriptor != -1:
+                os.close(descriptor)
+    raise AppDockError("restart diagnostic log could not be created safely")
 
 
 def _alive(pid: int) -> bool:
@@ -232,30 +268,56 @@ def _launch_and_wait(
 ) -> object:
     ready_token = ready_token or secrets.token_urlsafe(32)
     data = startup_data or _restart_data_dir(restart_args)
-    startup_receipt = _write_update_startup_handoff(data, install, ready_token) if data is not None else None
-    command = [
-        sys.executable,
-        str(restart_script),
-        *restart_args,
-        f"--ready-token={ready_token}",
-        f"--update-helper-startup={ready_token}",
-    ]
+    startup_receipt = None
+    stdout_stream = None
+    stderr_stream = None
+    stdout_target: object = subprocess.DEVNULL
+    stderr_target: object = subprocess.DEVNULL
     try:
+        if data is not None:
+            runtime = data.expanduser().absolute() / "runtime"
+            stdout_stream = _open_restart_log_stream(runtime / RESTART_STDOUT_LOG_NAME)
+            stderr_stream = _open_restart_log_stream(runtime / RESTART_STDERR_LOG_NAME)
+            stdout_target = stdout_stream
+            stderr_target = stderr_stream
+        startup_receipt = _write_update_startup_handoff(data, install, ready_token) if data is not None else None
+        command = [
+            sys.executable,
+            str(restart_script),
+            *restart_args,
+            f"--ready-token={ready_token}",
+            f"--update-helper-startup={ready_token}",
+        ]
         restarted = subprocess.Popen(
             command,
             shell=False,
             cwd=str(install),
             close_fds=True,
+            stdout=stdout_target,
+            stderr=stderr_target,
             **_process_group_options(),
         )
-    except OSError:
+    except Exception:
+        if stdout_stream is not None:
+            stdout_stream.close()
+        if stderr_stream is not None:
+            stderr_stream.close()
         if startup_receipt is not None:
             startup_receipt.unlink(missing_ok=True)
         raise
+    else:
+        if stdout_stream is not None:
+            stdout_stream.close()
+        if stderr_stream is not None:
+            stderr_stream.close()
     try:
         _wait_for_restart_ready(restarted, restart_args, ready_token)
-    except Exception:
+    except Exception as exc:
         _stop_restarted_process(restarted)
+        if data is not None:
+            raise RuntimeError(
+                f"{exc}; restart diagnostics were captured in runtime/{RESTART_STDOUT_LOG_NAME} and runtime/{RESTART_STDERR_LOG_NAME}"
+            ) from exc
         raise
     finally:
         if startup_receipt is not None:
@@ -288,6 +350,11 @@ def run(
         _safe_append_update_log(log_path, message)
 
     log(f"update helper started for pid {pid}")
+    try:
+        _validate_installed_tree(install)
+    except Exception as exc:
+        log(f"update preflight rejected current installation; AppDock was left running: {exc}")
+        return 1
     if handshake is not None and handshake_token is not None:
         temporary = handshake.with_suffix(handshake.suffix + ".tmp")
         temporary.write_text(handshake_token, encoding="utf-8")
