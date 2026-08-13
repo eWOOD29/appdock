@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import inspect
 import io
 import json
 import tempfile
@@ -7,6 +9,7 @@ import unittest
 from pathlib import Path
 
 import appdock
+from scripts import update_helper
 
 
 class _Response:
@@ -149,6 +152,68 @@ class UpdateChannelTests(unittest.TestCase):
         self.assertIn('if path == "/api/updates/channel":', source)
         self.assertIn('write_update_channel(self.config, body.get("channel"))', source)
         self.assertIn('stage_coordinated_update(release, self.config, Handler.coordinator', source)
+
+
+class UpdaterIncidentHardeningTests(unittest.TestCase):
+    def _write_release_tree(self, root: Path):
+        members = {
+            'appdock.py': b'app',
+            'static/app.js': b'js',
+            'static/app.css': b'css',
+            'scripts/update_helper.py': b'helper',
+            'scripts/path_safety.ps1': b'safety',
+            'scripts/install.ps1': b'install',
+            'scripts/uninstall.ps1': b'uninstall',
+        }
+        for relative, payload in members.items():
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(payload)
+        manifest = {
+            'schema_version': 2,
+            'files': [
+                {'path': relative, 'sha256': hashlib.sha256(payload).hexdigest()}
+                for relative, payload in sorted(members.items())
+            ],
+        }
+        (root / 'RELEASE-MANIFEST.json').write_text(json.dumps(manifest), encoding='utf-8')
+
+    def test_mixed_install_inventory_is_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            install = Path(td) / 'install'
+            self._write_release_tree(install)
+            extra = install / '.venv' / 'Lib' / 'site.py'
+            extra.parent.mkdir(parents=True)
+            extra.write_text('local file\n', encoding='utf-8')
+            with self.assertRaises(appdock.AppDockError) as raised:
+                appdock._validate_installed_tree(install)
+            self.assertIn('unexpected unowned files', str(raised.exception))
+
+    def test_helper_preflight_occurs_before_shutdown_handshake(self):
+        source = inspect.getsource(update_helper.run)
+        self.assertLess(source.index('_validate_installed_tree(install)'), source.index('temporary.replace(handshake)'))
+        self.assertLess(source.index('temporary.replace(handshake)'), source.index('while _alive(pid)'))
+        self.assertIn('AppDock was left running', source)
+
+    def test_restart_launch_uses_durable_diagnostic_streams(self):
+        source = inspect.getsource(update_helper._launch_and_wait)
+        self.assertIn('stdout=stdout_target', source)
+        self.assertIn('stderr=stderr_target', source)
+        self.assertIn('RESTART_STDOUT_LOG_NAME', source)
+        self.assertIn('RESTART_STDERR_LOG_NAME', source)
+        self.assertIn('restart diagnostics were captured', source)
+        self.assertIn('close_fds=True', source)
+
+    def test_restart_log_stream_is_appendable_and_persistent(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'runtime' / update_helper.RESTART_STDOUT_LOG_NAME
+            with update_helper._open_restart_log_stream(path) as stream:
+                stream.write('first\n')
+                stream.flush()
+            with update_helper._open_restart_log_stream(path) as stream:
+                stream.write('second\n')
+                stream.flush()
+            self.assertEqual(path.read_text(encoding='utf-8'), 'first\nsecond\n')
 
 
 class BetaWorkflowTests(unittest.TestCase):
