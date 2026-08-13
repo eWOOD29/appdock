@@ -82,10 +82,11 @@ def _open_restart_log_stream(path: Path):
     _assert_no_link_or_reparse_ancestor(path.parent)
     path.parent.mkdir(parents=True, exist_ok=True)
     _assert_no_link_or_reparse_ancestor(path.parent)
-    if _is_link_or_reparse(path):
-        raise AppDockError("restart diagnostic log is unsafe")
     base_flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_BINARY", 0)
     for _attempt in range(2):
+        _assert_no_link_or_reparse_ancestor(path.parent)
+        if _is_link_or_reparse(path):
+            raise AppDockError("restart diagnostic log is unsafe")
         existed = path.exists()
         before = path.stat() if existed else None
         if existed and (before is None or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1):
