@@ -259,13 +259,14 @@ class UpdaterIncidentHardeningTests(unittest.TestCase):
             coordinator = appdock.UpdateCoordinator(config)
             coordinator.retain_update_lock(appdock.acquire_update_lock(config.data_root))
             claimed = coordinator.claim(record['digest'])
+            parent_pid = os.getpid()
             try:
                 with self.assertRaises(appdock.AppDockError) as raised:
                     appdock.launch_update_helper(
                         staged,
                         install,
                         config.data_root,
-                        current_pid=os.getpid(),
+                        current_pid=parent_pid,
                         restart_args=['--host', '127.0.0.1', '--port', '65530', '--data-dir', str(config.data_root)],
                         expected_identity=claimed,
                     )
@@ -277,6 +278,7 @@ class UpdaterIncidentHardeningTests(unittest.TestCase):
             coordinator.release_update_lock()
 
             self.assertIn('startup handshake', str(raised.exception))
+            self.assertEqual(os.getpid(), parent_pid)
             self.assertEqual(extra.read_text(encoding='utf-8'), 'preserve me\n')
             self.assertEqual(list(config.runtime_root.glob('update-helper-*.ready')), [])
             update_log = (config.runtime_root / 'update.log').read_text(encoding='utf-8')
