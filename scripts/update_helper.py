@@ -33,16 +33,8 @@ def _process_group_options() -> dict[str, object]:
     return {"start_new_session": True}
 
 
-def _normalized_windows_path(value: str) -> str:
-    if value.startswith("\\\\?\\UNC\\"):
-        value = "\\\\" + value[8:]
-    elif value.startswith("\\\\?\\"):
-        value = value[4:]
-    return os.path.normcase(os.path.normpath(value))
-
-
-def _validate_windows_handle_path(handle: int, path: Path, label: str) -> None:
-    """Reject reparse handles and ancestor redirection using handle-native identity."""
+def _validate_windows_handle_safety(handle: int, label: str) -> None:
+    """Reject a Windows handle that itself names a reparse object."""
     if os.name != "nt":
         return
     import ctypes
@@ -60,17 +52,6 @@ def _validate_windows_handle_path(handle: int, path: Path, label: str) -> None:
         raise AppDockError(f"{label} handle attributes could not be verified") from ctypes.WinError(ctypes.get_last_error())
     if info.FileAttributes & 0x400:
         raise AppDockError(f"{label} opened as a reparse point")
-
-    get_final_path = kernel32.GetFinalPathNameByHandleW
-    get_final_path.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
-    get_final_path.restype = wintypes.DWORD
-    size = 32768
-    buffer = ctypes.create_unicode_buffer(size)
-    length = get_final_path(handle, buffer, size, 0)
-    if length == 0 or length >= size:
-        raise AppDockError(f"{label} final path could not be verified")
-    if _normalized_windows_path(buffer.value) != _normalized_windows_path(str(path)):
-        raise AppDockError(f"{label} resolved outside its expected path")
 
 
 def _open_existing_no_follow_descriptor(path: Path, label: str) -> int:
@@ -147,7 +128,7 @@ def _validate_open_append_descriptor(path: Path, descriptor: int, label: str) ->
     if os.name == "nt":
         import msvcrt
 
-        _validate_windows_handle_path(msvcrt.get_osfhandle(descriptor), path, label)
+        _validate_windows_handle_safety(msvcrt.get_osfhandle(descriptor), label)
     if _is_link_or_reparse(path):
         raise AppDockError(f"{label} path changed to an unsafe alias while opening")
     try:
