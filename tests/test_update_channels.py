@@ -257,7 +257,6 @@ class UpdaterIncidentHardeningTests(unittest.TestCase):
             record = self._write_staged_receipt(config, staged)
 
             coordinator = appdock.UpdateCoordinator(config)
-            coordinator.store(record)
             coordinator.retain_update_lock(appdock.acquire_update_lock(config.data_root))
             claimed = coordinator.claim(record['digest'])
             try:
