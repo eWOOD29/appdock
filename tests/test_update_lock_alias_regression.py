@@ -12,6 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parents[1]))
 import appdock  # noqa: E402
 from appdock import AppDockConfig, apply_update  # noqa: E402
+from scripts import update_helper  # noqa: E402
 
 
 class UpdateLockAliasRegressionTests(unittest.TestCase):
@@ -85,6 +86,22 @@ class UpdateLockAliasRegressionTests(unittest.TestCase):
                 self.assertEqual(probe.returncode, 0, probe.stderr)
                 self.assertEqual(probe.stdout.strip(), "acquired")
                 self.assertEqual(appdock._UPDATE_LOCK_STATES, {})
+
+    def test_restart_diagnostic_log_rejects_hardlink_without_touching_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            source = root / "source.txt"
+            source.write_text("preserve\n", encoding="utf-8")
+            target = runtime / update_helper.RESTART_STDERR_LOG_NAME
+            try:
+                os.link(source, target)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"hardlinks unavailable: {exc}")
+            with self.assertRaises(appdock.AppDockError):
+                update_helper._open_restart_log_stream(target)
+            self.assertEqual(source.read_text(encoding="utf-8"), "preserve\n")
 
 
 if __name__ == "__main__":
