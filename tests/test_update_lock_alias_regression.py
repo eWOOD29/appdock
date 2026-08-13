@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 import appdock  # noqa: E402
@@ -102,6 +103,72 @@ class UpdateLockAliasRegressionTests(unittest.TestCase):
             with self.assertRaises(appdock.AppDockError):
                 update_helper._open_restart_log_stream(target)
             self.assertEqual(source.read_text(encoding="utf-8"), "preserve\n")
+
+    def test_restart_log_existing_file_replacement_alias_is_rejected_without_touching_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            path = runtime / update_helper.RESTART_STDOUT_LOG_NAME
+            path.write_bytes(b"old-diagnostic\n")
+            protected = root / "protected.txt"
+            protected.write_bytes(b"protected-bytes")
+            original_open = update_helper._open_existing_no_follow_descriptor
+            raced = {"done": False}
+
+            def replace_then_open(candidate: Path, label: str):
+                if Path(candidate) == path and not raced["done"]:
+                    path.unlink()
+                    try:
+                        path.symlink_to(protected)
+                    except OSError as exc:
+                        self.skipTest(f"file symlink creation unavailable: {exc}")
+                    raced["done"] = True
+                return original_open(candidate, label)
+
+            with patch.object(
+                update_helper,
+                "_open_existing_no_follow_descriptor",
+                side_effect=replace_then_open,
+            ):
+                with self.assertRaises(appdock.AppDockError):
+                    update_helper._open_restart_log_stream(path)
+
+            self.assertTrue(raced["done"])
+            self.assertEqual(protected.read_bytes(), b"protected-bytes")
+
+    def test_update_log_existing_file_replacement_alias_is_rejected_without_touching_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            path = runtime / "update.log"
+            path.write_bytes(b"old-update-log\n")
+            protected = root / "protected.txt"
+            protected.write_bytes(b"protected-bytes")
+            original_open = update_helper._open_existing_no_follow_descriptor
+            raced = {"done": False}
+
+            def replace_then_open(candidate: Path, label: str):
+                if Path(candidate) == path and not raced["done"]:
+                    path.unlink()
+                    try:
+                        path.symlink_to(protected)
+                    except OSError as exc:
+                        self.skipTest(f"file symlink creation unavailable: {exc}")
+                    raced["done"] = True
+                return original_open(candidate, label)
+
+            with patch.object(
+                update_helper,
+                "_open_existing_no_follow_descriptor",
+                side_effect=replace_then_open,
+            ):
+                with self.assertRaises(appdock.AppDockError):
+                    update_helper._safe_append_update_log(path, "must not reach protected target")
+
+            self.assertTrue(raced["done"])
+            self.assertEqual(protected.read_bytes(), b"protected-bytes")
 
 
 if __name__ == "__main__":
