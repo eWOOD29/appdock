@@ -1,0 +1,38 @@
+name: Temporary beta2 review remediation
+
+on:
+  push:
+    branches:
+      - scratch/appdock-beta2-review-remediation-r1
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-test:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: scratch/appdock-beta2-review-remediation-r1
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Apply bounded review remediation
+        run: python tools/tmp_beta2_review_patch.py
+      - name: Run focused restart-handoff regressions
+        run: python -m unittest discover -s tests -p "test_update_restart_handoff_regression.py" -v
+      - name: Run full Python suite
+        run: python -m unittest discover -s tests -v
+      - name: Freeze scratch tree without transport files
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/tmp-beta2-review-remediation.yml tools/tmp_beta2_review_patch.py
+          git add appdock.py scripts/update_helper.py tests/test_update_restart_handoff_regression.py
+          git diff --cached --check
+          git commit -m "fix: reject stale updater owners and unsafe recovery restart"
+          git push origin HEAD:scratch/appdock-beta2-review-remediation-r1
