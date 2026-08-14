@@ -141,7 +141,8 @@ class Generation9RemediationTests(unittest.TestCase):
         appdock._write_staged_receipt(self.config, receipt)
         launched: list[tuple[Path, Path, list[str], Path | None]] = []
 
-        def restore(restart_script, install, restart_args, *, startup_data=None, ready_token=None):
+        def restore(restart_script, install, restart_args, *, startup_data=None, ready_token=None, use_startup_handoff=True):
+            self.assertFalse(use_startup_handoff)
             launched.append((restart_script, install, restart_args, startup_data))
             return SimpleNamespace(poll=lambda: None)
 

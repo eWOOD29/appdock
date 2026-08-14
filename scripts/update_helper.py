@@ -344,15 +344,20 @@ def _restore_existing_service_after_preapply_failure(
     restart_args: list[str],
     log: Callable[[str], None],
 ) -> bool:
-    """Restore the old serving process after the parent has handed off."""
+    """Restore the old service normally when no updater lock is held."""
     try:
-        _launch_and_wait(restart_script, install, restart_args, startup_data=data)
+        _launch_and_wait(
+            restart_script,
+            install,
+            restart_args,
+            startup_data=data,
+            use_startup_handoff=False,
+        )
     except Exception as exc:
         log(f"existing AppDock could not be restored before apply: {exc}")
         return False
     log("existing AppDock restored and readiness verified before apply")
     return True
-
 
 def _launch_and_wait(
     restart_script: Path,
@@ -361,6 +366,7 @@ def _launch_and_wait(
     *,
     startup_data: Path | None = None,
     ready_token: str | None = None,
+    use_startup_handoff: bool = True,
 ) -> object:
     ready_token = ready_token or secrets.token_urlsafe(32)
     data = startup_data or _restart_data_dir(restart_args)
@@ -376,14 +382,16 @@ def _launch_and_wait(
             stderr_stream = _open_restart_log_stream(runtime / RESTART_STDERR_LOG_NAME)
             stdout_target = stdout_stream
             stderr_target = stderr_stream
-        startup_receipt = _write_update_startup_handoff(data, install, ready_token) if data is not None else None
+        if use_startup_handoff and data is not None:
+            startup_receipt = _write_update_startup_handoff(data, install, ready_token)
         command = [
             sys.executable,
             str(restart_script),
             *restart_args,
             f"--ready-token={ready_token}",
-            f"--update-helper-startup={ready_token}",
         ]
+        if use_startup_handoff:
+            command.append(f"--update-helper-startup={ready_token}")
         restarted = subprocess.Popen(
             command,
             shell=False,
@@ -419,7 +427,6 @@ def _launch_and_wait(
         if startup_receipt is not None:
             startup_receipt.unlink(missing_ok=True)
     return restarted
-
 
 def run(
     staged: Path,
@@ -471,55 +478,85 @@ def run(
         log(f"update helper identity verification failed: {exc}")
         _restore_existing_service_after_preapply_failure(restart_script, install, data, restart_args, log)
         return 1
+
+    failure: Exception | None = None
+    restore_after_unlock = False
+    restore_success_message = ""
+    restore_failure_prefix = ""
+    discard_failed_stage = False
     try:
         with acquire_update_lock(data):
             try:
                 recover_update_transactions(data, expected_install=install)
             except Exception as exc:
-                _restore_existing_service_after_preapply_failure(restart_script, install, data, restart_args, log)
+                failure = exc
+                restore_after_unlock = True
+                restore_success_message = "existing AppDock restarted after updater lock release"
+                restore_failure_prefix = "existing AppDock restart after updater lock release failed"
                 log(f"update recovery failed before apply: {exc}")
-                return 1
-            service_restored = False
-            try:
-                result = apply_update(
-                    staged,
-                    install,
-                    data,
-                    phase_hook=phase_hook if callable(phase_hook) else None,
-                    expected_identity=claimed_identity,
-                )
-                log(f"update applied: {result['files']}")
-                log("restarting AppDock with a fixed argument list")
+            else:
                 try:
-                    _launch_and_wait(restart_script, install, restart_args, startup_data=data)
-                    finalize_update(result, install, data)
-                except Exception as restart_exc:
-                    rollback_update(result, install, data)
-                    log("restart readiness failed; previous program files restored")
+                    result = apply_update(
+                        staged,
+                        install,
+                        data,
+                        phase_hook=phase_hook if callable(phase_hook) else None,
+                        expected_identity=claimed_identity,
+                    )
+                except Exception as exc:
+                    failure = exc
+                    restore_after_unlock = True
+                    restore_success_message = "existing AppDock restarted after updater lock release"
+                    restore_failure_prefix = "existing AppDock restart after updater lock release failed"
+                    discard_failed_stage = True
+                else:
+                    log(f"update applied: {result['files']}")
+                    log("restarting AppDock with a fixed argument list")
+                    restarted = None
                     try:
-                        _launch_and_wait(restart_script, install, restart_args, startup_data=data)
-                        service_restored = True
-                        log("restored AppDock restarted successfully")
-                    except Exception as restore_exc:
-                        log(f"restored AppDock restart failed: {restore_exc}")
-                    raise restart_exc
-            except Exception as exc:  # copy failures and restart-launch failures roll back
-                if not service_restored:
-                    try:
-                        _launch_and_wait(restart_script, install, restart_args, startup_data=data)
-                        log("existing AppDock restarted after update failure")
-                    except Exception as restore_exc:
-                        log(f"existing AppDock restart after update failure failed: {restore_exc}")
-                _discard_stage(staged, data)
-                log(f"update failed: {exc}")
-                return 1
-            _discard_stage(staged, data)
-            log("update helper finished")
-            return 0
+                        restarted = _launch_and_wait(restart_script, install, restart_args, startup_data=data)
+                        finalize_update(result, install, data)
+                    except Exception as restart_exc:
+                        if restarted is not None:
+                            _stop_restarted_process(restarted)
+                        try:
+                            rollback_update(result, install, data)
+                        except Exception as rollback_exc:
+                            failure = rollback_exc
+                            log(f"restart readiness failed and rollback failed: {rollback_exc}")
+                        else:
+                            log("restart readiness failed; previous program files restored")
+                            failure = restart_exc
+                            restore_after_unlock = True
+                            restore_success_message = "restored AppDock restarted successfully after updater lock release"
+                            restore_failure_prefix = "restored AppDock restart after updater lock release failed"
+                            discard_failed_stage = True
+                    else:
+                        _discard_stage(staged, data)
+                        log("update helper finished")
+                        return 0
+
+                if discard_failed_stage:
+                    _discard_stage(staged, data)
+                if failure is not None:
+                    log(f"update failed: {failure}")
     except Exception as exc:
         log(f"update helper could not acquire updater lock or recover transactions: {exc}")
         return 1
 
+    if restore_after_unlock:
+        try:
+            _launch_and_wait(
+                restart_script,
+                install,
+                restart_args,
+                startup_data=data,
+                use_startup_handoff=False,
+            )
+            log(restore_success_message)
+        except Exception as restore_exc:
+            log(f"{restore_failure_prefix}: {restore_exc}")
+    return 1
 
 _HELPER_OPTIONS = frozenset({
     "--staged",
