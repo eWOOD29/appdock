@@ -136,5 +136,137 @@ class UpdateRestartHandoffRegressionTests(unittest.TestCase):
             self.assertFalse(launch.call_args.kwargs["use_startup_handoff"])
 
 
+    @unittest.skipUnless(os.name == "nt", "Windows retained process-handle regression")
+    def test_windows_process_exists_rejects_exited_process_with_retained_handle(self):
+        process = subprocess.Popen(
+            [sys.executable, "-c", "pass"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+        process.wait(timeout=5)
+        self.assertFalse(appdock._process_exists(process.pid))
+
+    @unittest.skipUnless(os.name == "nt", "Windows retained process-handle regression")
+    def test_windows_startup_handoff_rejects_exited_owner_with_retained_handle(self):
+        process = subprocess.Popen(
+            [sys.executable, "-c", "pass"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+        process.wait(timeout=5)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            data = root / "data"
+            install = root / "install"
+            install.mkdir()
+            token = "B" * 32
+            receipt = appdock._update_startup_receipt_path(data, token)
+            appdock._durable_write_json(
+                receipt,
+                {
+                    "schema_version": 1,
+                    "token": token,
+                    "owner_pid": process.pid,
+                    "install": str(install.resolve()),
+                    "data": str(data.resolve()),
+                },
+            )
+            with self.assertRaises(appdock.AppDockError):
+                appdock._consume_update_startup_handoff(data, install, token)
+            self.assertTrue(receipt.exists())
+
+    def test_recovery_failure_never_restarts_untrusted_installation(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            staged = root / "staged"
+            install = root / "install"
+            data = root / "data"
+            restart_script = install / "appdock.py"
+            for item in (staged, install, data / "runtime"):
+                item.mkdir(parents=True, exist_ok=True)
+
+            class FakeLock:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_args):
+                    return None
+
+            logs: list[str] = []
+            with (
+                patch.object(update_helper, "_update_lock_path", return_value=data / "runtime" / "update.lock"),
+                patch.object(update_helper, "_safe_append_update_log", side_effect=lambda _path, message: logs.append(message)),
+                patch.object(update_helper, "_validate_installed_tree", return_value=({}, [])),
+                patch.object(update_helper, "_alive", return_value=False),
+                patch.object(update_helper, "_verify_helper_identity", return_value={"identity": "ok"}),
+                patch.object(update_helper, "acquire_update_lock", return_value=FakeLock()),
+                patch.object(update_helper, "recover_update_transactions", side_effect=appdock.AppDockError("recovery failed")),
+                patch.object(update_helper, "_launch_and_wait") as launch,
+            ):
+                result = update_helper.run(
+                    staged,
+                    install,
+                    data,
+                    12345,
+                    restart_script,
+                    ["--host", "127.0.0.1", "--port", "8765", "--data-dir", str(data)],
+                )
+
+            self.assertEqual(result, 1)
+            launch.assert_not_called()
+            self.assertTrue(any("will not be restarted" in item for item in logs))
+            self.assertTrue(any("installation state is untrusted" in item for item in logs))
+
+    def test_post_lock_restore_revalidates_installation_before_launch(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            staged = root / "staged"
+            install = root / "install"
+            data = root / "data"
+            restart_script = install / "appdock.py"
+            for item in (staged, install, data / "runtime"):
+                item.mkdir(parents=True, exist_ok=True)
+
+            class FakeLock:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_args):
+                    return None
+
+            logs: list[str] = []
+            with (
+                patch.object(update_helper, "_update_lock_path", return_value=data / "runtime" / "update.lock"),
+                patch.object(
+                    update_helper,
+                    "_validate_installed_tree",
+                    side_effect=[({}, []), appdock.AppDockError("restored tree is unsafe")],
+                ) as validate,
+                patch.object(update_helper, "_safe_append_update_log", side_effect=lambda _path, message: logs.append(message)),
+                patch.object(update_helper, "_alive", return_value=False),
+                patch.object(update_helper, "_verify_helper_identity", return_value={"identity": "ok"}),
+                patch.object(update_helper, "acquire_update_lock", return_value=FakeLock()),
+                patch.object(update_helper, "recover_update_transactions", return_value=[]),
+                patch.object(update_helper, "apply_update", side_effect=RuntimeError("apply failed")),
+                patch.object(update_helper, "_discard_stage"),
+                patch.object(update_helper, "_launch_and_wait") as launch,
+            ):
+                result = update_helper.run(
+                    staged,
+                    install,
+                    data,
+                    12345,
+                    restart_script,
+                    ["--host", "127.0.0.1", "--port", "8765", "--data-dir", str(data)],
+                )
+
+            self.assertEqual(result, 1)
+            self.assertEqual(validate.call_count, 2)
+            launch.assert_not_called()
+            self.assertTrue(any("restored installation did not pass validation" in item for item in logs))
+
+
 if __name__ == "__main__":
     unittest.main()

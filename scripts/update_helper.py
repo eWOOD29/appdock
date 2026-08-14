@@ -490,10 +490,10 @@ def run(
                 recover_update_transactions(data, expected_install=install)
             except Exception as exc:
                 failure = exc
-                restore_after_unlock = True
-                restore_success_message = "existing AppDock restarted after updater lock release"
-                restore_failure_prefix = "existing AppDock restart after updater lock release failed"
-                log(f"update recovery failed before apply: {exc}")
+                log(
+                    "update recovery failed before apply; existing AppDock will not be restarted "
+                    f"because installation state is untrusted: {exc}"
+                )
             else:
                 try:
                     result = apply_update(
@@ -545,6 +545,14 @@ def run(
         return 1
 
     if restore_after_unlock:
+        try:
+            _validate_installed_tree(install)
+        except Exception as validation_exc:
+            log(
+                f"{restore_failure_prefix}: restored installation did not pass validation: "
+                f"{validation_exc}"
+            )
+            return 1
         try:
             _launch_and_wait(
                 restart_script,

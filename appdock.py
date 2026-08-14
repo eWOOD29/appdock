@@ -1506,24 +1506,29 @@ def _process_exists(pid: int) -> bool:
         import ctypes
         from ctypes import wintypes
 
-        process_query_limited_information = 0x1000
-        error_access_denied = 5
-        error_invalid_parameter = 87
+        synchronize = 0x00100000
+        wait_object_0 = 0x00000000
+        wait_timeout = 0x00000102
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         open_process = kernel32.OpenProcess
         open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
         open_process.restype = wintypes.HANDLE
+        wait_for_single_object = kernel32.WaitForSingleObject
+        wait_for_single_object.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        wait_for_single_object.restype = wintypes.DWORD
         close_handle = kernel32.CloseHandle
         close_handle.argtypes = [wintypes.HANDLE]
         close_handle.restype = wintypes.BOOL
-        handle = open_process(process_query_limited_information, False, pid)
-        if handle:
+        handle = open_process(synchronize, False, pid)
+        if not handle:
+            return False
+        try:
+            wait_result = wait_for_single_object(handle, 0)
+        finally:
             close_handle(handle)
+        if wait_result == wait_timeout:
             return True
-        error = ctypes.get_last_error()
-        if error == error_access_denied:
-            return True
-        if error == error_invalid_parameter:
+        if wait_result == wait_object_0:
             return False
         return False
     try:
