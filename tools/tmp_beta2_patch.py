@@ -64,7 +64,7 @@ replace_between(
     restart_args: list[str],
     log: Callable[[str], None],
 ) -> bool:
-    """Restore the old service normally after the helper no longer needs the lock."""
+    """Restore the old service normally when no updater lock is held."""
     try:
         _launch_and_wait(
             restart_script,
@@ -95,8 +95,6 @@ replace_between(
 ) -> object:
     ready_token = ready_token or secrets.token_urlsafe(32)
     data = startup_data or _restart_data_dir(restart_args)
-    if use_startup_handoff and data is None:
-        raise RuntimeError("update startup handoff requires the AppDock data directory")
     startup_receipt = None
     stdout_stream = None
     stderr_stream = None
@@ -109,7 +107,7 @@ replace_between(
             stderr_stream = _open_restart_log_stream(runtime / RESTART_STDERR_LOG_NAME)
             stdout_target = stdout_stream
             stderr_target = stderr_stream
-        if use_startup_handoff:
+        if use_startup_handoff and data is not None:
             startup_receipt = _write_update_startup_handoff(data, install, ready_token)
         command = [
             sys.executable,
@@ -292,15 +290,22 @@ replace_between(
 )
 
 
+generation9 = Path("tests/test_generation9_remediation.py")
+generation9_text = generation9.read_text(encoding="utf-8")
+old_restore = '''        def restore(restart_script, install, restart_args, *, startup_data=None, ready_token=None):\n            launched.append((restart_script, install, restart_args, startup_data))\n            return SimpleNamespace(poll=lambda: None)\n'''
+new_restore = '''        def restore(restart_script, install, restart_args, *, startup_data=None, ready_token=None, use_startup_handoff=True):\n            self.assertFalse(use_startup_handoff)\n            launched.append((restart_script, install, restart_args, startup_data))\n            return SimpleNamespace(poll=lambda: None)\n'''
+if old_restore not in generation9_text:
+    raise RuntimeError("generation9 restore seam was not found")
+generation9.write_text(generation9_text.replace(old_restore, new_restore, 1), encoding="utf-8")
+
+
 test_path = Path("tests/test_update_restart_handoff_regression.py")
 test_path.write_text(r'''from __future__ import annotations
 
-import json
 import os
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -373,17 +378,13 @@ class UpdateRestartHandoffRegressionTests(unittest.TestCase):
 
             class FakeLock:
                 def __enter__(self):
-                    self.assert_not_active()
+                    if lock_state["active"]:
+                        raise AssertionError("fake lock is already active")
                     lock_state["active"] = True
                     return self
 
                 def __exit__(self, *_args):
                     lock_state["active"] = False
-
-                @staticmethod
-                def assert_not_active():
-                    if lock_state["active"]:
-                        raise AssertionError("fake lock is already active")
 
             def fake_launch(*_args, use_startup_handoff=True, **_kwargs):
                 launches.append((use_startup_handoff, lock_state["active"]))
