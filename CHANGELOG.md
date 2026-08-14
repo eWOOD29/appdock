@@ -4,6 +4,14 @@ All notable changes to AppDock are documented here. The project follows Semantic
 
 ## [Unreleased]
 
+## [0.2.2-beta.1] - 2026-08-14
+
+### Fixed
+
+- Reject unsupported or mixed current installations before publishing the updater helper handshake, so the running AppDock service is not shut down when preflight fails.
+- Persist updater restart stdout/stderr diagnostics under the data runtime root and harden updater log appends against symlink, reparse-point, hardlink, and replacement-race redirection.
+- Accept syntactically valid option-like updater handshake tokens from the already-published v0.2.1 parent without weakening helper identity or preflight validation.
+
 ## [0.2.1] - 2026-08-12
 
 ### Added
