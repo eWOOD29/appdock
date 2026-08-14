@@ -1,0 +1,38 @@
+name: Temporary beta2 remediation transport
+
+on:
+  push:
+    branches:
+      - scratch/appdock-beta2-restart-remediation
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-test:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: scratch/appdock-beta2-restart-remediation
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Apply bounded remediation
+        run: python tools/tmp_beta2_patch.py
+      - name: Run focused restart-handoff regressions
+        run: python -m unittest discover -s tests -p "test_update_restart_handoff_regression.py" -v
+      - name: Run full Python suite
+        run: python -m unittest discover -s tests -v
+      - name: Freeze scratch tree without transport files
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/tmp-beta2-remediation.yml tools/tmp_beta2_patch.py
+          git add appdock.py scripts/update_helper.py tests/test_update_restart_handoff_regression.py
+          git diff --cached --check
+          git commit -m "fix: harden Windows updater restart handoff"
+          git push origin HEAD:scratch/appdock-beta2-restart-remediation
