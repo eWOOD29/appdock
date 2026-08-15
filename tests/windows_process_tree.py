@@ -41,6 +41,21 @@ class ProcessIdentity:
         )
 
 
+def identity_key(identity: ProcessIdentity) -> tuple[int, int]:
+    return identity.pid, identity.creation_time
+
+
+def identity_keys(identities: Iterable[ProcessIdentity]) -> set[tuple[int, int]]:
+    return {identity_key(identity) for identity in identities}
+
+
+def identities_subset(
+    identities: Iterable[ProcessIdentity],
+    candidates: Iterable[ProcessIdentity],
+) -> bool:
+    return identity_keys(identities) <= identity_keys(candidates)
+
+
 if os.name == "nt":
     class _ProcessEntry32W(ctypes.Structure):
         _fields_ = [
@@ -180,7 +195,7 @@ def descendants_or_self(
         if root.pid not in current:
             return {}
         try:
-            if process_identity(root.pid, current) != root:
+            if identity_key(process_identity(root.pid, current)) != identity_key(root):
                 return {}
             selected = {root.pid}
             changed = True
@@ -217,7 +232,7 @@ def lineage_until(
 
 def merge_identities(*groups: Iterable[ProcessIdentity]) -> dict[tuple[int, int], ProcessIdentity]:
     return {
-        (identity.pid, identity.creation_time): identity
+        identity_key(identity): identity
         for group in groups
         for identity in group
     }
@@ -240,6 +255,6 @@ def running_identities(
             if identity.pid not in refreshed:
                 continue
             current = process_identity(identity.pid, refreshed)
-        if current == identity:
+        if identity_key(current) == identity_key(identity):
             survivors.append(identity)
     return survivors

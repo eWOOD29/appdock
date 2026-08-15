@@ -25,6 +25,7 @@ from test_update_real_rollback_process import (
 )
 from windows_process_tree import (
     descendants_or_self,
+    identities_subset,
     identities_for_pids,
     process_identity,
     running_identities,
@@ -157,7 +158,7 @@ class RealFinalizeRollbackProcessProofTests(unittest.TestCase):
                 listeners_before = _listening_pids(port)
                 listener_identities_before = identities_for_pids(listeners_before, before_snapshot)
                 self.assertEqual(len(listener_identities_before), 1)
-                self.assertTrue(listener_identities_before <= set(candidate_tree))
+                self.assertTrue(identities_subset(listener_identities_before, candidate_tree))
                 real_stop(process)
                 after_snapshot = snapshot_processes()
                 stop_observation.update(
@@ -221,7 +222,7 @@ class RealFinalizeRollbackProcessProofTests(unittest.TestCase):
                 candidate_tree = list(candidate["process_tree"])
                 self.assertEqual(len(candidate_listeners), 1)
                 self.assertEqual(len(candidate_listener_identities), 1)
-                self.assertTrue(candidate_listener_identities <= set(candidate_tree))
+                self.assertTrue(identities_subset(candidate_listener_identities, candidate_tree))
 
                 self.assertEqual(finalize_observation["candidate_pid"], candidate_pid)
                 self.assertIsNone(finalize_observation["candidate_poll"])
@@ -230,7 +231,7 @@ class RealFinalizeRollbackProcessProofTests(unittest.TestCase):
                 finalize_survivors = list(finalize_observation["candidate_survivors"])
                 self.assertEqual(len(finalize_listeners), 1)
                 self.assertEqual(len(finalize_listener_identities), 1)
-                self.assertTrue(finalize_listener_identities <= set(finalize_survivors))
+                self.assertTrue(identities_subset(finalize_listener_identities, finalize_survivors))
                 self.assertTrue(stop_observation["candidate_tree_before_stop"])
                 self.assertEqual(stop_observation["survivors_after_stop"], [])
                 self.assertEqual(stop_observation["listeners_after_stop"], [])
@@ -253,7 +254,7 @@ class RealFinalizeRollbackProcessProofTests(unittest.TestCase):
                 restored_tree = list(restored["process_tree"])
                 self.assertEqual(len(restored_listeners), 1)
                 self.assertEqual(len(restored_listener_identities), 1)
-                self.assertTrue(restored_listener_identities <= set(restored_tree))
+                self.assertTrue(identities_subset(restored_listener_identities, restored_tree))
                 self.assertNotEqual(candidate_health["ready_token"], old_health["ready_token"])
 
                 self.assertIsNotNone(candidate_process)
@@ -266,7 +267,7 @@ class RealFinalizeRollbackProcessProofTests(unittest.TestCase):
                 final_old_tree = descendants_or_self(restored["launch_identity"])
                 self.assertEqual(len(final_listeners), 1)
                 self.assertEqual(len(final_listener_identities), 1)
-                self.assertTrue(final_listener_identities <= set(final_old_tree.values()))
+                self.assertTrue(identities_subset(final_listener_identities, final_old_tree.values()))
                 shutdown_candidate_tree = list(stop_observation["candidate_tree_before_stop"])
                 self.assertEqual(running_identities(shutdown_candidate_tree, final_snapshot), [])
 

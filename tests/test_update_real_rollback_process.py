@@ -20,6 +20,7 @@ import windows_process_tree
 from windows_process_tree import (
     ProcessIdentity,
     descendants_or_self,
+    identities_subset,
     identities_for_pids,
     process_identity,
     running_identities,
@@ -399,8 +400,8 @@ class RealRollbackProcessProofTests(unittest.TestCase):
                 }
                 self.assertTrue(restored_launch_tree)
                 self.assertTrue(restored_recorded_tree)
-                self.assertTrue(listener_identities <= set(restored_launch_tree.values()))
-                self.assertTrue(listener_identities <= restored_recorded_tree)
+                self.assertTrue(identities_subset(listener_identities, restored_launch_tree.values()))
+                self.assertTrue(identities_subset(listener_identities, restored_recorded_tree))
                 self.assertEqual(running_identities(candidate_identities, process_snapshot), [])
 
                 transactions = sorted((data / "updates" / "transactions").glob("*/transaction.json"))
