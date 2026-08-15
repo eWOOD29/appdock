@@ -21,7 +21,14 @@ from test_update_real_rollback_process import (
     _listening_pids,
     _managed_snapshot,
     _source_version,
-    _terminate_tree,
+    _terminate_and_reap,
+)
+from windows_process_tree import (
+    descendants_or_self,
+    identities_for_pids,
+    process_identity,
+    running_identities,
+    snapshot_processes,
 )
 
 
@@ -80,10 +87,12 @@ class RealFinalizeRollbackProcessProofTests(unittest.TestCase):
             ]
             health_url = f"http://127.0.0.1:{port}/health"
             real_launch = update_helper._launch_and_wait
+            real_stop = update_helper._stop_restarted_process
             observations: list[dict[str, object]] = []
             candidate_process: subprocess.Popen[object] | None = None
             old_process: subprocess.Popen[object] | None = None
             finalize_observation: dict[str, object] = {}
+            stop_observation: dict[str, object] = {}
 
             def observing_launch(restart_script, install_arg, restart_args_arg, **kwargs):
                 nonlocal candidate_process, old_process
@@ -92,11 +101,15 @@ class RealFinalizeRollbackProcessProofTests(unittest.TestCase):
                 active_version = _source_version(install / "appdock.py")
                 active_sha = hashlib.sha256((install / "appdock.py").read_bytes()).hexdigest()
                 lock_probe = _probe_lock(data, install)
+                before_snapshot = snapshot_processes()
                 before_listeners = sorted(_listening_pids(port))
                 candidate_running_before_old = None
+                candidate_survivors_before_old = None
                 if phase == "restored-old":
                     self.assertIsNotNone(candidate_process)
                     candidate_running_before_old = candidate_process.poll() is None
+                    candidate_tree = list(stop_observation["candidate_tree_before_stop"])
+                    candidate_survivors_before_old = running_identities(candidate_tree, before_snapshot)
 
                 process = real_launch(
                     restart_script,
@@ -106,6 +119,11 @@ class RealFinalizeRollbackProcessProofTests(unittest.TestCase):
                 )
                 with urllib.request.urlopen(health_url, timeout=5) as response:
                     health = json.loads(response.read().decode("utf-8"))
+                ready_snapshot = snapshot_processes()
+                launch_identity = process_identity(process.pid, ready_snapshot)
+                process_tree = list(descendants_or_self(launch_identity).values())
+                ready_listeners = _listening_pids(port)
+                listener_identities = identities_for_pids(ready_listeners, ready_snapshot)
                 observation = {
                     "phase": phase,
                     "version": active_version,
@@ -116,9 +134,13 @@ class RealFinalizeRollbackProcessProofTests(unittest.TestCase):
                     "lock_stderr": lock_probe.stderr.strip(),
                     "listeners_before_launch": before_listeners,
                     "candidate_running_before_old": candidate_running_before_old,
+                    "candidate_survivors_before_old": candidate_survivors_before_old,
                     "pid": process.pid,
+                    "launch_identity": launch_identity,
+                    "process_tree": process_tree,
                     "health": health,
-                    "listeners_after_ready": sorted(_listening_pids(port)),
+                    "listeners_after_ready": sorted(ready_listeners),
+                    "listener_identities_after_ready": listener_identities,
                 }
                 observations.append(observation)
                 if phase == "candidate":
@@ -127,21 +149,44 @@ class RealFinalizeRollbackProcessProofTests(unittest.TestCase):
                     old_process = process
                 return process
 
+            def observing_stop(process):
+                self.assertIs(process, candidate_process)
+                before_snapshot = snapshot_processes()
+                launch_identity = observations[0]["launch_identity"]
+                candidate_tree = list(descendants_or_self(launch_identity).values())
+                listeners_before = _listening_pids(port)
+                listener_identities_before = identities_for_pids(listeners_before, before_snapshot)
+                self.assertEqual(len(listener_identities_before), 1)
+                self.assertTrue(listener_identities_before <= set(candidate_tree))
+                real_stop(process)
+                after_snapshot = snapshot_processes()
+                stop_observation.update(
+                    candidate_tree_before_stop=candidate_tree,
+                    survivors_after_stop=running_identities(candidate_tree, after_snapshot),
+                    listeners_after_stop=sorted(_listening_pids(port)),
+                )
+
             def fail_finalize(_result, _install, _data):
                 self.assertIsNotNone(candidate_process)
                 with urllib.request.urlopen(health_url, timeout=5) as response:
                     health = json.loads(response.read().decode("utf-8"))
+                finalize_snapshot = snapshot_processes()
+                candidate_tree = list(observations[0]["process_tree"])
+                finalize_listeners = _listening_pids(port)
                 finalize_observation.update(
                     health=health,
                     candidate_pid=candidate_process.pid,
                     candidate_poll=candidate_process.poll(),
-                    listening=sorted(_listening_pids(port)),
+                    candidate_survivors=running_identities(candidate_tree, finalize_snapshot),
+                    listening=sorted(finalize_listeners),
+                    listener_identities=identities_for_pids(finalize_listeners, finalize_snapshot),
                 )
                 raise RuntimeError("forced finalize failure after healthy candidate")
 
             try:
                 with (
                     patch.object(update_helper, "_launch_and_wait", side_effect=observing_launch),
+                    patch.object(update_helper, "_stop_restarted_process", side_effect=observing_stop),
                     patch.object(update_helper, "finalize_update", side_effect=fail_finalize),
                 ):
                     result = update_helper.run(
@@ -153,12 +198,15 @@ class RealFinalizeRollbackProcessProofTests(unittest.TestCase):
                         restart_args,
                     )
                 self.assertEqual(result, 1)
-                self.assertEqual([item["phase"] for item in observations], ["candidate", "restored-old"])
+                self.assertEqual(
+                    [item["phase"] for item in observations],
+                    ["candidate", "restored-old"],
+                    (data / "runtime" / "update.log").read_text(encoding="utf-8"),
+                )
 
                 candidate = observations[0]
                 restored = observations[1]
                 candidate_pid = int(candidate["pid"])
-                old_pid = int(restored["pid"])
 
                 self.assertEqual(candidate["version"], "0.2.2-beta.1")
                 self.assertEqual(candidate["app_sha256"], candidate_app_sha)
@@ -168,17 +216,31 @@ class RealFinalizeRollbackProcessProofTests(unittest.TestCase):
                 self.assertTrue(candidate_health["ok"])
                 self.assertEqual(candidate_health["service"], "appdock")
                 self.assertEqual(candidate_health["version"], "0.2.2-beta.1")
-                self.assertEqual(candidate["listeners_after_ready"], [candidate_pid])
+                candidate_listeners = set(candidate["listeners_after_ready"])
+                candidate_listener_identities = set(candidate["listener_identities_after_ready"])
+                candidate_tree = list(candidate["process_tree"])
+                self.assertEqual(len(candidate_listeners), 1)
+                self.assertEqual(len(candidate_listener_identities), 1)
+                self.assertTrue(candidate_listener_identities <= set(candidate_tree))
 
                 self.assertEqual(finalize_observation["candidate_pid"], candidate_pid)
                 self.assertIsNone(finalize_observation["candidate_poll"])
-                self.assertEqual(finalize_observation["listening"], [candidate_pid])
+                finalize_listeners = set(finalize_observation["listening"])
+                finalize_listener_identities = set(finalize_observation["listener_identities"])
+                finalize_survivors = list(finalize_observation["candidate_survivors"])
+                self.assertEqual(len(finalize_listeners), 1)
+                self.assertEqual(len(finalize_listener_identities), 1)
+                self.assertTrue(finalize_listener_identities <= set(finalize_survivors))
+                self.assertTrue(stop_observation["candidate_tree_before_stop"])
+                self.assertEqual(stop_observation["survivors_after_stop"], [])
+                self.assertEqual(stop_observation["listeners_after_stop"], [])
 
                 self.assertEqual(restored["version"], "0.2.1")
                 self.assertEqual(restored["app_sha256"], old_app_sha)
                 self.assertFalse(restored["use_startup_handoff"])
                 self.assertFalse(restored["candidate_running_before_old"])
-                self.assertNotIn(candidate_pid, restored["listeners_before_launch"])
+                self.assertEqual(restored["candidate_survivors_before_old"], [])
+                self.assertEqual(restored["listeners_before_launch"], [])
                 self.assertEqual(restored["lock_returncode"], 0, restored)
                 self.assertEqual(restored["lock_stdout"], "acquired")
                 old_health = dict(restored["health"])
@@ -186,14 +248,27 @@ class RealFinalizeRollbackProcessProofTests(unittest.TestCase):
                 self.assertEqual(old_health["service"], "appdock")
                 self.assertEqual(old_health["version"], "0.2.1")
                 self.assertTrue(old_health.get("ready_token"))
-                self.assertEqual(restored["listeners_after_ready"], [old_pid])
+                restored_listeners = set(restored["listeners_after_ready"])
+                restored_listener_identities = set(restored["listener_identities_after_ready"])
+                restored_tree = list(restored["process_tree"])
+                self.assertEqual(len(restored_listeners), 1)
+                self.assertEqual(len(restored_listener_identities), 1)
+                self.assertTrue(restored_listener_identities <= set(restored_tree))
                 self.assertNotEqual(candidate_health["ready_token"], old_health["ready_token"])
 
                 self.assertIsNotNone(candidate_process)
                 self.assertIsNotNone(old_process)
                 self.assertIsNotNone(candidate_process.poll())
                 self.assertIsNone(old_process.poll())
-                self.assertEqual(_listening_pids(port), {old_pid})
+                final_listeners = _listening_pids(port)
+                final_snapshot = snapshot_processes()
+                final_listener_identities = identities_for_pids(final_listeners, final_snapshot)
+                final_old_tree = descendants_or_self(restored["launch_identity"])
+                self.assertEqual(len(final_listeners), 1)
+                self.assertEqual(len(final_listener_identities), 1)
+                self.assertTrue(final_listener_identities <= set(final_old_tree.values()))
+                shutdown_candidate_tree = list(stop_observation["candidate_tree_before_stop"])
+                self.assertEqual(running_identities(shutdown_candidate_tree, final_snapshot), [])
 
                 inventory, extras = appdock._validate_installed_tree(install)
                 self.assertEqual(extras, [])
@@ -216,9 +291,9 @@ class RealFinalizeRollbackProcessProofTests(unittest.TestCase):
                 self.assertIn("restored AppDock restarted successfully after updater lock release", update_log)
             finally:
                 if old_process is not None:
-                    _terminate_tree(old_process.pid)
+                    _terminate_and_reap(old_process)
                 if candidate_process is not None:
-                    _terminate_tree(candidate_process.pid)
+                    _terminate_and_reap(candidate_process)
 
 
 if __name__ == "__main__":
