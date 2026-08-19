@@ -240,7 +240,7 @@ class UpdaterIncidentHardeningTests(unittest.TestCase):
         self.assertIn('AppDock was left running', source)
 
     def test_v021_parent_real_helper_rejects_mixed_install_before_handshake_and_releases_lock(self):
-        self.assertEqual(appdock.CURRENT_VERSION, '0.2.2-beta.1')
+        self.assertEqual(appdock.CURRENT_VERSION, '0.2.2-beta.2')
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             config = appdock.AppDockConfig.from_environment(data_dir=root / 'data')

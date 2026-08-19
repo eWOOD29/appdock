@@ -32,7 +32,7 @@ else:
     import fcntl
 
 MANIFEST_NAME = "appdock.json"
-CURRENT_VERSION = "0.2.2-beta.1"
+CURRENT_VERSION = "0.2.2-beta.2"
 DEFAULT_UPDATE_REPOSITORY = "eWOOD29/appdock"
 DEFAULT_UPDATE_CHANNEL = "stable"
 UPDATE_CHANNELS = frozenset({"stable", "beta"})

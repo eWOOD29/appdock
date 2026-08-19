@@ -74,9 +74,9 @@ class RealFinalizeRollbackProcessProofTests(unittest.TestCase):
             build_portable.build_archive(candidate_zip)
             candidate_bytes = candidate_zip.read_bytes()
             appdock.validate_zip(candidate_bytes)
-            staged = data / "updates" / "0.2.2-beta.1"
+            staged = data / "updates" / "0.2.2-beta.2"
             _extract_zip(candidate_bytes, staged)
-            self.assertEqual(_source_version(staged / "appdock.py"), "0.2.2-beta.1")
+            self.assertEqual(_source_version(staged / "appdock.py"), "0.2.2-beta.2")
             candidate_app_sha = hashlib.sha256((staged / "appdock.py").read_bytes()).hexdigest()
             self.assertNotEqual(candidate_app_sha, old_app_sha)
 
@@ -209,14 +209,14 @@ class RealFinalizeRollbackProcessProofTests(unittest.TestCase):
                 restored = observations[1]
                 candidate_pid = int(candidate["pid"])
 
-                self.assertEqual(candidate["version"], "0.2.2-beta.1")
+                self.assertEqual(candidate["version"], "0.2.2-beta.2")
                 self.assertEqual(candidate["app_sha256"], candidate_app_sha)
                 self.assertTrue(candidate["use_startup_handoff"])
                 self.assertNotEqual(candidate["lock_returncode"], 0)
                 candidate_health = dict(candidate["health"])
                 self.assertTrue(candidate_health["ok"])
                 self.assertEqual(candidate_health["service"], "appdock")
-                self.assertEqual(candidate_health["version"], "0.2.2-beta.1")
+                self.assertEqual(candidate_health["version"], "0.2.2-beta.2")
                 candidate_listeners = set(candidate["listeners_after_ready"])
                 candidate_listener_identities = set(candidate["listener_identities_after_ready"])
                 candidate_tree = list(candidate["process_tree"])
