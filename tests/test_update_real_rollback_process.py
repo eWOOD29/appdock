@@ -284,9 +284,9 @@ class RealRollbackProcessProofTests(unittest.TestCase):
             build_portable.build_archive(candidate_zip)
             candidate_bytes = candidate_zip.read_bytes()
             appdock.validate_zip(candidate_bytes)
-            staged = data / "updates" / "0.2.2-beta.1"
+            staged = data / "updates" / "0.2.2-beta.2"
             _extract_zip(candidate_bytes, staged)
-            self.assertEqual(_source_version(staged / "appdock.py"), "0.2.2-beta.1")
+            self.assertEqual(_source_version(staged / "appdock.py"), "0.2.2-beta.2")
             candidate_app_sha = hashlib.sha256((staged / "appdock.py").read_bytes()).hexdigest()
             self.assertNotEqual(candidate_app_sha, old_app_sha)
 
@@ -329,7 +329,7 @@ class RealRollbackProcessProofTests(unittest.TestCase):
                     item for item in records
                     if item.get("kind") == "launch-boundary" and item.get("phase") == "restored-old"
                 )
-                self.assertEqual(candidate_boundary["version"], "0.2.2-beta.1")
+                self.assertEqual(candidate_boundary["version"], "0.2.2-beta.2")
                 self.assertEqual(candidate_boundary["app_sha256"], candidate_app_sha)
                 self.assertEqual(old_boundary["version"], "0.2.1")
                 self.assertEqual(old_boundary["app_sha256"], old_app_sha)

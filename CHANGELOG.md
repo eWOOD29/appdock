@@ -4,6 +4,16 @@ All notable changes to AppDock are documented here. The project follows Semantic
 
 ## [Unreleased]
 
+## [0.2.2-beta.2] - 2026-08-19
+
+### Fixed
+
+- Harden updater restart/rollback handling from PR #8: reject unsupported or mixed current installations before helper handshake, preserve the running service when preflight fails, persist restart stdout/stderr diagnostics under the data runtime root, harden updater log appends against symlink, reparse-point, hardlink, and replacement-race redirection, and accept syntactically valid option-like handshake tokens from the published v0.2.1 parent without weakening helper identity or preflight validation.
+
+### Verified
+
+- Closed PR #8 restart/rollback evidence against the accepted merge snapshot and successful exact-head and merge-commit CI (10/10 jobs each).
+
 ## [0.2.2-beta.1] - 2026-08-14
 
 ### Fixed
