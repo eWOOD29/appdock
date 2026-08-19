@@ -1502,12 +1502,44 @@ def _write_update_startup_handoff(data: str | Path, install: str | Path, token: 
 def _process_exists(pid: int) -> bool:
     if pid <= 0 or pid == os.getpid():
         return False
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        synchronize = 0x00100000
+        wait_object_0 = 0x00000000
+        wait_timeout = 0x00000102
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        open_process.restype = wintypes.HANDLE
+        wait_for_single_object = kernel32.WaitForSingleObject
+        wait_for_single_object.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        wait_for_single_object.restype = wintypes.DWORD
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+        handle = open_process(synchronize, False, pid)
+        if not handle:
+            return False
+        try:
+            wait_result = wait_for_single_object(handle, 0)
+        finally:
+            close_handle(handle)
+        if wait_result == wait_timeout:
+            return True
+        if wait_result == wait_object_0:
+            return False
+        return False
     try:
         os.kill(pid, 0)
-    except (OSError, ProcessLookupError):
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
         return False
     return True
-
 
 def _consume_update_startup_handoff(data: Path, install: Path, token: str) -> None:
     receipt_path = _update_startup_receipt_path(data, token)
