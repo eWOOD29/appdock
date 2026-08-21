@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import urllib.request
 from pathlib import Path
@@ -74,9 +75,9 @@ class RealFinalizeRollbackProcessProofTests(unittest.TestCase):
             build_portable.build_archive(candidate_zip)
             candidate_bytes = candidate_zip.read_bytes()
             appdock.validate_zip(candidate_bytes)
-            staged = data / "updates" / "0.2.2-beta.2"
+            staged = data / "updates" / "0.2.2-beta.3"
             _extract_zip(candidate_bytes, staged)
-            self.assertEqual(_source_version(staged / "appdock.py"), "0.2.2-beta.2")
+            self.assertEqual(_source_version(staged / "appdock.py"), "0.2.2-beta.3")
             candidate_app_sha = hashlib.sha256((staged / "appdock.py").read_bytes()).hexdigest()
             self.assertNotEqual(candidate_app_sha, old_app_sha)
 
@@ -125,6 +126,7 @@ class RealFinalizeRollbackProcessProofTests(unittest.TestCase):
                 process_tree = list(descendants_or_self(launch_identity).values())
                 ready_listeners = _listening_pids(port)
                 listener_identities = identities_for_pids(ready_listeners, ready_snapshot)
+                active_transactions = sorted(str(item) for item in (data / "updates" / "transactions").glob("*/transaction.json"))
                 observation = {
                     "phase": phase,
                     "version": active_version,
@@ -142,6 +144,7 @@ class RealFinalizeRollbackProcessProofTests(unittest.TestCase):
                     "health": health,
                     "listeners_after_ready": sorted(ready_listeners),
                     "listener_identities_after_ready": listener_identities,
+                    "active_transactions": active_transactions,
                 }
                 observations.append(observation)
                 if phase == "candidate":
@@ -161,9 +164,15 @@ class RealFinalizeRollbackProcessProofTests(unittest.TestCase):
                 self.assertTrue(identities_subset(listener_identities_before, candidate_tree))
                 real_stop(process)
                 after_snapshot = snapshot_processes()
+                survivors = running_identities(candidate_tree, after_snapshot)
+                for _ in range(40):
+                    if not survivors:
+                        break
+                    time.sleep(0.05)
+                    survivors = running_identities(candidate_tree, snapshot_processes())
                 stop_observation.update(
                     candidate_tree_before_stop=candidate_tree,
-                    survivors_after_stop=running_identities(candidate_tree, after_snapshot),
+                    survivors_after_stop=survivors,
                     listeners_after_stop=sorted(_listening_pids(port)),
                 )
 
@@ -208,15 +217,16 @@ class RealFinalizeRollbackProcessProofTests(unittest.TestCase):
                 candidate = observations[0]
                 restored = observations[1]
                 candidate_pid = int(candidate["pid"])
+                self.assertEqual(restored["active_transactions"], [])
 
-                self.assertEqual(candidate["version"], "0.2.2-beta.2")
+                self.assertEqual(candidate["version"], "0.2.2-beta.3")
                 self.assertEqual(candidate["app_sha256"], candidate_app_sha)
                 self.assertTrue(candidate["use_startup_handoff"])
                 self.assertNotEqual(candidate["lock_returncode"], 0)
                 candidate_health = dict(candidate["health"])
                 self.assertTrue(candidate_health["ok"])
                 self.assertEqual(candidate_health["service"], "appdock")
-                self.assertEqual(candidate_health["version"], "0.2.2-beta.2")
+                self.assertEqual(candidate_health["version"], "0.2.2-beta.3")
                 candidate_listeners = set(candidate["listeners_after_ready"])
                 candidate_listener_identities = set(candidate["listener_identities_after_ready"])
                 candidate_tree = list(candidate["process_tree"])
@@ -278,10 +288,22 @@ class RealFinalizeRollbackProcessProofTests(unittest.TestCase):
                 self.assertEqual(hashlib.sha256((install / "appdock.py").read_bytes()).hexdigest(), old_app_sha)
 
                 transactions = sorted((data / "updates" / "transactions").glob("*/transaction.json"))
-                self.assertEqual(len(transactions), 1)
-                journal = json.loads(transactions[0].read_text(encoding="utf-8"))
+                self.assertEqual(transactions, [])
+                history_transactions = sorted((data / "updates" / "history").glob("*/transaction.json"))
+                self.assertEqual(len(history_transactions), 1)
+                journal = json.loads(history_transactions[0].read_text(encoding="utf-8"))
                 self.assertEqual(journal["phase"], "rolled_back")
                 self.assertEqual(journal["recovery"], "restore-old")
+                failure_evidence = history_transactions[0].with_name("failure.json")
+                self.assertTrue(failure_evidence.is_file())
+                evidence = json.loads(failure_evidence.read_text(encoding="utf-8"))
+                self.assertEqual(evidence["operation_id"], journal["operation_id"])
+                self.assertEqual(evidence["phase"], "committed")
+                self.assertEqual(evidence["rollback_phase"], "restore-old")
+                self.assertEqual(evidence["rollback_outcome"], "rolled_back")
+                self.assertRegex(evidence["exception_type"], r"^[A-Za-z0-9_.-]{1,128}$")
+                self.assertNotIn("message", evidence)
+                self.assertNotIn("path", evidence)
                 self.assertFalse(staged.exists())
                 self.assertEqual(list((data / "runtime").glob("update-startup-*.json")), [])
 

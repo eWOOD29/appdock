@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from functools import wraps
 import hashlib
 import http.client
@@ -32,7 +33,7 @@ else:
     import fcntl
 
 MANIFEST_NAME = "appdock.json"
-CURRENT_VERSION = "0.2.2-beta.2"
+CURRENT_VERSION = "0.2.2-beta.3"
 DEFAULT_UPDATE_REPOSITORY = "eWOOD29/appdock"
 DEFAULT_UPDATE_CHANNEL = "stable"
 UPDATE_CHANNELS = frozenset({"stable", "beta"})
@@ -81,6 +82,15 @@ _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 class AppDockError(Exception):
     """Expected, user-facing AppDock error."""
+
+
+class UpdateApplyError(AppDockError):
+    """Sanitized apply failure carrying only an internal recovery contract."""
+
+    def __init__(self, message: str, *, operation_id: str | None, recovery_outcome: str):
+        super().__init__(message)
+        self.operation_id = operation_id
+        self.recovery_outcome = recovery_outcome
 
 
 class ManifestError(AppDockError, ValueError):
@@ -223,20 +233,69 @@ def _loads_strict_json(text: str) -> Any:
         raise AppDockError("JSON file is invalid") from exc
 
 
-def _fsync_directory(path: Path) -> None:
+def _fsync_directory(path: Path, *, strict: bool = False) -> None:
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        create_file.restype = wintypes.HANDLE
+        flush_buffers = kernel32.FlushFileBuffers
+        flush_buffers.argtypes = [wintypes.HANDLE]
+        flush_buffers.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+        handle = create_file(
+            str(path),
+            0x40000000,
+            0x00000001 | 0x00000002 | 0x00000004,
+            None,
+            3,
+            0x02000000,
+            None,
+        )
+        invalid_handle = wintypes.HANDLE(-1).value
+        if handle == invalid_handle:
+            error = ctypes.get_last_error()
+            if strict:
+                raise ctypes.WinError(error)
+            return
+        flush_error = 0
+        try:
+            if not flush_buffers(handle):
+                flush_error = ctypes.get_last_error()
+        finally:
+            close_handle(handle)
+        if flush_error and strict:
+            raise ctypes.WinError(flush_error)
+        return
     try:
         descriptor = os.open(path, os.O_RDONLY)
     except OSError:
+        if strict:
+            raise
         return
     try:
         os.fsync(descriptor)
     except OSError:
-        pass
+        if strict:
+            raise
     finally:
         os.close(descriptor)
 
 
-def _durable_write_bytes(path: Path, payload: bytes) -> None:
+def _durable_write_bytes(path: Path, payload: bytes, *, strict: bool = False) -> None:
     path = Path(path).expanduser().absolute()
     _assert_safe_directory_ancestors(path.parent)
     if _is_link_or_reparse(path):
@@ -258,17 +317,259 @@ def _durable_write_bytes(path: Path, payload: bytes) -> None:
         temporary.unlink(missing_ok=True)
         raise AppDockError("update output path changed while writing")
     os.replace(temporary, path)
-    _fsync_directory(path.parent)
+    _fsync_directory(path.parent, strict=strict)
 
 
-def _durable_write_json(path: Path, payload: Any) -> None:
-    _durable_write_bytes(path, (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+def _durable_write_json(path: Path, payload: Any, *, strict: bool = False) -> None:
+    _durable_write_bytes(path, (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8"), strict=strict)
+
+
+def _durable_write_json_strict(path: Path, payload: Any) -> None:
+    """Persist JSON and fail closed if the containing directory cannot flush."""
+    _durable_write_bytes(path, (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8"), strict=True)
 
 
 def _durable_copy(source: Path, destination: Path) -> None:
     _durable_write_bytes(destination, _read_regular_single_link(source, MAX_UPDATE_UNCOMPRESSED_BYTES))
 
 
+@contextmanager
+def _directory_ancestry_lease(*paths: Path):
+    """Hold non-delete-sharing handles for every existing directory ancestor.
+
+    Windows reparses are opened with OPEN_REPARSE_POINT and are rejected from
+    the handle itself.  The handles remain live across the final validation and
+    every destructive operation, preventing an ancestor directory rebind.
+    POSIX has no matching share-mode primitive, so its safe lexical checks stay
+    unchanged.
+    """
+    if os.name != "nt":
+        yield
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    get_info = kernel32.GetFileInformationByHandleEx
+    get_info.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+    get_info.restype = wintypes.BOOL
+
+    class _FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = [("FileAttributes", wintypes.DWORD), ("ReparseTag", wintypes.DWORD)]
+
+    existing: dict[str, Path] = {}
+    for raw_path in paths:
+        current = Path(raw_path).expanduser().absolute()
+        # The target directory itself may be renamed or removed by the
+        # transaction. Lease its parent, whose delete-sharing denial binds the
+        # target name without blocking the controller's legitimate child move.
+        current = current.parent
+        while True:
+            if current.exists():
+                try:
+                    metadata = current.lstat()
+                except OSError as exc:
+                    raise AppDockError("update directory lease ancestor disappeared") from exc
+                if not stat.S_ISDIR(metadata.st_mode) or _is_link_or_reparse(current):
+                    raise AppDockError("update directory lease ancestor is unsafe")
+                existing.setdefault(str(current).casefold(), current)
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+
+    handles: list[Any] = []
+    invalid_handle = wintypes.HANDLE(-1).value
+    try:
+        for current in sorted(existing.values(), key=lambda item: (len(item.parts), str(item).casefold())):
+            handle = create_file(
+                str(current),
+                0x80000000,
+                0x00000001 | 0x00000002,
+                None,
+                3,
+                0x02000000 | 0x00200000,
+                None,
+            )
+            if handle == invalid_handle:
+                raise ctypes.WinError(ctypes.get_last_error())
+            handles.append(handle)
+            info = _FileAttributeTagInfo()
+            if not get_info(handle, 9, ctypes.byref(info), ctypes.sizeof(info)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if not info.FileAttributes & 0x10 or info.FileAttributes & 0x400:
+                raise AppDockError("update directory lease opened a non-directory or reparse point")
+        yield
+    finally:
+        for handle in reversed(handles):
+            close_handle(handle)
+
+
+@contextmanager
+def _windows_directory_handle(path: Path):
+    """Open one real directory while denying external delete/rename sharing."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    get_info = kernel32.GetFileInformationByHandleEx
+    get_info.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+    get_info.restype = wintypes.BOOL
+
+    class _FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = [("FileAttributes", wintypes.DWORD), ("ReparseTag", wintypes.DWORD)]
+
+    handle = create_file(
+        str(path),
+        0x00010000 | 0x80000000,  # DELETE | GENERIC_READ
+        0x00000001 | 0x00000002,  # FILE_SHARE_READ | FILE_SHARE_WRITE
+        None,
+        3,  # OPEN_EXISTING
+        0x02000000 | 0x00200000,  # FILE_FLAG_BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+        None,
+    )
+    invalid_handle = wintypes.HANDLE(-1).value
+    if handle == invalid_handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        info = _FileAttributeTagInfo()
+        if not get_info(handle, 9, ctypes.byref(info), ctypes.sizeof(info)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if not info.FileAttributes & 0x10 or info.FileAttributes & 0x400 or info.ReparseTag:
+            raise AppDockError("bound directory move source is not a real directory")
+        yield handle
+    finally:
+        close_handle(handle)
+
+
+@contextmanager
+def _directory_handle_lease(path: Path):
+    """Keep a real directory handle open while its contents are verified."""
+    if os.name != "nt":
+        yield
+        return
+    with _windows_directory_handle(path):
+        yield
+
+
+def _invoke_bound_validator(validator: Callable[..., None], source_handle: Any) -> None:
+    import inspect
+
+    try:
+        parameters = inspect.signature(validator).parameters.values()
+    except (TypeError, ValueError):
+        validator()
+        return
+    accepts_handle = any(
+        parameter.kind in {inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.VAR_POSITIONAL}
+        for parameter in parameters
+    )
+    if accepts_handle:
+        validator(source_handle)
+    else:
+        validator()
+
+
+def _bound_directory_move(
+    source: Path,
+    destination: Path,
+    *,
+    validator: Callable[..., None] | None = None,
+) -> None:
+    """Move an exact directory through its opened Windows handle.
+
+    The validator runs only after the source handle and destination-parent
+    ancestry leases are held.  On POSIX the existing lexical checks and
+    os.replace remain the platform primitive.
+    """
+    source = Path(source).expanduser().absolute()
+    destination = Path(destination).expanduser().absolute()
+    if _lexical_path_key(source) == _lexical_path_key(destination):
+        raise AppDockError("bound directory move source and destination are identical")
+    try:
+        destination.relative_to(source)
+    except ValueError:
+        pass
+    else:
+        raise AppDockError("bound directory move destination is inside its source")
+    _assert_no_link_or_reparse_ancestor(source)
+    _assert_no_link_or_reparse_ancestor(destination)
+    if destination.exists() or _is_link_or_reparse(destination):
+        raise AppDockError("bound directory move destination already exists")
+    if not destination.parent.is_dir() or _is_link_or_reparse(destination.parent):
+        raise AppDockError("bound directory move destination parent is unsafe")
+    if os.name != "nt":
+        if not source.is_dir() or _is_link_or_reparse(source):
+            raise AppDockError("bound directory move source is unsafe")
+        if validator is not None:
+            _invoke_bound_validator(validator, None)
+        os.replace(source, destination)
+        _fsync_directory(source.parent, strict=True)
+        _fsync_directory(destination.parent, strict=True)
+        return
+
+    with _windows_directory_handle(source) as source_handle:
+        # _directory_ancestry_lease derives and binds each target's parent.
+        # Pass the movable source and destination, not their parents, so the
+        # exact directory names used by this transaction cannot be rebound.
+        with _directory_ancestry_lease(source, destination):
+            if destination.exists() or _is_link_or_reparse(destination):
+                raise AppDockError("bound directory move destination appeared")
+            if validator is not None:
+                _invoke_bound_validator(validator, source_handle)
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            set_info = kernel32.SetFileInformationByHandle
+            set_info.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+            set_info.restype = wintypes.BOOL
+
+            class _FileRenameInfo(ctypes.Structure):
+                _fields_ = [
+                    ("Flags", wintypes.DWORD),
+                    ("RootDirectory", wintypes.HANDLE),
+                    ("FileNameLength", wintypes.DWORD),
+                    ("FileName", wintypes.WCHAR * 1),
+                ]
+
+            encoded_destination = str(destination).encode("utf-16-le")
+            buffer_size = _FileRenameInfo.FileName.offset + len(encoded_destination) + 2
+            buffer = ctypes.create_string_buffer(buffer_size)
+            rename_info = ctypes.cast(buffer, ctypes.POINTER(_FileRenameInfo)).contents
+            rename_info.Flags = 0
+            rename_info.RootDirectory = wintypes.HANDLE(0)
+            rename_info.FileNameLength = len(encoded_destination)
+            ctypes.memmove(
+                ctypes.addressof(buffer) + _FileRenameInfo.FileName.offset,
+                encoded_destination,
+                len(encoded_destination),
+            )
+            # The buffer is zero-initialized, providing the required WCHAR NUL.
+            if not set_info(
+                source_handle,
+                3,
+                ctypes.byref(buffer),
+                buffer_size,
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+            # Keep both the source handle and parent ancestry leases live while
+            # proving the rename is durable. Callers must not reopen parents
+            # after this function returns and treat that as authorization.
+            _fsync_directory(source.parent, strict=True)
+            _fsync_directory(destination.parent, strict=True)
 def _inside(path: Path, root: Path) -> bool:
     try:
         path.resolve().relative_to(root.resolve())
@@ -2493,13 +2794,22 @@ class GitHubOnboarding:
         if destination.exists() or registry.exists():
             raise PreviewError("an app with this id is already registered")
         try:
-            stage.replace(destination)
+            def validate_registration_move(_source_handle: Any = None) -> None:
+                refreshed = _safe_child(self.config.staging_root, stage_name)
+                if not refreshed.is_dir() or _is_link_or_reparse(refreshed):
+                    raise PreviewError("staging area changed")
+                _assert_tree_safe(refreshed, self.config.data_root)
+                checked = normalize_manifest(json.loads((refreshed / MANIFEST_NAME).read_text(encoding="utf-8")), manifest_dir=refreshed, directory=refreshed)
+                if checked["id"] != app_id:
+                    raise PreviewError("preview changed")
+
+            _bound_directory_move(stage, destination, validator=validate_registration_move)
             normalized["external"] = False
             normalized["directory"] = str(destination)
             _atomic_json(registry / MANIFEST_NAME, normalized)
         except Exception:
             if destination.exists() and not stage.exists():
-                destination.replace(stage)
+                _bound_directory_move(destination, stage)
             _remove_tree(registry, ignore_errors=True)
             raise PreviewError("could not register repository")
         return {"registered": True, "id": app_id, "started": False}
@@ -3129,7 +3439,11 @@ def stage_update(release: dict[str, Any], config: AppDockConfig, *, opener: Call
             for info in archive.infolist():
                 _assert_zip_member(info.filename, info)
                 archive.extract(info, temporary)
-        temporary.replace(destination)
+        _bound_directory_move(
+            temporary,
+            destination,
+            validator=lambda: _assert_tree_safe(temporary, config.updates_root),
+        )
     except Exception:
         _remove_tree(temporary, ignore_errors=True)
         raise
@@ -3163,12 +3477,33 @@ def _update_transactions_root(data: Path) -> Path:
     return root.resolve()
 
 
+def _update_history_root(data: Path) -> Path:
+    data = Path(data).expanduser().absolute()
+    _assert_safe_directory_ancestors(data)
+    updates = data / "updates"
+    history = updates / "history"
+    _assert_safe_directory_ancestors(updates)
+    _assert_safe_directory_ancestors(history)
+    if updates.exists() and (not updates.is_dir() or _is_link_or_reparse(updates)):
+        raise AppDockError("update history root is unsafe")
+    if history.exists() and (not history.is_dir() or _is_link_or_reparse(history)):
+        raise AppDockError("update history root is unsafe")
+    updates.mkdir(parents=True, exist_ok=True)
+    history.mkdir(parents=True, exist_ok=True)
+    _assert_safe_directory_ancestors(history)
+    if not _inside(history, data) or not history.is_dir() or _is_link_or_reparse(history):
+        raise AppDockError("update history root is unsafe")
+    return history.resolve()
+
+
 def _update_journal(tx_root: Path) -> dict[str, Any]:
     journal = _read_bounded_json(tx_root / "transaction.json")
     required = {"schema_version", "operation_id", "install", "candidate", "backup", "old_exists", "phase", "recovery", "files", "preexisting", "identity"}
+    allowed = required | {"old_identity"}
     if (
         not isinstance(journal, dict)
-        or set(journal) != required
+        or not set(journal).issubset(allowed)
+        or not required.issubset(set(journal))
         or journal.get("schema_version") != 2
         or journal.get("phase") not in {"prepared", "swapping", "committed", "complete", "rolled_back"}
         or journal.get("recovery") not in {"restore-old", "finish-new"}
@@ -3180,6 +3515,8 @@ def _update_journal(tx_root: Path) -> dict[str, Any]:
         raise AppDockError("update transaction is invalid")
     if not isinstance(journal["identity"], dict):
         raise AppDockError("update transaction identity is invalid")
+    if "old_identity" in journal and journal["old_identity"] is not None:
+        _validate_old_tree_identity(journal["old_identity"])
     if journal["phase"] in {"prepared", "swapping", "rolled_back"} and journal["recovery"] != "restore-old":
         raise AppDockError("update transaction recovery phase is invalid")
     if journal["phase"] in {"committed", "complete"} and journal["recovery"] != "finish-new":
@@ -3209,7 +3546,10 @@ def _transaction_paths(install: Path, data: Path, operation_id: str) -> dict[str
     candidate = install.parent / f".{install.name}.appdock-{operation_id}.candidate"
     backup = install.parent / f".{install.name}.appdock-{operation_id}.backup"
     evidence_backup = data / "updates" / "backups" / operation_id
-    for path in (tx_root, candidate, backup, evidence_backup):
+    history = data / "updates" / "history" / operation_id
+    restore_temp = tx_root / "restore-old-temp"
+    restore_quarantine = tx_root / "current-install-before-restore"
+    for path in (tx_root, candidate, backup, evidence_backup, history, restore_temp, restore_quarantine):
         _assert_no_link_or_reparse_ancestor(path)
     return {
         "tx_root": tx_root,
@@ -3218,6 +3558,9 @@ def _transaction_paths(install: Path, data: Path, operation_id: str) -> dict[str
         "candidate": candidate,
         "backup": backup,
         "evidence_backup": evidence_backup,
+        "history": history,
+        "restore_temp": restore_temp,
+        "restore_quarantine": restore_quarantine,
     }
 
 
@@ -3241,7 +3584,7 @@ def _validated_transaction_context(tx_root: Path, install: Path, data: Path) -> 
         raise AppDockError("update transaction candidate path is invalid")
     if _lexical_path_key(journal["backup"]) != _lexical_path_key(derived["backup"]):
         raise AppDockError("update transaction backup path is invalid")
-    for name in ("candidate", "backup"):
+    for name in ("candidate", "backup", "evidence_backup", "restore_temp", "restore_quarantine"):
         path = derived[name]
         _assert_no_link_or_reparse_ancestor(path)
         if path.exists() and (not path.is_dir() or _is_link_or_reparse(path)):
@@ -3249,10 +3592,83 @@ def _validated_transaction_context(tx_root: Path, install: Path, data: Path) -> 
     return {**derived, "journal_data": journal}
 
 
-def _set_update_phase(tx_root: Path, journal: dict[str, Any], phase: str, recovery: str) -> None:
-    journal["phase"] = phase
-    journal["recovery"] = recovery
-    _durable_write_json(tx_root / "transaction.json", journal)
+def _set_update_phase(tx_root: Path, journal: dict[str, Any], phase: str, recovery: str, *, strict: bool = False) -> None:
+    next_journal = {**journal, "phase": phase, "recovery": recovery}
+    if strict:
+        try:
+            _durable_write_json_strict(tx_root / "transaction.json", next_journal)
+        except BaseException:
+            # A replacement may have happened before the parent flush failed.
+            # Restore the previous journal bytes so retry cannot observe a
+            # terminal phase that was never durably authorized.
+            try:
+                _durable_write_json(tx_root / "transaction.json", journal)
+            except BaseException:
+                pass
+            raise
+    else:
+        _durable_write_json(tx_root / "transaction.json", next_journal)
+    journal.clear()
+    journal.update(next_journal)
+
+
+def _bounded_exception_metadata(failure: BaseException | None) -> tuple[str | None, int | None, int | None]:
+    if failure is None:
+        return None, None, None
+    try:
+        exception_type = type(failure).__name__
+    except BaseException:
+        exception_type = "Exception"
+    if type(exception_type) is not str or not 1 <= len(exception_type) <= 128 or not all(
+        character in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-" for character in exception_type
+    ):
+        exception_type = "Exception"
+    try:
+        errno = getattr(failure, "errno", None)
+    except BaseException:
+        errno = None
+    try:
+        winerror = getattr(failure, "winerror", None)
+    except BaseException:
+        winerror = None
+    if type(errno) is not int or not 0 <= errno <= 0xFFFFFFFF:
+        errno = None
+    if type(winerror) is not int or not 0 <= winerror <= 0xFFFFFFFF:
+        winerror = None
+    return exception_type, errno, winerror
+
+
+def _update_failure_evidence(
+    tx_root: Path,
+    journal: dict[str, Any],
+    *,
+    phase: str,
+    failing_operation: str,
+    failure: BaseException,
+    rollback_phase: str,
+    rollback_outcome: str,
+    rollback_failure: BaseException | None = None,
+) -> None:
+    exception_type, errno, winerror = _bounded_exception_metadata(failure)
+    rollback_failure_type, rollback_failure_errno, rollback_failure_winerror = _bounded_exception_metadata(rollback_failure)
+    _durable_write_json_strict(
+        tx_root / "failure.json",
+        {
+            "schema_version": 1,
+            "operation_id": journal["operation_id"],
+            "phase": phase,
+            "failing_operation": failing_operation,
+            "exception_type": exception_type,
+            "errno": errno,
+            "winerror": winerror,
+            "target_identity_digest": _digest(journal["identity"]),
+            "rollback_phase": rollback_phase,
+            "rollback_outcome": rollback_outcome,
+            "rollback_failure_type": rollback_failure_type,
+            "rollback_failure_errno": rollback_failure_errno,
+            "rollback_failure_winerror": rollback_failure_winerror,
+        },
+    )
 
 
 def _copy_release_tree(source: Path, destination: Path) -> None:
@@ -3343,49 +3759,340 @@ def _validate_installed_tree(install: Path) -> tuple[dict[str, str], list[str]]:
     return inventory, sorted(extras)
 
 
-def _recover_one_update(tx_root: Path, *, install: Path, data: Path, phase_hook: Callable[[str], None] | None = None) -> str:
+def _installed_tree_identity(install: Path) -> dict[str, Any]:
+    inventory, generated = _validate_installed_tree(install)
+    if not inventory or "appdock.py" not in inventory:
+        raise AppDockError("managed installation is empty or missing AppDock")
+    records = [
+        {
+            "path": relative,
+            "sha256": digest,
+            "size": len(_read_regular_single_link(_release_path(install, relative), MAX_UPDATE_UNCOMPRESSED_BYTES)),
+        }
+        for relative, digest in sorted(inventory.items())
+    ]
+    manifest_sha256: str | None = None
+    manifest = install / RELEASE_MANIFEST_NAME
+    if manifest.exists():
+        manifest_sha256 = hashlib.sha256(_read_regular_single_link(manifest, MAX_UPDATE_UNCOMPRESSED_BYTES)).hexdigest()
+    return {
+        "inventory_sha256": hashlib.sha256(_canonical_json(records)).hexdigest(),
+        "inventory": records,
+        "generated": sorted(generated),
+        "manifest_sha256": manifest_sha256,
+    }
+
+
+def _validate_old_tree_identity(identity: Any) -> dict[str, Any]:
+    required = {"inventory_sha256", "inventory", "generated", "manifest_sha256"}
+    if not isinstance(identity, dict) or set(identity) != required:
+        raise AppDockError("update old installation identity is invalid")
+    if not isinstance(identity["inventory_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", identity["inventory_sha256"]):
+        raise AppDockError("update old installation identity is invalid")
+    records = identity["inventory"]
+    if not isinstance(records, list) or not records:
+        raise AppDockError("update old installation identity is invalid")
+    previous = ""
+    normalized: list[dict[str, Any]] = []
+    for record in records:
+        if not isinstance(record, dict) or set(record) != {"path", "sha256", "size"}:
+            raise AppDockError("update old installation identity is invalid")
+        relative, digest, size = record["path"], record["sha256"], record["size"]
+        if (
+            not isinstance(relative, str) or relative <= previous or "\\" in relative
+            or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
+            or type(size) is not int or size < 0
+        ):
+            raise AppDockError("update old installation identity is invalid")
+        try:
+            _assert_zip_member(relative, zipfile.ZipInfo(relative))
+        except AppDockError as exc:
+            raise AppDockError("update old installation identity is invalid") from exc
+        previous = relative
+        normalized.append({"path": relative, "sha256": digest, "size": size})
+    if "appdock.py" not in {record["path"] for record in normalized}:
+        raise AppDockError("update old installation identity is invalid")
+    generated = identity["generated"]
+    if not isinstance(generated, list) or any(
+        not isinstance(item, str) or not item or "\\" in item
+        or Path(item).is_absolute() or any(part in {"", ".", ".."} for part in PurePosixPath(item).parts)
+        for item in generated
+    ) or generated != sorted(set(generated)):
+        raise AppDockError("update old installation identity is invalid")
+    manifest_sha256 = identity["manifest_sha256"]
+    if manifest_sha256 is not None and (not isinstance(manifest_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", manifest_sha256)):
+        raise AppDockError("update old installation identity is invalid")
+    if hashlib.sha256(_canonical_json(normalized)).hexdigest() != identity["inventory_sha256"]:
+        raise AppDockError("update old installation identity is invalid")
+    return {
+        "inventory_sha256": identity["inventory_sha256"],
+        "inventory": normalized,
+        "generated": list(generated),
+        "manifest_sha256": manifest_sha256,
+    }
+
+
+def _verify_old_tree_identity(install: Path, identity: Any) -> None:
+    expected = _validate_old_tree_identity(identity)
+    actual = _installed_tree_identity(install)
+    if actual != expected:
+        raise AppDockError("managed installation does not match its recorded rollback identity")
+
+
+def _validated_old_tree_source(source: Path) -> dict[str, Any]:
+    if not source.is_dir() or _is_link_or_reparse(source):
+        raise AppDockError("update backup is missing during recovery")
+    try:
+        return _installed_tree_identity(source)
+    except AppDockError as exc:
+        if str(exc) == "managed installation is empty or missing AppDock":
+            raise AppDockError("update backup is missing during recovery") from exc
+        raise
+
+
+def _best_effort_update_cleanup(*paths: Path) -> None:
+    for path in paths:
+        try:
+            _remove_tree(path, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _retire_authorized_rollback_for_restart(
+    install: Path,
+    data: Path,
+    operation_id: Any,
+    recovery_outcome: Any,
+    *,
+    validation_hook: Callable[[], None] | None = None,
+) -> bool:
+    """Move one exact rollback record out of the active set by bound handle."""
+    if type(operation_id) is not str or not UPDATE_OPERATION_ID_RE.fullmatch(operation_id) or recovery_outcome != "rolled_back":
+        return False
+    try:
+        paths = _transaction_paths(install, data, operation_id)
+        context = _validated_transaction_context(paths["tx_root"], install, data)
+        history_root = _update_history_root(data)
+        archive = history_root / operation_id
+        if not _inside(archive, history_root) or archive == history_root:
+            return False
+        if archive.exists() or _is_link_or_reparse(archive):
+            return False
+        if not context["tx_root"].is_dir() or _is_link_or_reparse(context["tx_root"]):
+            return False
+
+        def validate_final_state() -> None:
+            refreshed = _validated_transaction_context(paths["tx_root"], install, data)
+            journal = refreshed["journal_data"]
+            if (
+                journal.get("operation_id") != operation_id
+                or journal.get("phase") != "rolled_back"
+                or journal.get("recovery") != "restore-old"
+                or journal.get("old_exists") is not True
+                or journal.get("old_identity") is None
+            ):
+                raise AppDockError("rollback retirement authorization is invalid")
+            _validate_old_tree_identity(journal["old_identity"])
+            # The installed directory is not being moved. Its own handle must
+            # remain live through the final identity check and the source move.
+            with _directory_handle_lease(refreshed["install"]):
+                _verify_old_tree_identity(refreshed["install"], journal["old_identity"])
+                if validation_hook is not None:
+                    validation_hook()
+
+        _bound_directory_move(paths["tx_root"], archive, validator=validate_final_state)
+    except (AppDockError, OSError, ValueError, TypeError):
+        return False
+    return True
+
+
+def _recover_one_update_unleased(tx_root: Path, *, install: Path, data: Path, phase_hook: Callable[[str], None] | None = None) -> str:
     context = _validated_transaction_context(tx_root, install, data)
     journal = context["journal_data"]
-    if journal["phase"] in {"complete", "rolled_back"}:
+    if journal["phase"] == "complete":
         return journal["phase"]
     install = context["install"]
     candidate = context["candidate"]
     backup = context["backup"]
+    evidence_backup = context["evidence_backup"]
+    restore_temp = context["restore_temp"]
+    restore_quarantine = context["restore_quarantine"]
+    if journal["phase"] == "rolled_back":
+        old_identity = journal.get("old_identity")
+        if journal["old_exists"]:
+            if old_identity is None:
+                # Legacy terminal journals remain readable, but without an exact
+                # old-tree identity they cannot authorize destructive cleanup.
+                return "rolled_back"
+            if restore_quarantine.exists() and install.exists():
+                # A promotion may have completed and then failed while
+                # flushing the install parent.  If install is the exact old
+                # tree, quarantine is the displaced candidate and is safe to
+                # retire; mismatched bytes remain fail-closed.
+                with _directory_handle_lease(install):
+                    _verify_old_tree_identity(install, old_identity)
+                _remove_tree(restore_quarantine)
+            elif not install.exists() and restore_temp.exists():
+                if _installed_tree_identity(restore_temp) != _validate_old_tree_identity(old_identity):
+                    raise AppDockError("restore-old recovery has ambiguous restoration state")
+                _bound_directory_move(restore_temp, install, validator=lambda: _verify_old_tree_identity(restore_temp, old_identity))
+            with _directory_handle_lease(install):
+                _verify_old_tree_identity(install, old_identity)
+        elif install.exists() and restore_quarantine.exists():
+            raise AppDockError("restore-old recovery has ambiguous install quarantine state")
+        _best_effort_update_cleanup(candidate, evidence_backup, backup, restore_temp, restore_quarantine)
+        return "rolled_back"
     finish_new = journal["phase"] == "committed" or journal["recovery"] == "finish-new"
     if phase_hook:
         phase_hook("recovery:finish-new" if finish_new else "recovery:restore-old")
     if finish_new:
         if not install.exists() and candidate.is_dir():
-            _verify_identity_tree(candidate, journal["identity"], complete=False)
-            os.replace(candidate, install)
-            _fsync_directory(install.parent)
-        if install.exists():
-            _verify_identity_tree(install, journal["identity"], complete=False)
+            def validate_candidate_promotion(_source_handle: Any = None) -> None:
+                refreshed = _validated_transaction_context(tx_root, install, data)
+                refreshed_journal = refreshed["journal_data"]
+                if (
+                    refreshed_journal["phase"] != "committed"
+                    or refreshed_journal["recovery"] != "finish-new"
+                    or install.exists()
+                ):
+                    raise AppDockError("finish-new recovery state changed before promotion")
+                _verify_identity_tree(candidate, journal["identity"], complete=False)
+
+            _bound_directory_move(candidate, install, validator=validate_candidate_promotion)
+        if not install.exists() or not install.is_dir() or _is_link_or_reparse(install):
+            raise AppDockError("update recovery cannot finish-new without a verified installation")
+        _verify_identity_tree(install, journal["identity"], complete=False)
         _validate_installed_tree(install)
+        # Terminal authorization is durable before any source cleanup. If the
+        # strict write or its parent flush fails, these sources remain available
+        # for a retry and this function raises without claiming completion.
+        _set_update_phase(context["tx_root"], journal, "complete", "finish-new", strict=True)
         if backup.exists():
             _remove_tree(backup)
         if candidate.exists():
             _remove_tree(candidate)
         _remove_tree(context["evidence_backup"], ignore_errors=True)
-        _set_update_phase(context["tx_root"], journal, "complete", "finish-new")
         return "complete"
     if journal["old_exists"]:
-        if backup.is_dir():
-            if install.exists():
-                _remove_tree(install)
-            os.replace(backup, install)
-            _fsync_directory(install.parent)
-        elif not install.is_dir():
+        if backup.exists():
+            restore_source = backup
+        elif evidence_backup.is_dir() and not _is_link_or_reparse(evidence_backup):
+            restore_source = evidence_backup
+        else:
             raise AppDockError("update backup is missing during recovery")
-        _validate_installed_tree(install)
+        backup_identity = _validated_old_tree_source(restore_source)
+        recorded_old_identity = journal.get("old_identity")
+        if (
+            recorded_old_identity is not None
+            and backup_identity != _validate_old_tree_identity(recorded_old_identity)
+        ):
+            raise AppDockError("update backup does not match its recorded rollback identity")
+
+        if install.exists() and restore_quarantine.exists():
+            # The promotion can be complete at the namespace level while its
+            # destination-parent flush fails.  An exact old install identity
+            # proves quarantine is the displaced candidate; otherwise this is
+            # still an ambiguous state and must remain blocked.
+            recorded_old_identity = journal.get("old_identity")
+            if recorded_old_identity is None or _installed_tree_identity(install) != _validate_old_tree_identity(recorded_old_identity):
+                raise AppDockError("restore-old recovery has ambiguous install quarantine state")
+            _remove_tree(restore_quarantine)
+        if install.exists():
+            if not install.is_dir() or _is_link_or_reparse(install):
+                raise AppDockError("managed installation root is unsafe")
+
+            def validate_current_install() -> None:
+                refreshed = _validated_transaction_context(tx_root, install, data)
+                if refreshed["journal_data"]["phase"] not in {"prepared", "swapping"} or refreshed["journal_data"]["recovery"] != "restore-old":
+                    raise AppDockError("restore-old recovery journal changed before quarantine")
+                _validate_installed_tree(install)
+
+            _bound_directory_move(install, restore_quarantine, validator=validate_current_install)
+
+        # The trusted source remains untouched until the independently copied
+        # restoration is promoted. A valid temp survives a crash between these
+        # two bound moves; a missing temp is rebuilt from the trusted source.
+        if restore_temp.exists():
+            try:
+                restored_identity = _installed_tree_identity(restore_temp)
+            except AppDockError:
+                _remove_tree(restore_temp)
+                restored_identity = None
+            if restored_identity is not None and restored_identity != backup_identity:
+                _remove_tree(restore_temp)
+                restored_identity = None
+        else:
+            restored_identity = None
+        if restored_identity is None:
+            _copy_release_tree(restore_source, restore_temp)
+            restored_identity = _installed_tree_identity(restore_temp)
+        if restored_identity != backup_identity:
+            raise AppDockError("restored installation does not match its validated backup")
+        if phase_hook:
+            phase_hook("before-promote-restore")
+
+        def validate_restore_promotion() -> None:
+            refreshed = _validated_transaction_context(tx_root, install, data)
+            refreshed_journal = refreshed["journal_data"]
+            if (
+                refreshed_journal["phase"] not in {"prepared", "swapping"}
+                or refreshed_journal["recovery"] != "restore-old"
+                or install.exists()
+            ):
+                raise AppDockError("restore-old recovery state changed before promotion")
+            if _installed_tree_identity(restore_temp) != backup_identity:
+                raise AppDockError("restore temp changed before promotion")
+
+        _bound_directory_move(restore_temp, install, validator=validate_restore_promotion)
+        with _directory_handle_lease(install):
+            installed_identity = _installed_tree_identity(install)
+        if installed_identity != backup_identity:
+            raise AppDockError("restored installation does not match its validated backup")
     elif install.exists():
-        _remove_tree(install)
-    if candidate.exists():
-        _verify_identity_tree(candidate, journal["identity"], complete=False)
-        _remove_tree(candidate)
-    _remove_tree(context["evidence_backup"], ignore_errors=True)
-    _set_update_phase(context["tx_root"], journal, "rolled_back", "restore-old")
+        if restore_quarantine.exists():
+            raise AppDockError("restore-old recovery has ambiguous install quarantine state")
+
+        def validate_unexpected_install() -> None:
+            refreshed = _validated_transaction_context(tx_root, install, data)
+            if refreshed["journal_data"]["phase"] not in {"prepared", "swapping"} or refreshed["journal_data"]["recovery"] != "restore-old":
+                raise AppDockError("restore-old recovery journal changed before quarantine")
+            if not install.is_dir() or _is_link_or_reparse(install):
+                raise AppDockError("managed installation root is unsafe")
+
+        _bound_directory_move(install, restore_quarantine, validator=validate_unexpected_install)
+    # The restored install is validated against the pre-swap source. The
+    # journal is the authorization boundary; cleanup must never precede it.
+    try:
+        _set_update_phase(context["tx_root"], journal, "rolled_back", "restore-old", strict=True)
+    except BaseException:
+        # If the terminal journal write fails after promotion, put the exact
+        # promoted tree back into the restoration slot. This leaves install
+        # absent and quarantine intact, so retry has one unambiguous path.
+        if install.exists() and not restore_temp.exists():
+            try:
+                def validate_uncommitted_promotion() -> None:
+                    refreshed = _validated_transaction_context(tx_root, install, data)
+                    if refreshed["journal_data"]["phase"] not in {"prepared", "swapping"}:
+                        raise AppDockError("restore-old recovery journal changed during retry preparation")
+                    if _installed_tree_identity(install) != backup_identity:
+                        raise AppDockError("promoted restore changed before retry preparation")
+
+                _bound_directory_move(install, restore_temp, validator=validate_uncommitted_promotion)
+            except BaseException:
+                pass
+        raise
+    _best_effort_update_cleanup(candidate, evidence_backup, backup, restore_temp, restore_quarantine)
     return "rolled_back"
+
+
+def _recover_one_update(tx_root: Path, *, install: Path, data: Path, phase_hook: Callable[[str], None] | None = None) -> str:
+    """Recover one transaction while its complete directory ancestry is leased."""
+    preflight = _validated_transaction_context(tx_root, install, data)
+    lease_paths = tuple(preflight[name] for name in ("tx_root", "install", "candidate", "backup", "evidence_backup", "restore_temp", "restore_quarantine"))
+    with _directory_ancestry_lease(*lease_paths):
+        # The pre-lease context is only a locator. Every journal/path/identity
+        # check in the destructive implementation runs again under the lease.
+        return _recover_one_update_unleased(tx_root, install=install, data=data, phase_hook=phase_hook)
 
 
 @_locked_transaction(0)
@@ -3452,6 +4159,7 @@ def apply_update(
         _verify_identity_tree(staged, target_identity, complete=True)
     target_inventory = {record["path"]: record["sha256"] for record in target_identity["inventory"]}
     current_inventory, generated = _validate_installed_tree(install)
+    old_identity = _installed_tree_identity(install) if install.exists() else None
     target_files = {*target_inventory, RELEASE_MANIFEST_NAME}
     current_files = set(current_inventory)
     if (install / RELEASE_MANIFEST_NAME).exists():
@@ -3472,9 +4180,47 @@ def apply_update(
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     _safe_backup_copy(path, destination)
     except Exception as exc:
-        _remove_tree(evidence_backup, ignore_errors=True)
-        _remove_tree(tx_root, ignore_errors=True)
-        raise AppDockError("update backup failed; installation was not changed") from exc
+        # A pre-swap backup failure still gets an exact, durable rollback
+        # record. This preserves the old restart handoff without treating an
+        # arbitrary apply exception as authorization.
+        journal = {
+            "schema_version": 2,
+            "operation_id": operation_id,
+            "install": str(install),
+            "candidate": str(paths["candidate"]),
+            "backup": str(paths["backup"]),
+            "old_exists": install.exists(),
+            "phase": "prepared",
+            "recovery": "restore-old",
+            "files": affected,
+            "preexisting": sorted(current_files),
+            "identity": target_identity,
+            "old_identity": old_identity,
+        }
+        try:
+            _durable_write_json(tx_root / "transaction.json", journal)
+            _set_update_phase(tx_root, journal, "rolled_back", "restore-old", strict=True)
+        except BaseException:
+            raise AppDockError("update backup failed; installation was not changed") from None
+        outcome = "rolled_back"
+        try:
+            _update_failure_evidence(
+                tx_root,
+                journal,
+                phase="prepared",
+                failing_operation="backup-installation",
+                failure=exc,
+                rollback_phase="restore-old",
+                rollback_outcome=outcome,
+            )
+        except BaseException:
+            outcome = "unknown"
+        _best_effort_update_cleanup(evidence_backup, paths["candidate"], paths["backup"], paths["restore_temp"])
+        raise UpdateApplyError(
+            "update backup failed; installation was not changed",
+            operation_id=operation_id,
+            recovery_outcome=outcome,
+        ) from None
     candidate = paths["candidate"]
     backup = paths["backup"]
     if candidate.exists() or backup.exists():
@@ -3504,6 +4250,7 @@ def apply_update(
         "files": affected,
         "preexisting": sorted(current_files),
         "identity": target_identity,
+        "old_identity": old_identity,
     }
     _durable_write_json(tx_root / "transaction.json", journal)
     if phase_hook:
@@ -3516,31 +4263,141 @@ def apply_update(
         "identity": target_identity,
         "transaction": str(tx_root / "transaction.json"),
     }
+    failing_operation = "persist-swapping-phase"
     try:
         _set_update_phase(tx_root, journal, "swapping", "restore-old")
         if install.exists():
-            os.replace(install, backup)
-            _fsync_directory(install.parent)
+            failing_operation = "replace-install-with-backup"
+
+            def validate_install_source(_source_handle: Any = None) -> None:
+                refreshed = _validated_transaction_context(tx_root, install, data)
+                refreshed_journal = refreshed["journal_data"]
+                if (
+                    refreshed_journal["phase"] != "swapping"
+                    or refreshed_journal["recovery"] != "restore-old"
+                    or refreshed_journal["operation_id"] != operation_id
+                    or backup.exists()
+                ):
+                    raise AppDockError("update transaction changed before backing up installation")
+                if not install.is_dir() or _is_link_or_reparse(install):
+                    raise AppDockError("managed installation root is unsafe")
+                if old_identity is not None:
+                    _verify_old_tree_identity(install, old_identity)
+
+            _bound_directory_move(install, backup, validator=validate_install_source)
         if phase_hook:
             phase_hook("after-backup")
-        os.replace(candidate, install)
-        _fsync_directory(install.parent)
+        failing_operation = "replace-candidate-with-install"
+
+        def validate_candidate_source(_source_handle: Any = None) -> None:
+            refreshed = _validated_transaction_context(tx_root, install, data)
+            refreshed_journal = refreshed["journal_data"]
+            if (
+                refreshed_journal["phase"] != "swapping"
+                or refreshed_journal["recovery"] != "restore-old"
+                or refreshed_journal["operation_id"] != operation_id
+                or install.exists()
+            ):
+                raise AppDockError("update transaction changed before activating candidate")
+            _verify_identity_tree(candidate, target_identity, complete=False)
+
+        _bound_directory_move(candidate, install, validator=validate_candidate_source)
         if phase_hook:
             phase_hook("after-activate")
+        failing_operation = "validate-activated-install"
         _validate_installed_tree(install)
         if phase_hook:
             phase_hook("before-commit")
+        failing_operation = "persist-committed-phase"
         _set_update_phase(tx_root, journal, "committed", "finish-new")
         if phase_hook:
             phase_hook("after-commit")
         if restart:
+            failing_operation = "restart-callback"
             restart()
+            failing_operation = "finalize-update"
             finalize_update(result, install, data)
     except BaseException as exc:
-        _recover_one_update(tx_root, install=install, data=data)
+        # Capture the transaction state at the failure boundary. Recovery can
+        # legitimately move a committed transaction to complete, but that is
+        # not a rollback and must not be reported as one.
+        failure_journal = dict(journal)
+        try:
+            persisted_journal = _update_journal(tx_root)
+        except BaseException:
+            persisted_journal = None
+        if isinstance(persisted_journal, dict):
+            failure_journal = persisted_journal
+        failure_phase = failure_journal.get("phase", "unknown")
+        rollback_error: BaseException | None = None
+        recovery_phase = "finish-new" if (
+            failure_journal.get("phase") == "committed" or failure_journal.get("recovery") == "finish-new"
+        ) else "restore-old"
+        rollback_outcome = "failed"
+        try:
+            recovery_result = _recover_one_update(tx_root, install=install, data=data)
+        except BaseException as recovery_exc:
+            rollback_error = recovery_exc
+        else:
+            if recovery_result == "rolled_back":
+                rollback_outcome = "rolled_back"
+            elif recovery_result in {"complete", "finish-new"}:
+                rollback_outcome = "complete"
+            else:
+                rollback_error = AppDockError("update recovery returned an unknown outcome")
+        evidence_persistence_failed = False
+        evidence_control_failure: BaseException | None = None
+        try:
+            _update_failure_evidence(
+                tx_root,
+                failure_journal,
+                phase=failure_phase,
+                failing_operation=failing_operation,
+                failure=exc,
+                rollback_phase=recovery_phase,
+                rollback_outcome=rollback_outcome,
+                rollback_failure=rollback_error,
+            )
+        except (KeyboardInterrupt, SystemExit) as captured_control_failure:
+            evidence_control_failure = captured_control_failure
+        except BaseException:
+            evidence_persistence_failed = True
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise
-        raise AppDockError("update failed and was rolled back") from exc
+        if isinstance(rollback_error, (KeyboardInterrupt, SystemExit)):
+            raise rollback_error
+        if evidence_control_failure is not None:
+            raise evidence_control_failure
+        operation_id_for_error = failure_journal.get("operation_id") if isinstance(failure_journal, dict) else None
+        if evidence_persistence_failed:
+            raise UpdateApplyError(
+                "update failed and failure evidence could not be persisted",
+                operation_id=operation_id_for_error,
+                recovery_outcome="unknown",
+            ) from None
+        if rollback_error is not None:
+            raise UpdateApplyError(
+                "update failed and recovery did not complete",
+                operation_id=operation_id_for_error,
+                recovery_outcome="unknown",
+            ) from None
+        if rollback_outcome == "rolled_back":
+            raise UpdateApplyError(
+                "update failed and was rolled back",
+                operation_id=operation_id_for_error,
+                recovery_outcome="rolled_back",
+            ) from None
+        if rollback_outcome == "complete":
+            raise UpdateApplyError(
+                "update failed after commit; recovery completed",
+                operation_id=operation_id_for_error,
+                recovery_outcome="complete",
+            ) from None
+        raise UpdateApplyError(
+            "update failed and recovery did not complete",
+            operation_id=operation_id_for_error,
+            recovery_outcome="unknown",
+        ) from None
     return result
 
 
@@ -3560,7 +4417,13 @@ def finalize_update(applied: dict[str, Any], install_dir: str | Path, data_dir: 
 
 
 @_locked_transaction(2)
-def rollback_update(applied: dict[str, Any], install_dir: str | Path, data_dir: str | Path) -> None:
+def rollback_update(
+    applied: dict[str, Any],
+    install_dir: str | Path,
+    data_dir: str | Path,
+    *,
+    failure: BaseException | None = None,
+) -> None:
     install, data = _validated_update_roots(install_dir, data_dir)
     transaction_raw = applied.get("transaction")
     if isinstance(transaction_raw, str) and transaction_raw:
@@ -3573,12 +4436,25 @@ def rollback_update(applied: dict[str, Any], install_dir: str | Path, data_dir: 
         if _lexical_path_key(transaction) != _lexical_path_key(context["journal"]):
             raise AppDockError("update transaction path is invalid")
         journal = context["journal_data"]
+        failure_journal = dict(journal)
         if journal["phase"] == "complete":
             raise AppDockError("finalized update can no longer be rolled back automatically")
         journal["phase"] = "swapping"
         journal["recovery"] = "restore-old"
         _durable_write_json(context["journal"], journal)
-        _recover_one_update(tx_root, install=install, data=data)
+        outcome = _recover_one_update(tx_root, install=install, data=data)
+        if outcome != "rolled_back":
+            raise AppDockError("update rollback did not reach a trusted terminal state")
+        if failure is not None:
+            _update_failure_evidence(
+                tx_root,
+                failure_journal,
+                phase=str(failure_journal.get("phase", "unknown")),
+                failing_operation="restart-readiness-or-finalize",
+                failure=failure,
+                rollback_phase="restore-old",
+                rollback_outcome=outcome,
+            )
         return
     # Compatibility for pre-v0.1.1 in-memory results retained for focused rollback tests.
     backup = Path(str(applied.get("backup") or "")).expanduser().absolute()
@@ -3611,6 +4487,39 @@ def rollback_update(applied: dict[str, Any], install_dir: str | Path, data_dir: 
 def _is_development_checkout(install_dir: Path) -> bool:
     root = install_dir.expanduser().resolve()
     return any((candidate / ".git").exists() for candidate in (root, *root.parents))
+
+
+def _trusted_update_helper_cwd(install: Path, staged: Path, data: Path) -> Path:
+    """Choose a stable directory that is not part of the update swap."""
+    cwd = Path(install.anchor or install.parent.anchor or install.parent).expanduser().absolute()
+    mutable_roots = (
+        install,
+        staged,
+        data,
+        data / "updates",
+        data / "updates" / "transactions",
+        data / "updates" / "backups",
+    )
+    _assert_no_link_or_reparse_ancestor(cwd)
+    if not cwd.is_dir() or _is_link_or_reparse(cwd):
+        raise AppDockError("could not establish a trusted updater working directory")
+    if any(_inside(cwd, root) for root in mutable_roots):
+        raise AppDockError("could not establish a trusted updater working directory")
+    return cwd
+
+
+def _validate_parent_restart_script(install: Path, restart_script: str | Path) -> Path:
+    """Bind the parent restart target to the exact installed entrypoint."""
+    install = Path(install).expanduser().absolute()
+    expected = (install / "appdock.py").absolute()
+    candidate = Path(restart_script).expanduser().absolute()
+    for path in (install, expected, candidate):
+        _assert_no_link_or_reparse_ancestor(path)
+    if not expected.is_file() or _is_link_or_reparse(expected):
+        raise AppDockError("restart script is not the installed AppDock entrypoint")
+    if os.path.normcase(str(candidate)) != os.path.normcase(str(expected)):
+        raise AppDockError("restart script is not the installed AppDock entrypoint")
+    return expected
 
 
 def launch_update_helper(
@@ -3654,6 +4563,7 @@ def launch_update_helper(
             identity = identity_claim
     if hashlib.sha256(_read_regular_single_link(helper, MAX_UPDATE_UNCOMPRESSED_BYTES)).hexdigest() != identity["helper_sha256"]:
         raise AppDockError("staged update helper checksum does not match its identity")
+    helper_cwd = _trusted_update_helper_cwd(install, staged, data)
     if claimed_record is not None:
         # The stage is user-writable after staging. Revalidate the complete
         # receipt/tree a second time immediately before constructing Popen.
@@ -3662,6 +4572,11 @@ def launch_update_helper(
     command = [sys.executable, str(install / "appdock.py"), *list(restart_args)] if restart_command is None else restart_command
     if not isinstance(command, list) or not command or not all(isinstance(item, str) and item for item in command):
         raise AppDockError("restart command is invalid")
+    if command[0] != sys.executable:
+        raise AppDockError("restart command must use the configured Python executable")
+    if len(command) < 2:
+        raise AppDockError("restart script is missing")
+    restart_script = _validate_parent_restart_script(install, command[1])
     helper_command = [
         sys.executable,
         "-B",
@@ -3670,7 +4585,7 @@ def launch_update_helper(
         "--install", str(install),
         "--data", str(data),
         "--pid", str(current_pid if current_pid is not None else os.getpid()),
-        "--restart-script", command[1] if len(command) > 1 else str(install / "appdock.py"),
+        "--restart-script", str(restart_script),
     ]
     handshake = data / "runtime" / f"update-helper-{uuid.uuid4().hex}.ready"
     handshake_token = secrets.token_urlsafe(32)
@@ -3685,13 +4600,12 @@ def launch_update_helper(
             "--expected-inventory-sha256", identity["inventory_sha256"],
             "--expected-helper-sha256", identity["helper_sha256"],
         ])
-    if command and command[0] != sys.executable:
-        raise AppDockError("restart command must use the configured Python executable")
+
     for argument in command[2:]:
         helper_command.append(f"--restart-arg={argument}")
     runner = popen or subprocess.Popen
     try:
-        process = runner(helper_command, shell=False, close_fds=True)
+        process = runner(helper_command, shell=False, close_fds=True, cwd=str(helper_cwd))
     except OSError as exc:
         raise AppDockError("could not launch update helper") from exc
     deadline = time.monotonic() + 5
@@ -4159,7 +5073,11 @@ def main() -> None:
     parser.add_argument("--data-dir", default=None)
     parser.add_argument("--ready-token", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--update-helper-startup", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--bound-directory-move", nargs=2, metavar=("SOURCE", "DESTINATION"), help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.bound_directory_move is not None:
+        _bound_directory_move(Path(args.bound_directory_move[0]), Path(args.bound_directory_move[1]))
+        return
     validate_bind_host(args.host)
     if args.ready_token is not None and not re.fullmatch(r"[A-Za-z0-9_-]{20,128}", args.ready_token):
         parser.error("invalid readiness token")

@@ -116,9 +116,9 @@ class UpdateRestartHandoffRegressionTests(unittest.TestCase):
 
             self.assertEqual(result, 1)
             rollback.assert_called_once()
-            self.assertEqual(launches, [(True, True), (False, False)])
+            self.assertEqual(launches, [(True, True)])
             self.assertTrue(any("previous program files restored" in item for item in logs))
-            self.assertTrue(any("after updater lock release" in item for item in logs))
+            self.assertTrue(any("exact durable rollback" in item for item in logs))
 
     def test_preapply_restore_uses_normal_startup_without_handoff(self):
         with tempfile.TemporaryDirectory() as td:
@@ -263,9 +263,9 @@ class UpdateRestartHandoffRegressionTests(unittest.TestCase):
                 )
 
             self.assertEqual(result, 1)
-            self.assertEqual(validate.call_count, 2)
+            self.assertEqual(validate.call_count, 1)
             launch.assert_not_called()
-            self.assertTrue(any("restored installation did not pass validation" in item for item in logs))
+            self.assertTrue(any("exact durable rollback" in item for item in logs))
 
 
 if __name__ == "__main__":

@@ -4,6 +4,22 @@ All notable changes to AppDock are documented here. The project follows Semantic
 
 ## [Unreleased]
 
+## [0.2.2-beta.3] - 2026-08-19
+
+### Fixed
+
+- Launch the external Windows update helper from an explicit trusted filesystem root outside every installation, staging, data, backup, candidate, and transaction tree, preventing an inherited installation-root working directory from blocking the atomic directory swap with `WinError 32`.
+- Fail closed before mutation if the helper's effective working directory overlaps a mutable update tree, and preserve bounded transaction-local causal evidence for a failed swap while keeping the public rollback error path sanitized.
+- Bind restore-old recovery and relaunch to the transaction's exact pre-swap byte identity, persist terminal rollback state before cleanup, and atomically archive compatible rollback evidence outside the active transaction set before restarting an older AppDock runtime.
+- Flush rollback-retirement parent directories through writable Windows directory handles and refuse relaunch if the move or durability flush cannot be proven.
+- Treat a completed restore promotion whose destination-parent flush fails as retryable only when the installed bytes exactly match the recorded old identity; safely retire quarantine or re-promote the validated restore temp instead of rejecting the recovery as ambiguous.
+- Bind the parent restart script to the exact installed `install\\appdock.py` before creating the helper handshake or runtime state, and publish staged directories through the same handle-bound move contract used by updater tree swaps.
+
+### Verified
+
+- Added a real Windows parent → external helper → directory swap → candidate readiness → transaction finalization regression that begins with the parent working directory inside the disposable installation root, plus causal-evidence and unsafe-cwd rejection coverage.
+- Added real candidate-failure and post-readiness finalize-failure process proofs for exact v0.2.1 restoration, lock-release ordering, backward-compatible startup, single-listener ownership, and fail-closed recovery/retirement crash windows.
+
 ## [0.2.2-beta.2] - 2026-08-19
 
 ### Fixed

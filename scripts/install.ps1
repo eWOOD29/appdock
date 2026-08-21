@@ -88,15 +88,18 @@ if (Test-Path -LiteralPath $IncomingReleaseManifest -PathType Leaf) {
 }
 
 if ($PythonExe) {
+    $PythonVersionArgs = @()
     $ResolvedPython = (Resolve-Path $PythonExe).Path
     & $ResolvedPython --version | Out-Host
     if ($LASTEXITCODE -ne 0) { throw 'The selected Python interpreter did not start.' }
     $PythonLine = '"' + $ResolvedPython + '"'
 } else {
-    & py -3.11 --version | Out-Host
+    $ResolvedPython = (Get-Command py -ErrorAction Stop).Source
+    & $ResolvedPython -3.11 --version | Out-Host
     if ($LASTEXITCODE -ne 0) {
         throw 'Python 3.11+ was not found. Install Python, or pass -PythonExe with a full path.'
     }
+    $PythonVersionArgs = @('-3.11')
     $PythonLine = 'py -3.11'
 }
 
@@ -161,20 +164,23 @@ $PythonLine "$InstallDir\appdock.py" --host 127.0.0.1 --port 8765
             } | ForEach-Object {
                 Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
             }
-            Move-Item -LiteralPath $InstallDir -Destination $BackupDir
+            & $ResolvedPython @PythonVersionArgs -B (Join-Path $SourceRoot 'appdock.py') --bound-directory-move $InstallDir $BackupDir
+            if ($LASTEXITCODE -ne 0) { throw 'The bound installation backup move failed.' }
         } else {
             Remove-Item -LiteralPath $InstallDir -Force
         }
     }
 
     try {
-        Move-Item -LiteralPath $StageDir -Destination $InstallDir
+        & $ResolvedPython @PythonVersionArgs -B (Join-Path $SourceRoot 'appdock.py') --bound-directory-move $StageDir $InstallDir
+        if ($LASTEXITCODE -ne 0) { throw 'The bound staged installation move failed.' }
     } catch {
         if (Test-Path -LiteralPath $InstallDir) {
             Remove-Item -LiteralPath $InstallDir -Recurse -Force
         }
         if ((Test-Path -LiteralPath $BackupDir -PathType Container) -and -not (Test-Path -LiteralPath $InstallDir)) {
-            Move-Item -LiteralPath $BackupDir -Destination $InstallDir
+            & $ResolvedPython @PythonVersionArgs -B (Join-Path $SourceRoot 'appdock.py') --bound-directory-move $BackupDir $InstallDir
+            if ($LASTEXITCODE -ne 0) { throw 'The bound installation restore move failed.' }
         }
         throw
     }

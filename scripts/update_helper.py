@@ -19,7 +19,7 @@ from typing import Callable
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from appdock import AppDockError, AppDockConfig, _assert_no_link_or_reparse_ancestor, _clear_staged_receipt, _is_link_or_reparse, _read_staged_receipt, _remove_tree, _update_lock_path, _validate_installed_tree, _write_update_startup_handoff, acquire_update_lock, apply_update, finalize_update, recover_update_transactions, rollback_update  # noqa: E402
+from appdock import AppDockError, AppDockConfig, UpdateApplyError, _assert_no_link_or_reparse_ancestor, _clear_staged_receipt, _inside, _is_link_or_reparse, _read_staged_receipt, _remove_tree, _retire_authorized_rollback_for_restart, _update_lock_path, _validate_installed_tree, _write_update_startup_handoff, acquire_update_lock, apply_update, finalize_update, recover_update_transactions, rollback_update  # noqa: E402
 
 RESTART_READY_TIMEOUT_SECONDS = 20.0
 RESTART_STDOUT_LOG_NAME = "update-restart.stdout.log"
@@ -298,6 +298,37 @@ def _discard_stage(staged: Path, data: Path) -> None:
     _clear_staged_receipt(data, candidate)
 
 
+def _validate_effective_cwd(install: Path, staged: Path, data: Path) -> Path:
+    """Refuse to mutate any tree while the helper is rooted inside it."""
+    cwd = Path.cwd().expanduser().absolute()
+    mutable_roots = (
+        install,
+        staged,
+        install.parent,
+        data,
+        data / "updates",
+        data / "updates" / "transactions",
+        data / "updates" / "backups",
+    )
+    _assert_no_link_or_reparse_ancestor(cwd)
+    if not cwd.is_dir() or _is_link_or_reparse(cwd) or any(_inside(cwd, root) for root in mutable_roots):
+        raise AppDockError("could not establish a trusted updater working directory")
+    return cwd
+
+
+def _validate_bound_restart_script(install: Path, restart_script: Path) -> Path:
+    """Return only the exact lexical AppDock entry point for this install."""
+    install = Path(install).expanduser().absolute()
+    restart_script = Path(restart_script).expanduser().absolute()
+    expected = install / "appdock.py"
+    for path in (install, expected, restart_script):
+        _assert_no_link_or_reparse_ancestor(path)
+    normalize = lambda path: os.path.normcase(os.path.normpath(os.path.abspath(str(path))))
+    if normalize(restart_script) != normalize(expected):
+        raise AppDockError("restart script must be the exact install/appdock.py path")
+    return expected
+
+
 def _restart_data_dir(restart_args: list[str]) -> Path | None:
     for index, argument in enumerate(restart_args):
         if argument == "--data-dir" and index + 1 < len(restart_args):
@@ -368,6 +399,8 @@ def _launch_and_wait(
     ready_token: str | None = None,
     use_startup_handoff: bool = True,
 ) -> object:
+    install = Path(install).expanduser().absolute()
+    restart_script = _validate_bound_restart_script(install, restart_script)
     ready_token = ready_token or secrets.token_urlsafe(32)
     data = startup_data or _restart_data_dir(restart_args)
     startup_receipt = None
@@ -445,7 +478,11 @@ def run(
     expected_inventory_sha256: str | None = None,
     expected_helper_sha256: str | None = None,
 ) -> int:
+    staged = staged.expanduser().absolute()
+    install = install.expanduser().absolute()
     data = data.expanduser().absolute()
+    restart_script = _validate_bound_restart_script(install, restart_script)
+    _validate_effective_cwd(install, staged, data)
     _update_lock_path(data)
     log_path = data / "runtime" / "update.log"
 
@@ -481,9 +518,11 @@ def run(
 
     failure: Exception | None = None
     restore_after_unlock = False
-    restore_success_message = ""
-    restore_failure_prefix = ""
+    restore_success_message = "existing AppDock restarted after updater lock release"
+    restore_failure_prefix = "existing AppDock restart after updater lock release failed"
     discard_failed_stage = False
+    rollback_authorization: tuple[str | None, str] | None = None
+    rollback_retired = False
     try:
         with acquire_update_lock(data):
             try:
@@ -506,9 +545,21 @@ def run(
                 except Exception as exc:
                     failure = exc
                     restore_after_unlock = True
-                    restore_success_message = "existing AppDock restarted after updater lock release"
-                    restore_failure_prefix = "existing AppDock restart after updater lock release failed"
-                    discard_failed_stage = True
+                    if type(exc) is UpdateApplyError:
+                        rollback_authorization = (exc.operation_id, exc.recovery_outcome)
+                        rollback_retired = _retire_authorized_rollback_for_restart(
+                            install,
+                            data,
+                            exc.operation_id,
+                            exc.recovery_outcome,
+                        )
+                        restore_success_message = "existing AppDock restarted after updater lock release"
+                        restore_failure_prefix = "existing AppDock restart after updater lock release failed"
+                    else:
+                        log(
+                            "update apply failed without a trusted recovery outcome; "
+                            "existing AppDock will remain stopped"
+                        )
                 else:
                     log(f"update applied: {result['files']}")
                     log("restarting AppDock with a fixed argument list")
@@ -520,7 +571,7 @@ def run(
                         if restarted is not None:
                             _stop_restarted_process(restarted)
                         try:
-                            rollback_update(result, install, data)
+                            rollback_update(result, install, data, failure=restart_exc)
                         except Exception as rollback_exc:
                             failure = rollback_exc
                             log(f"restart readiness failed and rollback failed: {rollback_exc}")
@@ -530,6 +581,16 @@ def run(
                             restore_after_unlock = True
                             restore_success_message = "restored AppDock restarted successfully after updater lock release"
                             restore_failure_prefix = "restored AppDock restart after updater lock release failed"
+                            transaction_path = result.get("transaction") if isinstance(result, dict) else None
+                            transaction_parent = Path(str(transaction_path)).parent if transaction_path else None
+                            operation_id = transaction_parent.name if transaction_parent is not None else None
+                            rollback_authorization = (operation_id, "rolled_back")
+                            rollback_retired = _retire_authorized_rollback_for_restart(
+                                install,
+                                data,
+                                operation_id,
+                                "rolled_back",
+                            )
                             discard_failed_stage = True
                     else:
                         _discard_stage(staged, data)
@@ -545,14 +606,13 @@ def run(
         return 1
 
     if restore_after_unlock:
-        try:
-            _validate_installed_tree(install)
-        except Exception as validation_exc:
+        if rollback_authorization is None or not rollback_retired:
             log(
-                f"{restore_failure_prefix}: restored installation did not pass validation: "
-                f"{validation_exc}"
+                f"{restore_failure_prefix}: recovery outcome was not an exact durable rollback; "
+                "AppDock will remain stopped"
             )
             return 1
+        _discard_stage(staged, data)
         try:
             _launch_and_wait(
                 restart_script,
@@ -623,20 +683,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--expected-helper-sha256", required=True)
     args = parser.parse_args(_normalize_helper_cli_args(argv))
     data = args.data.expanduser().absolute()
-    try:
-        runtime_root = _update_lock_path(data).parent
-    except Exception as exc:
-        raise SystemExit(f"unsafe update data root: {exc}") from exc
     handshake = args.handshake.expanduser().absolute()
     staged = args.staged.expanduser().absolute()
     install = args.install.expanduser().absolute()
     restart_script = args.restart_script.expanduser().absolute()
     for path in (handshake, staged, install, restart_script):
         _assert_no_link_or_reparse_ancestor(path)
+    _validate_effective_cwd(install, staged, data)
+    # Bind the executable entry point before runtime-directory or handshake
+    # creation. run() repeats this check at its own direct-call boundary.
+    restart_script = _validate_bound_restart_script(install, restart_script)
+    runtime_root = data / "runtime"
     if _is_link_or_reparse(handshake) or handshake.parent != runtime_root or not re.fullmatch(r"update-helper-[0-9a-f]{32}\.ready", handshake.name):
         raise SystemExit("invalid update helper handshake path")
     if not re.fullmatch(r"[A-Za-z0-9_-]{20,128}", args.handshake_token):
         raise SystemExit("invalid update helper handshake token")
+    try:
+        runtime_root = _update_lock_path(data).parent
+    except Exception as exc:
+        raise SystemExit(f"unsafe update data root: {exc}") from exc
     handshake.parent.mkdir(parents=True, exist_ok=True)
     return run(
         staged,

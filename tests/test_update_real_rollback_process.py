@@ -181,6 +181,7 @@ boundary_snapshot = snapshot_processes()
 launch_lineage = lineage_until(os.getpid(), TEST_OWNER_PID, boundary_snapshot)
 candidate_identities = prior_candidate_identities()
 candidate_survivors = running_identities(candidate_identities, boundary_snapshot)
+active_transactions = sorted(str(item) for item in (DATA / "updates" / "transactions").glob("*/transaction.json"))
 emit(
     "launch-boundary",
     phase=phase,
@@ -189,6 +190,7 @@ emit(
     argv=ARGS,
     launch_lineage=serialized(launch_lineage.values()),
     candidate_survivors_before_launch=serialized(candidate_survivors),
+    active_transactions=active_transactions,
 )
 
 probe_code = (
@@ -284,9 +286,9 @@ class RealRollbackProcessProofTests(unittest.TestCase):
             build_portable.build_archive(candidate_zip)
             candidate_bytes = candidate_zip.read_bytes()
             appdock.validate_zip(candidate_bytes)
-            staged = data / "updates" / "0.2.2-beta.2"
+            staged = data / "updates" / "0.2.2-beta.3"
             _extract_zip(candidate_bytes, staged)
-            self.assertEqual(_source_version(staged / "appdock.py"), "0.2.2-beta.2")
+            self.assertEqual(_source_version(staged / "appdock.py"), "0.2.2-beta.3")
             candidate_app_sha = hashlib.sha256((staged / "appdock.py").read_bytes()).hexdigest()
             self.assertNotEqual(candidate_app_sha, old_app_sha)
 
@@ -299,9 +301,22 @@ class RealRollbackProcessProofTests(unittest.TestCase):
             wrapper_pids: set[int] = set()
             launched_processes: list[subprocess.Popen[object]] = []
             real_launch = update_helper._launch_and_wait
+            real_popen = subprocess.Popen
 
             def capture_successful_launch(*args, **kwargs):
-                process = real_launch(*args, **kwargs)
+                self.assertEqual(Path(args[0]).absolute(), (install / "appdock.py").absolute())
+
+                def launch_instrumented(command, *popen_args, **popen_kwargs):
+                    instrumented = list(command)
+                    self.assertEqual(Path(instrumented[1]).absolute(), (install / "appdock.py").absolute())
+                    instrumented[1] = str(wrapper)
+                    return real_popen(instrumented, *popen_args, **popen_kwargs)
+
+                # Preserve the real launch/handoff/readiness implementation;
+                # substitute only the child entry point with the test wrapper
+                # after proving production supplied the exact managed script.
+                with patch.object(update_helper.subprocess, "Popen", side_effect=launch_instrumented):
+                    process = real_launch(*args, **kwargs)
                 launched_processes.append(process)
                 return process
 
@@ -312,7 +327,7 @@ class RealRollbackProcessProofTests(unittest.TestCase):
                         install,
                         data,
                         0,
-                        wrapper,
+                        install / "appdock.py",
                         restart_args,
                     )
                 self.assertEqual(result, 1)
@@ -329,10 +344,11 @@ class RealRollbackProcessProofTests(unittest.TestCase):
                     item for item in records
                     if item.get("kind") == "launch-boundary" and item.get("phase") == "restored-old"
                 )
-                self.assertEqual(candidate_boundary["version"], "0.2.2-beta.2")
+                self.assertEqual(candidate_boundary["version"], "0.2.2-beta.3")
                 self.assertEqual(candidate_boundary["app_sha256"], candidate_app_sha)
                 self.assertEqual(old_boundary["version"], "0.2.1")
                 self.assertEqual(old_boundary["app_sha256"], old_app_sha)
+                self.assertEqual(old_boundary["active_transactions"], [])
 
                 candidate_lock = next(
                     item for item in records
@@ -405,10 +421,22 @@ class RealRollbackProcessProofTests(unittest.TestCase):
                 self.assertEqual(running_identities(candidate_identities, process_snapshot), [])
 
                 transactions = sorted((data / "updates" / "transactions").glob("*/transaction.json"))
-                self.assertEqual(len(transactions), 1)
-                journal = json.loads(transactions[0].read_text(encoding="utf-8"))
+                self.assertEqual(transactions, [])
+                history_transactions = sorted((data / "updates" / "history").glob("*/transaction.json"))
+                self.assertEqual(len(history_transactions), 1)
+                journal = json.loads(history_transactions[0].read_text(encoding="utf-8"))
                 self.assertEqual(journal["phase"], "rolled_back")
                 self.assertEqual(journal["recovery"], "restore-old")
+                failure_evidence = history_transactions[0].with_name("failure.json")
+                self.assertTrue(failure_evidence.is_file())
+                evidence = json.loads(failure_evidence.read_text(encoding="utf-8"))
+                self.assertEqual(evidence["operation_id"], journal["operation_id"])
+                self.assertEqual(evidence["phase"], "committed")
+                self.assertEqual(evidence["rollback_phase"], "restore-old")
+                self.assertEqual(evidence["rollback_outcome"], "rolled_back")
+                self.assertRegex(evidence["exception_type"], r"^[A-Za-z0-9_.-]{1,128}$")
+                self.assertNotIn("message", evidence)
+                self.assertNotIn("path", evidence)
                 self.assertFalse(staged.exists())
                 self.assertEqual(list((data / "runtime").glob("update-startup-*.json")), [])
 
