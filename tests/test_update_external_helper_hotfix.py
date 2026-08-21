@@ -22,6 +22,10 @@ from scripts import update_helper
 REPO_ROOT = Path(__file__).parents[1].resolve()
 
 
+def _same_path(left: str | Path, right: str | Path) -> bool:
+    return appdock._lexical_path_key(left) == appdock._lexical_path_key(right)
+
+
 LAUNCHER_SOURCE = r'''
 from __future__ import annotations
 
@@ -319,7 +323,7 @@ class RealExternalHelperCwdRegressionTests(unittest.TestCase):
 
             def fail_install_swap(source: str | Path, destination: str | Path, **kwargs) -> None:
                 nonlocal failed
-                if not failed and Path(source).absolute() == install.absolute():
+                if not failed and _same_path(source, install):
                     failed = True
                     raise PermissionError(13, "deliberate swap failure")
                 original_move(source, destination, **kwargs)
@@ -364,7 +368,7 @@ class RealExternalHelperCwdRegressionTests(unittest.TestCase):
 
             def fail_install_swap(source: str | Path, destination: str | Path, **kwargs) -> None:
                 nonlocal failed
-                if not failed and Path(source).absolute() == install.absolute():
+                if not failed and _same_path(source, install):
                     failed = True
                     raise PermissionError(13, "SECRET C:/private/path")
                 original_move(source, destination, **kwargs)
@@ -637,7 +641,7 @@ class Generation2ReviewBlockerTests(unittest.TestCase):
 
             def fail_install_swap(source, destination, **kwargs):
                 nonlocal failed
-                if not failed and Path(source).absolute() == install.absolute():
+                if not failed and _same_path(source, install):
                     failed = True
                     raise PermissionError(13, "swap failed")
                 return original_move(source, destination, **kwargs)
@@ -685,7 +689,7 @@ class Generation2ReviewBlockerTests(unittest.TestCase):
 
             def fail_install_swap(source, destination, **kwargs):
                 nonlocal failed
-                if not failed and Path(source).absolute() == install.absolute():
+                if not failed and _same_path(source, install):
                     failed = True
                     raise PermissionError(13, "swap failed")
                 return original_move(source, destination, **kwargs)

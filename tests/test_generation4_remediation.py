@@ -46,6 +46,10 @@ def _write_release(root: Path, marker: bytes) -> None:
     (root / appdock.RELEASE_MANIFEST_NAME).write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
 
 
+def _same_path(left: str | Path, right: str | Path) -> bool:
+    return appdock._lexical_path_key(left) == appdock._lexical_path_key(right)
+
+
 def _rollback_fixture(root: Path, operation_id: str, *, legacy: bool = False) -> tuple[Path, Path, Path, dict[str, Path], appdock.UpdateApplyError]:
     data = root / "data"
     install = root / "install"
@@ -107,7 +111,7 @@ class Generation4RecoveryRemediationTests(unittest.TestCase):
 
             def fail_after_promotion(path, *, strict=False):
                 path = Path(path)
-                if path == install.parent:
+                if _same_path(path, install.parent):
                     calls["install_parent"] += 1
                     if calls["install_parent"] >= 2:
                         raise OSError("restore promotion parent flush failed")
@@ -581,7 +585,10 @@ class Generation4RecoveryRemediationTests(unittest.TestCase):
                     appdock._recover_one_update(paths["tx_root"], install=install, data=data),
                     "complete",
                 )
-            self.assertEqual([(Path(call.args[0]), Path(call.args[1])) for call in move.call_args_list], [(paths["candidate"], install)])
+            self.assertEqual(
+                [(appdock._lexical_path_key(call.args[0]), appdock._lexical_path_key(call.args[1])) for call in move.call_args_list],
+                [(appdock._lexical_path_key(paths["candidate"]), appdock._lexical_path_key(install))],
+            )
             self.assertEqual(observed, {"backup": True, "candidate": False, "evidence": True, "strict": True})
             set_phase.assert_called_once()
             self.assertTrue(install.is_dir())
