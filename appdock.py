@@ -3534,7 +3534,9 @@ def _update_journal(tx_root: Path) -> dict[str, Any]:
 
 
 def _lexical_path_key(path: str | Path) -> str:
-    return os.path.normcase(os.path.normpath(os.path.abspath(str(Path(path).expanduser()))))
+    # Callers validate lexical ancestry/reparse safety before comparing keys.
+    # Resolve here so valid Windows short/long aliases identify the same root.
+    return os.path.normcase(os.path.normpath(str(Path(path).expanduser().absolute().resolve())))
 
 
 def _transaction_paths(install: Path, data: Path, operation_id: str) -> dict[str, Path]:

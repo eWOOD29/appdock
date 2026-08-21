@@ -73,6 +73,14 @@ def _rollback_fixture(root: Path, operation_id: str, *, legacy: bool = False) ->
 
 
 class Generation4RecoveryRemediationTests(unittest.TestCase):
+    def test_windows_short_and_long_aliases_share_transaction_path_key(self):
+        if os.name != "nt":
+            self.skipTest("Windows path alias semantics")
+        self.assertEqual(
+            appdock._lexical_path_key(r"C:\\Program Files"),
+            appdock._lexical_path_key(r"C:\\PROGRA~1"),
+        )
+
     def test_restore_promotion_flush_failure_leaves_retryable_install_quarantine_state(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
